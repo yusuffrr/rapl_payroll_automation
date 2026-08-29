@@ -23,6 +23,22 @@
 #   custom_late_deduction_fraction float -- see rewrite note below).
 #   checkout before 17:00  ALSO Half Day (stacks additively with any late-arrival band)
 #
+# 2026-08 ADDITIONS (see merge discussion):
+#   - early_exit is now set by THIS hook whenever out_time is before
+#     settings.early_exit_cutoff, i.e. exactly when the Half Day penalty
+#     applies. Shift Type 'Regular' has enable_early_exit_marking = 0, so
+#     native auto-attendance never set this flag; the only records carrying it
+#     were ones edited by hand or by direct SQL. The monthly attendance export
+#     shows it as the "EO" marker, so it now means "this day cost half a day's
+#     pay" rather than being scattered and rule-less. Deliberately NOT aligned
+#     to shift end (18:00) -- that would flag an hour of departures that carry
+#     no consequence.
+#   - custom_overtime_hours / custom_overtime are now written here, via
+#     ot_engine.compute_day_ot(). Previously the Server Script
+#     "OT Calculation - Attendance Records" owned that field on a nightly
+#     schedule with different rules; it is retired as part of this change.
+#     See ot_engine.py for the full rationale.
+#
 # Native Half Day mechanism verified: get_half_absent_days() + payment_days
 # reduction via Fraction of Daily Salary for Half Day (0.500) already delivers
 # exactly a half-day pay cut through existing `Depends on Payment Days`
@@ -44,7 +60,8 @@
 # a double-deduction against payment_days (see payroll_automation_utils.py
 # docstring and the Settings doctype's validate_half_day_leave_type()).
 
-from frappe.utils import get_datetime
+import frappe
+from frappe.utils import flt, get_datetime
 
 from rapl_payroll_automation.api.payroll_automation_utils import (
 	get_all_holiday_dates,
@@ -52,10 +69,21 @@ from rapl_payroll_automation.api.payroll_automation_utils import (
 	get_datetime_combine,
 	time_to_seconds,
 )
+from rapl_payroll_automation.api.ot_engine import (
+	NightShiftNotSupported,
+	compute_ot_for_attendance_doc,
+)
 from erpnext.setup.doctype.employee.employee import get_holiday_list_for_employee
 
 
 def apply_attendance_deduction_logic(doc, method):
+	# Reset OT every run. Guards 1 and 2 below return early, and without this a
+	# record that previously earned OT would keep a stale value if it later
+	# became a leave day or had its in_time cleared (e.g. on amend).
+	# _set_overtime_fields() overwrites these whenever a real value is computed.
+	doc.custom_overtime_hours = 0
+	doc.custom_overtime = 0
+
 	# --- Guard 1: leave-application-driven day (incl. half-day paid leave) ---
 	# check_leave_record() (native, runs earlier in Attendance's own validate())
 	# will have already set doc.leave_type from a real, approved Leave
@@ -87,6 +115,9 @@ def apply_attendance_deduction_logic(doc, method):
 	# actually configured (confirmed = Sunday for RAPL's "Public Holidays 2026").
 	holiday_list = get_holiday_list_for_employee(doc.employee)
 	if get_all_holiday_dates(holiday_list, doc.attendance_date, doc.attendance_date):
+		# Late/half-day/early-exit rules don't apply, but voluntary attendance on
+		# a holiday IS the main source of overtime -- so OT is still computed.
+		_set_overtime_fields(doc, settings)
 		return
 
 	# Reset our own field every run so re-validation (e.g. amend) recomputes cleanly
@@ -113,10 +144,32 @@ def apply_attendance_deduction_logic(doc, method):
 	# --- Early exit check -- stacks additively with any late-arrival band above ---
 	if doc.out_time:
 		early_exit_cutoff = get_datetime_combine(doc.attendance_date, settings.early_exit_cutoff)
+		doc.early_exit = 0
 		if doc.out_time < early_exit_cutoff:
 			is_half_day = True
+			doc.early_exit = 1
 
 	if is_half_day:
 		doc.status = "Half Day"
 		doc.half_day_status = "Absent"
 		doc.leave_type = settings.half_day_leave_type
+
+	# Overtime last: compute_day_ot() reads doc.status, which the Half Day
+	# assignment above may have just changed. A Half Day earns no OT.
+	_set_overtime_fields(doc, settings)
+
+
+def _set_overtime_fields(doc, settings):
+	"""Write custom_overtime_hours / custom_overtime. Never raises -- a shift
+	misconfiguration must not block an Attendance save."""
+	try:
+		ot_hours = compute_ot_for_attendance_doc(doc, settings)
+	except NightShiftNotSupported as e:
+		frappe.log_error(str(e), "RAPL OT: night shift not supported")
+		return
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "RAPL OT: compute failed")
+		return
+
+	doc.custom_overtime_hours = round(flt(ot_hours), 2)
+	doc.custom_overtime = 1 if doc.custom_overtime_hours > 0 else 0

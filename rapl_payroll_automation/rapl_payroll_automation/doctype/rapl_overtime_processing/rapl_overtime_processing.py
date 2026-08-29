@@ -21,14 +21,13 @@ from rapl_payroll_automation.api.payroll_automation_utils import (
 	create_and_submit_additional_salary,
 	get_all_holiday_dates,
 	get_automation_settings,
-	get_datetime_combine,
 	get_grade_ot_rule,
 	get_total_working_days,
 	get_weekly_off_dates,
 )
 from rapl_payroll_automation.api.overtime_automation import get_attendance_for_employee
 from erpnext.setup.doctype.employee.employee import get_holiday_list_for_employee
-from frappe.utils import flt, get_datetime, getdate
+from frappe.utils import flt, getdate
 
 
 class RAPLOvertimeProcessing(Document):
@@ -174,8 +173,23 @@ def get_employees(docname, all_employees=False, employees=None):
 
 
 def _compute_employee_overtime(emp, start_date, end_date, settings, errors):
-	"""Same calculation as overtime_automation.py's version -- kept local here
-	to avoid the two modules depending on each other's private helpers."""
+	"""OT hours are now READ from Attendance.custom_overtime_hours, which is
+	written by attendance_automation.py's validate hook via ot_engine.
+
+	Previously this function recomputed OT per day from in_time/out_time,
+	while a nightly Server Script independently wrote custom_overtime_hours
+	using different rules. The attendance export read the field; payroll paid
+	this recomputation; the two did not reconcile. Both now come from
+	ot_engine.compute_day_ot().
+
+	The rate calculation below is UNCHANGED -- per-day amount rounded to whole
+	rupees first, hourly rate derived from that and rounded to 2dp, so the
+	displayed Rate/hr multiplied by the displayed Hours reconciles by hand.
+
+	IMPORTANT: because the hours are now stored rather than derived on read,
+	any Attendance record modified WITHOUT passing through validate (e.g. a
+	direct SQL correction) keeps its previous OT until re-saved. Use
+	recompute_attendance_overtime() to refresh a date range after such edits."""
 	grade = frappe.db.get_value("Employee", emp, "grade")
 	monthly_salary = frappe.db.get_value("Employee", emp, settings.ot_rate_base_fieldname)
 
@@ -206,28 +220,13 @@ def _compute_employee_overtime(emp, start_date, end_date, settings, errors):
 	# Amount calculation, or the manual-vs-automatic mismatch bug returns).
 	per_day_amount = round(flt(monthly_salary) / ot_working_days)
 	hourly_rate = round(per_day_amount / flt(settings.ot_hours_divisor), 2)
-	shift = frappe.get_cached_doc("Shift Type", settings.reference_shift_type)
 
+	# get_attendance_for_employee() already filters docstatus=1 AND
+	# status='Present'. ot_engine writes 0 for any non-Present day, so the
+	# filter and the stored value agree.
 	total_ot_hours = 0.0
 	for day in get_attendance_for_employee(emp, start_date, end_date):
-		try:
-			if not day.in_time or not day.out_time:
-				continue
-			day.in_time = get_datetime(day.in_time)
-			day.out_time = get_datetime(day.out_time)
-
-			if day.attendance_date in all_holidays:
-				ot_hours = flt(day.working_hours) if day.working_hours else (
-					day.out_time - day.in_time
-				).total_seconds() / 3600
-			else:
-				shift_end_dt = get_datetime_combine(day.attendance_date, shift.end_time)
-				minutes_over = (day.out_time - shift_end_dt).total_seconds() / 60
-				ot_hours = 0 if minutes_over <= settings.ot_minimum_minutes else minutes_over / 60
-
-			total_ot_hours += max(ot_hours, 0)
-		except Exception as day_err:
-			errors.append(f"{emp} / {day.attendance_date}: {day_err} -- day skipped")
+		total_ot_hours += max(flt(day.custom_overtime_hours), 0)
 
 	# REVERSED per updated instruction: total_ot_hours now rounds to 2
 	# decimals (previously deliberately left exact/unrounded). This is the

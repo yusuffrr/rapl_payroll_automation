@@ -1,0 +1,22 @@
+{
+  "content": null,
+  "creation": "2026-08-28 00:00:00",
+  "docstatus": 0,
+  "doctype": "Page",
+  "idx": 0,
+  "modified": "2026-08-28 00:00:00",
+  "modified_by": "Administrator",
+  "module": "RAPL Payroll Automation",
+  "name": "rapl-attendance-export",
+  "owner": "Administrator",
+  "page_name": "rapl-attendance-export",
+  "restrict_to_domain": null,
+  "roles": [
+    {
+      "role": "All"
+    }
+  ],
+  "standard": "Yes",
+  "title": "Attendance Export",
+  "system_user": "Yes"
+}
