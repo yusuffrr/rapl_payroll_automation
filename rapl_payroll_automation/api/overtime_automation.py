@@ -54,8 +54,10 @@ def get_attendance_for_employee(employee, start_date, end_date):
 			"in_time",
 			"out_time",
 			"working_hours",
-			# Written by attendance_automation.py via ot_engine; read by
-			# rapl_overtime_processing instead of recomputing per day.
-			"custom_overtime_hours",
+			# Needed by ot_engine.resolve_shift(). Every submitted record
+			# currently carries shift='Regular' (the only Shift Type on the
+			# site), so this falls back to settings.reference_shift_type only
+			# if a record is ever saved without one.
+			"shift",
 		],
 	)
