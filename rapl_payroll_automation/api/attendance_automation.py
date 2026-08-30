@@ -61,7 +61,7 @@
 # docstring and the Settings doctype's validate_half_day_leave_type()).
 
 import frappe
-from frappe.utils import flt, get_datetime
+from frappe.utils import flt, get_datetime, time_diff_in_hours
 
 from rapl_payroll_automation.api.payroll_automation_utils import (
 	get_all_holiday_dates,
@@ -77,6 +77,10 @@ from erpnext.setup.doctype.employee.employee import get_holiday_list_for_employe
 
 
 def apply_attendance_deduction_logic(doc, method):
+	# Working hours first: OT's holiday branch reads it, and guard 3 (holiday)
+	# returns early, so this must happen before any of the guards below.
+	_fill_working_hours(doc)
+
 	# Reset OT every run. Guards 1 and 2 below return early, and without this a
 	# record that previously earned OT would keep a stale value if it later
 	# became a leave day or had its in_time cleared (e.g. on amend).
@@ -157,6 +161,39 @@ def apply_attendance_deduction_logic(doc, method):
 	# Overtime last: compute_day_ot() reads doc.status, which the Half Day
 	# assignment above may have just changed. A Half Day earns no OT.
 	_set_overtime_fields(doc, settings)
+
+
+def _fill_working_hours(doc):
+	"""Populate working_hours when it is empty.
+
+	ERPNext only ever calculates working_hours inside auto-attendance:
+	shift_type.process_auto_attendance() -> get_attendance() ->
+	employee_checkin.calculate_working_hours(), which derives it from Employee
+	Checkin logs. attendance.py itself contains no working_hours logic at all,
+	so an Attendance created by hand, by import, or without checkin logs keeps
+	working_hours = 0 no matter how many times it is saved.
+
+	Only fills when the field is empty. Never overwrites a value auto-attendance
+	produced -- under "Every Valid Check-in and Check-out" that value legitimately
+	excludes mid-day gaps, and clobbering it with a raw span would be wrong.
+
+	Matches ERPNext's own formula for the shift's current mode, "First Check-in
+	and Last Check-out": frappe.utils.time_diff_in_hours(out, in), i.e. the raw
+	span with no break deduction, rounded to 6 places.
+	"""
+	if doc.working_hours:
+		return
+	if not doc.in_time or not doc.out_time:
+		return
+
+	in_time = get_datetime(doc.in_time)
+	out_time = get_datetime(doc.out_time)
+	if out_time <= in_time:
+		# Bad punch (e.g. an in_time typed as 02:00). Leave it at 0 rather than
+		# invent a number -- a wrong working_hours would feed holiday OT.
+		return
+
+	doc.working_hours = time_diff_in_hours(out_time, in_time)
 
 
 def _set_overtime_fields(doc, settings):
