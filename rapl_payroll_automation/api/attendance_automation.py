@@ -126,30 +126,15 @@ def apply_attendance_deduction_logic(doc, method):
 
 	# Reset our own field every run so re-validation (e.g. amend) recomputes cleanly
 	doc.custom_late_mark_band = None
-	is_half_day = False
 
-	check_in_seconds = time_to_seconds(doc.in_time.time())
-	bands = sorted(settings.late_mark_bands, key=lambda r: time_to_seconds(r.from_time))
-
-	matched_band = None
-	for band in bands:
-		from_s = time_to_seconds(band.from_time)
-		to_s = time_to_seconds(band.to_time)
-		if from_s <= check_in_seconds <= to_s:
-			matched_band = band
-			break
-
-	if matched_band:
-		doc.custom_late_mark_band = matched_band.label
-	elif bands and check_in_seconds > time_to_seconds(bands[-1].to_time):
-		is_half_day = True  # later than every defined band -- native Half Day
-	# else: earlier than the first band's From Time -- grace, no deduction
+	band_label, past_all_bands = match_late_band(doc.in_time, settings)
+	doc.custom_late_mark_band = band_label
+	is_half_day = past_all_bands
 
 	# --- Early exit check -- stacks additively with any late-arrival band above ---
 	if doc.out_time:
-		early_exit_cutoff = get_datetime_combine(doc.attendance_date, settings.early_exit_cutoff)
 		doc.early_exit = 0
-		if doc.out_time < early_exit_cutoff:
+		if is_early_exit(doc.out_time, doc.attendance_date, settings):
 			is_half_day = True
 			doc.early_exit = 1
 
@@ -161,6 +146,49 @@ def apply_attendance_deduction_logic(doc, method):
 	# Overtime last: compute_day_ot() reads doc.status, which the Half Day
 	# assignment above may have just changed. A Half Day earns no OT.
 	_set_overtime_fields(doc, settings)
+
+
+def match_late_band(in_time, settings):
+	"""Return (band_label_or_None, arrived_later_than_every_band).
+
+	Extracted so the Attendance Console can compute the SAME expected band for
+	drift detection without duplicating the rule. A second implementation is
+	exactly how the OT calculation ended up disagreeing with itself, so this
+	must stay the only copy.
+
+	Semantics preserved exactly from the original inline block:
+	  - bands sorted by from_time; first band whose [from_time, to_time] window
+	    contains the check-in (INCLUSIVE both ends) wins
+	  - later than the last band's to_time -> no band, Half Day instead
+	  - earlier than the first band's from_time -> grace, no band, no Half Day
+	"""
+	if not in_time:
+		return None, False
+
+	check_in_seconds = time_to_seconds(get_datetime(in_time).time())
+	bands = sorted(settings.late_mark_bands, key=lambda r: time_to_seconds(r.from_time))
+
+	for band in bands:
+		if time_to_seconds(band.from_time) <= check_in_seconds <= time_to_seconds(band.to_time):
+			return band.label, False
+
+	if bands and check_in_seconds > time_to_seconds(bands[-1].to_time):
+		return None, True
+
+	return None, False
+
+
+def is_early_exit(out_time, attendance_date, settings):
+	"""Return True when out_time is before settings.early_exit_cutoff.
+
+	Shared with the Console for the same reason as match_late_band(). Note this
+	is the app's own 17:00 penalty cutoff, NOT Shift Type's native early_exit
+	marking (which is disabled -- enable_early_exit_marking = 0).
+	"""
+	if not out_time:
+		return False
+	cutoff = get_datetime_combine(attendance_date, settings.early_exit_cutoff)
+	return get_datetime(out_time) < cutoff
 
 
 def _fill_working_hours(doc):

@@ -1,0 +1,53 @@
+/* Shared by the Employee Attendance statement and the Attendance Console so
+   the two pages read identically: same columns, same colour meanings. */
+
+.ea-statement { margin-bottom: 28px; }
+
+.ea-head {
+	display: flex; justify-content: space-between; align-items: baseline;
+	flex-wrap: wrap; gap: 8px; margin-bottom: 10px;
+}
+.ea-name { font-size: 15px; font-weight: 600; }
+.ea-meta { color: var(--text-muted); font-size: 12px; margin-left: 8px; }
+
+.ea-rates { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+.ea-rates > div {
+	background: var(--subtle-fg, var(--control-bg)); border-radius: var(--border-radius-md);
+	padding: 8px 12px; min-width: 130px;
+}
+.ea-rates span { display: block; color: var(--text-muted); font-size: 11px; }
+.ea-rates b { font-size: 15px; font-weight: 600; }
+
+.ea-table { width: 100%; table-layout: fixed; border-collapse: collapse; font-size: 12px; }
+.ea-table thead tr { background: var(--subtle-fg, var(--control-bg)); }
+.ea-table th {
+	text-align: left; font-weight: 400; color: var(--text-muted);
+	padding: 6px 5px; font-size: 11px;
+}
+.ea-table td { padding: 6px 5px; border-bottom: 1px solid var(--border-color); }
+.ea-table .ea-num { text-align: right; }
+.ea-dim { color: var(--text-muted); }
+
+.ea-table tr.ea-off { background: var(--subtle-fg, var(--control-bg)); }
+.ea-table tr.ea-worked-off { background: var(--bg-green, #eaf3de); }
+.ea-table tr.ea-missing { background: var(--bg-red, #fceaea); }
+.ea-table tr.ea-missing td { color: var(--red-600, #a32d2d); }
+
+.ea-late { color: var(--orange-600, #ba7517); }
+.ea-cut  { color: var(--red-600, #a32d2d); }
+.ea-ot   { color: var(--green-600, #3b6d11); }
+
+.ea-foot {
+	display: flex; flex-wrap: wrap; gap: 24px;
+	margin-top: 12px; padding-top: 10px;
+	border-top: 1px solid var(--border-color); font-size: 12px;
+}
+.ea-foot > div { min-width: 170px; }
+.ea-foot-h { color: var(--text-muted); margin-bottom: 5px; font-size: 11px; }
+.ea-foot > div > div { display: flex; justify-content: space-between; gap: 12px; }
+.ea-total { border-top: 1px solid var(--border-color); margin-top: 4px; padding-top: 4px; font-weight: 600; }
+
+@media print {
+	.page-head, .navbar, .page-actions, .layout-side-section { display: none !important; }
+	.ea-statement { margin-bottom: 0; }
+}

@@ -65,6 +65,12 @@ doc_events = {
 	},
 }
 
+# Assets ---------------------------------------------------------------------
+# Shared stylesheet for the Employee Attendance statement and the Attendance
+# Console. Both render the same table shape, so the colour meanings (amber =
+# late mark, red = money out, green = money in) must be defined in one place.
+app_include_css = "/assets/rapl_payroll_automation/css/rapl_attendance.css"
+
 # Fixtures ---------------------------------------------------------------
 # Filtered by explicit dt + fieldname rather than by module. The previous
 # hrms_custom app filtered Custom Field on module = "Hrms Custom", but its
