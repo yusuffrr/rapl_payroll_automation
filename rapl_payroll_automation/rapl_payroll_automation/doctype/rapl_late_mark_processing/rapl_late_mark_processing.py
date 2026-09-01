@@ -4,7 +4,7 @@ import frappe
 from frappe import _
 from frappe.model.document import Document
 from frappe.model.naming import append_number_if_name_exists
-from frappe.utils import flt, getdate
+from frappe.utils import cint, flt, getdate
 
 from rapl_payroll_automation.api.payroll_automation_utils import (
 	additional_salary_already_exists,
@@ -135,7 +135,7 @@ def get_employees(docname, all_employees=False, employees=None):
 	return doc.name
 
 
-def _compute_employee_late_mark_details(employee, start_date, end_date, working_days, bands):
+def _compute_employee_late_mark_details(employee, start_date, end_date, working_days, bands, settings=None):
 	"""
 	Shared calculation, used both by bulk get_employees() and the
 	single-employee get_employee_late_mark_details() (for rows added via the
@@ -147,6 +147,7 @@ def _compute_employee_late_mark_details(employee, start_date, end_date, working_
 	what makes the per-band count columns possible; the old
 	custom_late_deduction_fraction field is no longer read here at all.
 	"""
+	settings = settings or get_automation_settings()
 	monthly_salary = frappe.db.get_value("Employee", employee, "custom_monthly_salary")
 	if not monthly_salary:
 		return (
@@ -168,15 +169,23 @@ def _compute_employee_late_mark_details(employee, start_date, end_date, working_
 	band_counts = []
 	amount = 0.0
 	for band in bands[:MAX_BANDS]:
-		count = frappe.db.count(
-			"Attendance",
-			filters={
-				"employee": employee,
-				"attendance_date": ["between", [start_date, end_date]],
-				"docstatus": 1,
-				"custom_late_mark_band": band.label,
-			},
-		)
+		filters = {
+			"employee": employee,
+			"attendance_date": ["between", [start_date, end_date]],
+			"docstatus": 1,
+			"custom_late_mark_band": band.label,
+		}
+		# A band sitting on an Absent / On Leave / Work From Home record would
+		# otherwise be counted, deducting a late mark for a day the employee
+		# was not at work -- stacked on top of the absence itself. This filter
+		# used to be missing entirely (only docstatus and the band label were
+		# checked). Half Day is deliberately still counted: arriving at 10:15
+		# earns a band AND leaving before 17:00 makes it a Half Day, and both
+		# penalties legitimately apply to the same record.
+		if cint(settings.get("count_late_marks_only_when_present", 1)):
+			filters["status"] = ["in", ["Present", "Half Day"]]
+
+		count = frappe.db.count("Attendance", filters=filters)
 		band_counts.append(count)
 		amount += count * flt(band.fraction) * per_day_rate
 

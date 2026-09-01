@@ -78,6 +78,13 @@ from rapl_payroll_automation.api.ot_engine import (
 from erpnext.setup.doctype.employee.employee import get_holiday_list_for_employee
 
 
+#: A late mark band on one of these is nonsense -- the employee was not at work,
+#: so a lateness deduction would stack on top of the absence itself. Half Day is
+#: NOT here: arriving at 10:15 earns a 1/4 band AND leaving before 17:00 makes it
+#: a Half Day, and both penalties legitimately apply to the same record.
+NON_ATTENDING_STATUSES = ("Absent", "On Leave", "Work From Home")
+
+
 def derive_attendance_fields(
 	employee, attendance_date, in_time, out_time, working_hours, status,
 	leave_type, shift, settings, holiday_dates=None, ot_eligible=None,
@@ -185,13 +192,28 @@ def derive_attendance_fields(
 	derived["rules_applied"] = True
 
 	band_label, past_all_bands = match_late_band(in_time, settings)
-	derived["custom_late_mark_band"] = band_label
 	is_half_day = past_all_bands
+
+	# Never stamp a band on a day the employee was not working. Without this,
+	# setting a record to Absent while an in_time survives leaves the band in
+	# place, and RAPL Late Mark Processing counts it -- deducting a late mark
+	# for a day already deducted as an absence. Verified: that counter filters
+	# only on docstatus and the band label, never on status.
+	if status in NON_ATTENDING_STATUSES:
+		derived["custom_late_mark_band"] = None
+		derived["custom_overtime_hours"] = 0
+		derived["custom_overtime"] = 0
+		return derived
+
+	derived["custom_late_mark_band"] = band_label
 
 	if out_time and is_early_exit(out_time, attendance_date, settings):
 		is_half_day = True
 		derived["early_exit"] = 1
 
+	# ORDER MATTERS. Clearing must be tested BEFORE the "ensure half_day_status"
+	# branch, or an incoming Half Day would always re-assert itself and a
+	# corrected punch could never lift it.
 	if is_half_day:
 		derived["status"] = "Half Day"
 		derived["half_day_status"] = "Absent"
@@ -207,6 +229,16 @@ def derive_attendance_fields(
 		derived["half_day_status"] = None
 		derived["leave_type"] = None
 		derived["cleared_half_day"] = True
+	elif status == "Half Day":
+		# A Half Day the rules did not produce -- chosen by hand in the Console
+		# or set on the form. half_day_status is REQUIRED for the deduction:
+		# salary_slip.get_half_absent_days() counts
+		#   status == "Half Day" AND half_day_status == "Absent"
+		# Attendance.check_leave_record() fills that in for a leave-less Half
+		# Day, but the Console writes by SQL so validate() never runs and
+		# nothing would set it. Without this, a manually set Half Day costs the
+		# employee nothing at all.
+		derived["half_day_status"] = half_day_status or "Absent"
 
 	# Overtime last: it reads the status the Half Day branch may have changed.
 	hours = _ot(derived["status"])

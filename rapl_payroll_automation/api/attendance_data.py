@@ -53,6 +53,8 @@ FLAG_LATE_DRIFT = "late_drift"
 FLAG_OFF_DAY_WORKED = "off_day_worked"
 FLAG_ON_LEAVE = "on_leave"
 FLAG_STATUS_DRIFT = "status_drift"
+FLAG_DUPLICATE_RECORDS = "duplicate_records"
+FLAG_CHECKIN_MISMATCH = "checkin_mismatch"
 
 FLAG_LEVELS = {
 	FLAG_MISSING_PUNCH: "red",
@@ -62,6 +64,8 @@ FLAG_LEVELS = {
 	FLAG_LATE_DRIFT: "amber",
 	FLAG_OFF_DAY_WORKED: "amber",
 	FLAG_STATUS_DRIFT: "amber",
+	FLAG_DUPLICATE_RECORDS: "red",
+	FLAG_CHECKIN_MISMATCH: "info",
 	FLAG_ON_LEAVE: "info",
 }
 
@@ -188,6 +192,16 @@ def build_month_rows(employee, start_date, end_date, settings=None):
 			"flags": [],
 		}
 
+		if len([r for r in records if r.docstatus == 1]) > 1:
+			# validate_duplicate_record() permits several submitted records for
+			# one date when the SHIFT differs. _pick_active() shows only the
+			# first, so the others would be edited by nobody and seen by
+			# nobody. Impossible with a single Shift Type, but silent if a
+			# second is ever added.
+			_flag(row, FLAG_DUPLICATE_RECORDS,
+				  f"{len([r for r in records if r.docstatus == 1])} submitted records "
+				  f"exist for this date; only the first is shown")
+
 		if record and not cancelled_only:
 			row["attendance"] = {
 				"name": record.name,
@@ -243,6 +257,25 @@ def _add_record_flags(row, record, day, is_holiday, holiday_dates, settings, emp
 			  f"On leave: {record.leave_type}" if genuine_leave
 			  else f"Auto half day ({record.leave_type})",
 			  {"leave_application": record.leave_application})
+
+	# Employee Checkin is the raw evidence; Attendance is the adjudicated
+	# version. A Console edit changes only the latter, and
+	# validate_time_change() blocks editing a linked checkin's time, so the two
+	# diverge permanently. Overwriting the evidence to match would destroy the
+	# ability to see a correction was ever made -- so this is surfaced, never
+	# reconciled.
+	checkins = frappe.get_all(
+		"Employee Checkin",
+		filters={"attendance": record.name},
+		fields=["time", "log_type"],
+		order_by="time",
+	)
+	if checkins and record.in_time:
+		first = get_datetime(checkins[0].time)
+		if abs((get_datetime(record.in_time) - first).total_seconds()) > 60:
+			_flag(row, FLAG_CHECKIN_MISMATCH,
+				  f"In time {str(record.in_time)[11:16]} differs from the linked "
+				  f"check-in {str(first)[11:16]}")
 
 	if record.status == "Present" and (not record.in_time or not record.out_time):
 		missing = "check-out" if record.in_time else "check-in"

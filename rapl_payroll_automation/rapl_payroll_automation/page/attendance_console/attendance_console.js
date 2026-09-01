@@ -26,6 +26,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 	const state = {
 		data: null,
 		pending: new Map(),   // attendance name -> {name, modified, in_time, out_time, status}
+		overrides: new Map(), // employee -> edited summary values (ot hours/rate/amount, band counts, per-day rate)
 		selected: new Set(),  // attendance names
 		expanded: new Set(),  // employee ids
 	};
@@ -134,17 +135,79 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		status("");
 		const bands = state.data.bands || [];
 		const html = state.data.groups.map((g) => render_group(g, bands)).join("");
-		$body.find(".ac-out").html(`<div class="ac-groups">${html}</div>`);
+		$body.find(".ac-out").html(
+			`<div class="ac-groups">${render_emp_header(bands)}${html}</div>`
+		);
 		render_bulk();
 		render_footer();
+	}
+
+	function render_emp_header(bands) {
+		// The summary row previously had no header, so its numbers read as
+		// unexplained gaps. These are the RAPL Overtime / Late Mark Processing
+		// Entry columns, in the same order the entry rows carry them.
+		const band_th = bands
+			.map((b) => `<th class="ac-num" style="width:5%">${frappe.utils.escape_html(b.label)}</th>`)
+			.join("");
+		return `
+			<table class="ea-table ac-emp-head">
+				<thead><tr>
+					<th style="width:3%"></th>
+					<th style="width:17%">${__("Employee")}</th>
+					<th style="width:7%">${__("Grade")}</th>
+					<th style="width:12%">${__("Attendance")}</th>
+					<th class="ac-num" style="width:8%">${__("OT h:mm")}</th>
+					<th class="ac-num" style="width:6%">${__("OT h")}</th>
+					<th class="ac-num" style="width:8%">${__("Rate/hr")}</th>
+					<th class="ac-num" style="width:9%">${__("OT")} &#8377;</th>
+					${band_th}
+					<th class="ac-num" style="width:8%">${__("Per day")} &#8377;</th>
+					<th class="ac-num" style="width:9%">${__("Cut")} &#8377;</th>
+					<th class="ac-num" style="width:5%">&#9873;</th>
+				</tr></thead>
+			</table>`;
+	}
+
+	function ov(employee, field, fallback) {
+		const o = state.overrides.get(employee);
+		return o && field in o ? o[field] : fallback;
+	}
+
+	function set_ov(employee, field, value) {
+		const o = state.overrides.get(employee) || {};
+		o[field] = value;
+		state.overrides.set(employee, o);
+	}
+
+	function hhmm_from_seconds(seconds) {
+		const s = Math.max(0, Math.round(flt(seconds)));
+		return `${String(Math.floor(s / 3600)).padStart(2, "0")}:${String(Math.floor((s % 3600) / 60)).padStart(2, "0")}`;
+	}
+
+	function seconds_from_hhmm(text) {
+		const m = String(text || "").trim().match(/^(\d{1,3}):([0-5]?\d)$/);
+		if (!m) return null;
+		return parseInt(m[1], 10) * 3600 + parseInt(m[2], 10) * 60;
 	}
 
 	function render_group(g, bands) {
 		const open = state.expanded.has(g.employee);
 		const s = g.summary;
 		const e = g.entry;
+		const emp = g.employee;
+		const ot_secs = ov(emp, "ot_hours_hhmm", e.ot_hours_hhmm);
+		const ot_hours = flt(ot_secs) / 3600;
+		const ot_rate = ov(emp, "ot_rate", e.ot_rate);
+		const ot_amount = ov(emp, "amount", e.ot_amount);
+		const per_day = ov(emp, "per_day_rate", e.per_day_rate);
+		const late_amount = ov(emp, "late_amount", e.late_amount);
+		const dirty = state.overrides.has(emp);
+
 		const band_cells = bands
-			.map((b) => `<td class="ac-num">${e.band_counts[b.label] || '<span class="ea-dim">&mdash;</span>'}</td>`)
+			.map((b, i) => {
+				const v = ov(emp, `band_${i + 1}_count`, e.band_counts[b.label] || 0);
+				return `<td class="ac-num"><input class="ac-cell ac-sum ac-band" data-employee="${emp}" data-field="band_${i + 1}_count" value="${v || ""}" placeholder="0"></td>`;
+			})
 			.join("");
 
 		const processed = [];
@@ -154,20 +217,27 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		return `
 			<div class="ac-group" data-employee="${g.employee}">
 				<table class="ea-table ac-emp">
-					<tr class="${open ? "ac-open" : ""}">
-						<td style="width:4%"><i class="ac-caret fa fa-chevron-${open ? "down" : "right"}"></i></td>
-						<td style="width:20%"><b>${g.employee}</b> ${frappe.utils.escape_html(g.employee_name || "")}</td>
-						<td style="width:8%" class="ea-dim">${frappe.utils.escape_html(g.grade || "")}</td>
-						<td style="width:14%" class="ea-dim">P ${s.present} &middot; HD ${s.half_day} &middot; L ${s.on_leave}</td>
-						<td style="width:8%" class="ac-num">${g.ot_eligible ? flt(e.ot_hours, 2) : '<span class="ea-dim">n/a</span>'}</td>
-						<td style="width:9%" class="ac-num ea-dim">${g.ot_eligible ? format_currency(e.ot_rate) : "&mdash;"}</td>
-						<td style="width:10%" class="ac-num ea-ot">${g.ot_eligible && e.ot_amount ? format_currency(e.ot_amount) : '<span class="ea-dim">&mdash;</span>'}</td>
+					<tr class="${open ? "ac-open" : ""} ${dirty ? "ac-ov" : ""}">
+						<td style="width:3%"><i class="ac-caret fa fa-chevron-${open ? "down" : "right"}"></i></td>
+						<td style="width:17%"><b>${g.employee}</b> ${frappe.utils.escape_html(g.employee_name || "")}${
+							g.employee_status && g.employee_status !== "Active"
+								? ` <span class="ea-dim">&middot; ${__("left")} ${g.relieving_date ? frappe.datetime.str_to_user(g.relieving_date) : ""}</span>`
+								: ""
+						}
+							${g.ot_eligible ? "" : `<span class="ea-dim" title="${__("Employee.custom_ot is off -- automatic OT is not calculated, but you can still enter it by hand")}">&middot; ${__("manual OT")}</span>`}</td>
+						<td style="width:7%" class="ea-dim">${frappe.utils.escape_html(g.grade || "")}</td>
+						<td style="width:12%" class="ea-dim">P ${s.present} &middot; HD ${s.half_day} &middot; L ${s.on_leave}</td>
+						<td style="width:8%" class="ac-num"><input class="ac-cell ac-sum" data-employee="${emp}" data-field="ot_hours_hhmm" value="${ot_secs ? hhmm_from_seconds(ot_secs) : ""}" placeholder="0:00"></td>
+						<td style="width:6%" class="ac-num ea-dim">${ot_hours ? flt(ot_hours, 2) : "&mdash;"}</td>
+						<td style="width:8%" class="ac-num"><input class="ac-cell ac-sum" data-employee="${emp}" data-field="ot_rate" value="${ot_rate || ""}" placeholder="0"></td>
+						<td style="width:9%" class="ac-num"><input class="ac-cell ac-sum ea-ot" data-employee="${emp}" data-field="amount" value="${ot_amount || ""}" placeholder="0"></td>
 						${band_cells}
-						<td style="width:10%" class="ac-num ea-cut">${e.late_amount ? format_currency(e.late_amount) : '<span class="ea-dim">&mdash;</span>'}</td>
-						<td style="width:9%" class="ac-num">
+						<td style="width:8%" class="ac-num"><input class="ac-cell ac-sum" data-employee="${emp}" data-field="per_day_rate" value="${per_day || ""}" placeholder="0"></td>
+						<td style="width:9%" class="ac-num"><input class="ac-cell ac-sum ea-cut" data-employee="${emp}" data-field="late_amount" value="${late_amount || ""}" placeholder="0"></td>
+						<td style="width:5%" class="ac-num">
 							${s.red_flags ? `<span class="ea-cut">${s.red_flags}</span>` : ""}
 							${s.amber_flags ? `<span class="ea-late" style="margin-left:4px">${s.amber_flags}</span>` : ""}
-							${!s.red_flags && !s.amber_flags ? '<span class="ea-dim">clean</span>' : ""}
+							${!s.red_flags && !s.amber_flags ? '<span class="ea-dim">&mdash;</span>' : ""}
 						</td>
 					</tr>
 				</table>
@@ -210,11 +280,18 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 					<td class="ea-dim">&mdash;</td><td class="ea-dim">&mdash;</td><td class="ac-num ea-dim">&mdash;</td></tr>`;
 			}
 			if (!row.in_service) return "";
+			const cancelled = (row.flags || []).some((f) => f.code === "cancelled_only");
+			// Attendance.validate() calls validate_active_employee(), which throws
+			// on insert for a non-Active employee. Creation is not offered rather
+			// than offered and then rejected.
+			const action = g.can_create
+				? `<button class="btn btn-xs ac-create">${__("Create")}</button>`
+				: `<span class="ea-dim">${__("Left")}</span>`;
 			return `<tr class="ea-missing" data-date="${row.date}" data-employee="${g.employee}">
 					<td></td>${flag_cell}
 					<td>${date_label}</td>
-					<td colspan="4">${__("No attendance record")}</td>
-					<td colspan="2" class="ac-num"><button class="btn btn-xs ac-create">${__("Create")}</button></td>
+					<td colspan="4">${cancelled ? __("Only a cancelled record exists") : __("No attendance record")}</td>
+					<td colspan="2" class="ac-num">${action}</td>
 				</tr>`;
 		}
 
@@ -240,7 +317,11 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		if (leave_type) {
 			return `<span class="ea-dim" title="${frappe.utils.escape_html(leave_type)}">${frappe.utils.escape_html(value)} &middot; ${__("leave")}</span>`;
 		}
-		const options = ["Present", "Absent", "Half Day", "On Leave", "Work From Home"];
+		// "On Leave" is deliberately absent. Setting it here writes the status by
+		// SQL with no leave_type or leave_application, because check_leave_record()
+		// never runs -- payroll would find no leave to deduct against. On Leave
+		// belongs to an approved Leave Application.
+		const options = ["Present", "Absent", "Half Day", "Work From Home"];
 		return `<select class="ac-status ac-cell">${options
 			.map((o) => `<option value="${o}" ${o === value ? "selected" : ""}>${__(o)}</option>`)
 			.join("")}</select>`;
@@ -270,7 +351,51 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		render();
 	});
 
-	$body.on("change", ".ac-cell", function () {
+	$body.on("change", ".ac-sum", function () {
+		// Cascade copied from the doctype forms so the Console and the created
+		// draft can never produce different figures:
+		//   OT h:mm changed -> ot_hours -> amount = round(hours x rate)
+		//   rate    changed -> amount = round(hours x rate)
+		//   amount  changed -> stands alone (not recomputed until h:mm or rate move)
+		//   band count / per-day rate changed -> cut = round(sum(count x fraction) x per_day)
+		const employee = $(this).data("employee");
+		const field = $(this).data("field");
+		const raw = $(this).val();
+		const g = state.data.groups.find((x) => x.employee === employee);
+		if (!g) return;
+		const bands = state.data.bands || [];
+
+		if (field === "ot_hours_hhmm") {
+			const secs = seconds_from_hhmm(raw);
+			if (raw && secs === null) {
+				frappe.show_alert({ message: __("Use H:MM, e.g. 2:30"), indicator: "orange" });
+				return render();
+			}
+			set_ov(employee, "ot_hours_hhmm", secs || 0);
+		} else {
+			set_ov(employee, field, flt(raw));
+		}
+
+		const o = state.overrides.get(employee) || {};
+		const hours = flt(ov(employee, "ot_hours_hhmm", g.entry.ot_hours_hhmm)) / 3600;
+		const rate = flt(ov(employee, "ot_rate", g.entry.ot_rate));
+
+		if (field === "ot_hours_hhmm" || field === "ot_rate") {
+			o.amount = Math.round(hours * rate);
+		}
+		if (field.startsWith("band_") || field === "per_day_rate") {
+			const per_day = flt(ov(employee, "per_day_rate", g.entry.per_day_rate));
+			let fraction = 0;
+			bands.forEach((b, i) => {
+				fraction += flt(b.fraction) * flt(ov(employee, `band_${i + 1}_count`, g.entry.band_counts[b.label] || 0));
+			});
+			o.late_amount = Math.round(fraction * per_day);
+		}
+		state.overrides.set(employee, o);
+		render();
+	});
+
+	$body.on("change", ".ac-cell:not(.ac-sum)", function () {
 		const $tr = $(this).closest("tr");
 		const name = $tr.data("name");
 		if (!name) return;
@@ -333,7 +458,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 			<span>${__("Status")}</span>
 			<select class="ac-bulk-status" style="width:auto">
 				<option value="">${__("Leave unchanged")}</option>
-				${["Present", "Absent", "Half Day", "On Leave"].map((o) => `<option>${o}</option>`).join("")}
+				${["Present", "Absent", "Half Day"].map((o) => `<option>${o}</option>`).join("")}
 			</select>
 			<button class="btn btn-xs ac-bulk-apply">${__("Apply to selected")}</button>
 			<button class="btn btn-xs ac-recalc">${__("Recalculate")}</button>
@@ -392,7 +517,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 				{ fieldname: "info", fieldtype: "HTML",
 				  options: `<p class="text-muted">${employee} &middot; ${frappe.datetime.str_to_user(date)}</p>` },
 				{ fieldname: "status", label: __("Status"), fieldtype: "Select",
-				  options: ["Present", "Absent", "Half Day", "On Leave", "Work From Home"], default: "Present" },
+				  options: ["Present", "Absent", "Half Day", "Work From Home"], default: "Present" },
 				{ fieldname: "in_time", label: __("In"), fieldtype: "Data",
 				  description: __("24-hour, e.g. 09:33") },
 				{ fieldname: "out_time", label: __("Out"), fieldtype: "Data",
@@ -451,8 +576,10 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		const loaded = state.data ? state.data.loaded_at : null;
 
 		if (!state.data) return $foot.hide();
+		const ovs = state.overrides.size;
 		$foot.show().html(`
 			<span class="${count ? "ac-dirty-text" : "ea-dim"}">${count ? __("{0} unsaved", [count]) : __("No unsaved changes")}</span>
+			${ovs ? `<span class="ac-dirty-text">${__("{0} manual override(s)", [ovs])}</span>` : ""}
 			<span class="ea-dim">${loaded ? __("Loaded {0}", [loaded.slice(11, 16)]) : ""}</span>
 			<span style="flex:1"></span>
 			<button class="btn btn-xs ac-draft-ot">${__("Create OT draft")}</button>
@@ -469,22 +596,39 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		});
 	});
 
-	$body.on("click", ".ac-apply", () => {
+	$body.on("click", ".ac-apply", () => apply(0));
+
+	function apply(confirm_processed) {
 		const changes = Array.from(state.pending.values());
 		if (!changes.length) return;
 		frappe.call({
 			method: "rapl_payroll_automation.api.attendance_console.apply_edits",
-			args: { changes: JSON.stringify(changes) },
+			args: { changes: JSON.stringify(changes), confirm_processed },
 			freeze: true,
 			freeze_message: __("Applying..."),
 			callback(r) {
 				const res = r.message || {};
 				(res.applied || []).forEach((a) => state.pending.delete(a.name));
+
+				// Rows the server refused because that employee's OT or Late
+				// Mark is already submitted for the period. Correcting them now
+				// will not reach payroll -- get_employees() skips anyone already
+				// paid -- so the user is told before it happens, not after.
+				const needs = (res.failed || []).filter((f) => f.needs_confirmation);
+				if (needs.length && !confirm_processed) {
+					frappe.confirm(
+						needs.map((f) => frappe.utils.escape_html(f.error)).join("<br><br>") +
+							"<br><br><b>" + __("Edit anyway?") + "</b>",
+						() => apply(1),
+						() => { report(res); do_load(period()); }
+					);
+					return;
+				}
 				report(res);
 				do_load(period());
 			},
 		});
-	});
+	}
 
 	function report(res) {
 		const applied = (res.applied || []).length;
@@ -509,25 +653,41 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 			);
 		}
 		const range = period();
-		const employee = employee_field.get_value();
+
+		// Every employee currently on screen, not just the filter box. With no
+		// filter that is the whole loaded set, so one click covers everyone.
+		const loaded = (state.data ? state.data.groups : []).map((g) => g.employee);
+
+		// Manual overrides are keyed by employee; passing those employees
+		// explicitly is also what lets an OT figure entered by hand survive for
+		// someone whose Employee.custom_ot is off.
+		const overrides = {};
+		state.overrides.forEach((v, k) => { overrides[k] = v; });
+
 		frappe.call({
 			method: "rapl_payroll_automation.api.attendance_console.create_processing_draft",
 			args: {
 				kind,
 				start_date: range.start,
 				end_date: range.end,
-				employees: employee ? JSON.stringify([employee]) : null,
+				employees: loaded.length ? JSON.stringify(loaded) : null,
+				overrides: Object.keys(overrides).length ? JSON.stringify(overrides) : null,
 			},
 			freeze: true,
 			callback(r) {
 				const res = r.message;
 				if (!res) return;
 				const errors = (res.result && res.result.errors) || [];
+				const overridden = res.overridden || [];
 				frappe.msgprint({
 					title: res.reused ? __("Draft refreshed") : __("Draft created"),
 					indicator: "blue",
 					message:
 						`<p><a href="${res.route}" target="_blank">${res.name}</a></p>` +
+						`<p class="text-muted">${__("Rows: {0} &rarr; {1}", [res.rows_before, res.rows_after])}` +
+						(res.filtered ? ` &middot; ${__("filtered")}` : "") +
+						(overridden.length ? ` &middot; ${__("{0} manual override(s) applied", [overridden.length])}` : "") +
+						"</p>" +
 						(errors.length
 							? `<div class="text-muted">${errors.map((e) => frappe.utils.escape_html(e)).join("<br>")}</div>`
 							: ""),

@@ -33,7 +33,6 @@ from frappe.utils import flt, get_datetime, getdate, now
 from rapl_payroll_automation.api.attendance_automation import derive_attendance_fields
 from rapl_payroll_automation.api.attendance_data import (
 	build_month_rows,
-	get_active_employees,
 	get_band_definitions,
 	summarise,
 )
@@ -52,9 +51,47 @@ HR_ROLES = {"HR Manager", "HR User"}
 EDITABLE_FIELDS = ("in_time", "out_time", "status")
 
 
-def _require_hr():
+MAX_ROWS_PER_APPLY = 500
+
+
+def _require_hr(ptype="read"):
+	"""Role AND real DocType permission.
+
+	A role check alone is not a permission check: an HR User whose write
+	permission on Attendance was removed would still get through, because
+	every write here goes via SQL and never touches the permission layer.
+	frappe.has_permission is the actual authority.
+	"""
 	if not (HR_ROLES & set(frappe.get_roles())):
 		frappe.throw("Attendance Console is restricted to HR.", frappe.PermissionError)
+	if not frappe.has_permission("Attendance", ptype=ptype):
+		frappe.throw(
+			f"You do not have {ptype} permission on Attendance.", frappe.PermissionError
+		)
+
+
+def _permitted_employees(employees=None, include_inactive=False):
+	"""Employee list filtered by the caller's User Permissions.
+
+	SQL writes bypass User Permissions entirely, so an HR User restricted to
+	one Company would otherwise see and edit every company's attendance.
+	frappe.get_all applies the restriction; we then work only within that set.
+
+	include_inactive: relieved employees still need their final period
+	corrected, so existing records stay reachable. Attendance.validate() calls
+	validate_active_employee() and throws on INSERT, so creation for them is
+	blocked by the framework and is not worked around here.
+	"""
+	filters = {} if include_inactive else {"status": "Active"}
+	if employees:
+		filters["name"] = ["in", employees]
+	return frappe.get_all(
+		"Employee",
+		filters=filters,
+		fields=["name", "employee_name", "grade", "status",
+				"date_of_joining", "relieving_date", "company"],
+		order_by="name",
+	)
 
 
 def _period_bounds(start_date, end_date):
@@ -69,7 +106,7 @@ def _period_bounds(start_date, end_date):
 @frappe.whitelist()
 def get_console_data(start_date=None, end_date=None, employees=None, only_flagged=0):
 	"""Employee summary rows + their day rows, for the grouped grid."""
-	_require_hr()
+	_require_hr("read")
 	start_date, end_date = _period_bounds(start_date, end_date)
 
 	if isinstance(employees, str):
@@ -79,8 +116,19 @@ def get_console_data(start_date=None, end_date=None, employees=None, only_flagge
 	settings = get_automation_settings()
 	bands = get_band_definitions(settings)
 
+	# Anyone with attendance in the period is included even if no longer
+	# Active -- a leaver's final month still needs correcting.
+	with_records = frappe.get_all(
+		"Attendance",
+		filters={"attendance_date": ["between", [start_date, end_date]], "docstatus": ["<", 3]},
+		pluck="employee", distinct=True,
+	)
+	candidates = _permitted_employees(employees, include_inactive=True)
+	allowed = {e.name for e in _permitted_employees(employees)} | set(with_records)
+	candidates = [e for e in candidates if e.name in allowed]
+
 	groups = []
-	for emp in get_active_employees(employees):
+	for emp in candidates:
 		data = build_month_rows(emp.name, start_date, end_date, settings)
 		rows = data["rows"]
 		summary = summarise(rows, settings)
@@ -94,6 +142,9 @@ def get_console_data(start_date=None, end_date=None, employees=None, only_flagge
 			"employee": emp.name,
 			"employee_name": emp.employee_name,
 			"grade": emp.grade,
+			"employee_status": emp.status,
+			"relieving_date": str(emp.relieving_date) if emp.relieving_date else None,
+			"can_create": emp.status == "Active",
 			"ot_eligible": is_ot_eligible(emp.name),
 			"summary": summary,
 			"entry": _entry_preview(emp, start_date, end_date, summary, bands, settings),
@@ -139,6 +190,10 @@ def _entry_preview(emp, start_date, end_date, summary, bands, settings):
 		"per_day_rate": per_day,
 		"ot_rate": hourly,
 		"ot_hours": ot_hours,
+		# Duration fields store SECONDS. rapl_overtime_processing_entry's
+		# ot_hours_hhmm is the editable one and ot_hours (Float) is derived
+		# from it, so the console must offer the same pair.
+		"ot_hours_hhmm": int(round(ot_hours * 3600)),
 		"ot_amount": round(ot_hours * hourly),
 		"band_counts": band_counts,
 		"late_amount": round(late_fraction * per_day),
@@ -176,7 +231,7 @@ def _recompute(record, settings):
 
 
 @frappe.whitelist()
-def apply_edits(changes):
+def apply_edits(changes, confirm_processed=0):
 	"""Write edited punches, re-derive everything, report per row.
 
 	changes: [{name, modified, in_time, out_time, status}, ...]
@@ -189,14 +244,20 @@ def apply_edits(changes):
 	Rows are independent, so a bad row does not block the good ones: valid rows
 	are written and invalid ones are returned with a reason.
 	"""
-	_require_hr()
+	_require_hr("write")
 	if isinstance(changes, str):
 		changes = frappe.parse_json(changes)
 	if not changes:
 		return {"applied": [], "failed": []}
+	if len(changes) > MAX_ROWS_PER_APPLY:
+		frappe.throw(
+			f"Too many rows in one go ({len(changes)}). Apply at most "
+			f"{MAX_ROWS_PER_APPLY} at a time."
+		)
 
 	settings = get_automation_settings()
 	applied, failed = [], []
+	confirmed = frappe.parse_json(confirm_processed) if isinstance(confirm_processed, str) else confirm_processed
 
 	for change in changes:
 		name = change.get("name")
@@ -224,6 +285,54 @@ def apply_edits(changes):
 
 		if current.docstatus == 2:
 			failed.append({"name": name, "error": "Record is cancelled"})
+			continue
+
+		# Already paid? additional_salary_already_exists() makes
+		# get_employees() SKIP an employee whose OT or Late Mark is already
+		# submitted for the period. Correcting their attendance afterwards is
+		# therefore invisible to payroll: the draft will not include them and
+		# nothing errors. Say so rather than let it pass silently.
+		if not confirmed:
+			blocked = _processed_components(current.employee, current.attendance_date, settings)
+			if blocked:
+				failed.append({
+					"name": name,
+					"needs_confirmation": True,
+					"error": (
+						f"{current.employee} already has submitted "
+						f"{' and '.join(blocked)} for this period. Correcting attendance "
+						f"now will NOT reach payroll -- the processing document skips "
+						f"employees already paid. Cancel and redo that Additional Salary, "
+						f"or confirm to edit anyway."
+					),
+				})
+				continue
+
+		if current.docstatus == 0:
+			# A draft can be saved properly, so it IS: doc.save() runs the full
+			# validate() chain including check_leave_record(), which sets
+			# leave_type / leave_application / half_day_status correctly. SQL is
+			# only used where the ORM refuses -- submitted records, which have
+			# no allow_on_submit fields on Attendance.
+			try:
+				doc = frappe.get_doc("Attendance", name)
+				for field in EDITABLE_FIELDS:
+					if field in change:
+						value = change[field] or None
+						if field in ("in_time", "out_time"):
+							value = _combine(doc.attendance_date, value)
+						setattr(doc, field, value)
+				doc.working_hours = 0
+				doc.save()
+				applied.append({
+					"name": name, "employee": doc.employee,
+					"attendance_date": str(doc.attendance_date), "via": "orm",
+					"values": {"status": doc.status,
+							   "working_hours": flt(doc.working_hours, 2)},
+				})
+			except Exception as e:
+				failed.append({"name": name,
+							   "error": frappe.utils.strip_html(str(e))[:500]})
 			continue
 
 		record = dict(current)
@@ -273,7 +382,7 @@ def apply_edits(changes):
 		try:
 			frappe.db.set_value("Attendance", name, update, update_modified=False)
 		except Exception as e:
-			failed.append({"name": name, "error": str(e)})
+			failed.append({"name": name, "error": frappe.utils.strip_html(str(e))[:500]})
 			continue
 
 		_audit(name, current, update)
@@ -284,8 +393,25 @@ def apply_edits(changes):
 			"values": {k: str(v) if v is not None else None for k, v in update.items()},
 		})
 
-	frappe.db.commit()
+	# No explicit commit. Frappe commits a clean response for us; committing
+	# here would also flush any unrelated pending work in this request and
+	# could not be rolled back if something later failed.
 	return {"applied": applied, "failed": failed}
+
+
+def _processed_components(employee, attendance_date, settings):
+	"""Which components are already submitted for the month containing this date."""
+	from frappe.utils import get_last_day
+
+	period_end = get_last_day(attendance_date)
+	found = []
+	for label, component in (
+		("Overtime", settings.overtime_salary_component),
+		("Late Mark", settings.late_mark_salary_component),
+	):
+		if component and additional_salary_already_exists(employee, component, period_end):
+			found.append(label)
+	return found
 
 
 def _audit(name, before, after):
@@ -320,7 +446,7 @@ def _audit(name, before, after):
 def recalculate(names):
 	"""Re-apply the rules without changing punches -- clears drift on records
 	corrected outside the app."""
-	_require_hr()
+	_require_hr("write")
 	if isinstance(names, str):
 		names = frappe.parse_json(names)
 	return apply_edits([{"name": n} for n in (names or [])])
@@ -340,7 +466,7 @@ def create_attendance(rows):
 	we ask for (verified in hrms attendance.py). The result is reported back so
 	a status that changed underneath is visible rather than silent.
 	"""
-	_require_hr()
+	_require_hr("create")
 	if isinstance(rows, str):
 		rows = frappe.parse_json(rows)
 
@@ -389,7 +515,6 @@ def create_attendance(rows):
 				"attendance_date": str(row.get("attendance_date")),
 				"error": frappe.utils.strip_html(str(e))[:500],
 			})
-	frappe.db.commit()
 	return {"created": created, "failed": failed}
 
 
@@ -422,8 +547,59 @@ def _existing_draft(doctype, start_date, end_date):
 	)
 
 
+def _apply_overrides(doc, kind, overrides, bands):
+	"""Write the Console's edited summary values onto the draft's entry rows.
+
+	Values the user typed win over what get_employees() computed. Rows the user
+	did not touch are left exactly as fetched.
+	"""
+	if not overrides:
+		return []
+
+	touched = []
+	by_employee = {row.employee: row for row in doc.entries}
+
+	for employee, values in overrides.items():
+		row = by_employee.get(employee)
+		if not row:
+			continue
+
+		if kind == "overtime":
+			if values.get("ot_hours_hhmm") is not None:
+				row.ot_hours_hhmm = int(values["ot_hours_hhmm"])
+				row.ot_hours = flt(row.ot_hours_hhmm / 3600.0, 2)
+			if values.get("ot_rate") is not None:
+				row.ot_rate = flt(values["ot_rate"])
+			row.amount = (
+				flt(values["amount"]) if values.get("amount") is not None
+				else round(flt(row.ot_hours) * flt(row.ot_rate))
+			)
+		else:
+			for index, band in enumerate(bands, start=1):
+				key = f"band_{index}_count"
+				if key in values:
+					setattr(row, key, int(values[key] or 0))
+			if values.get("per_day_rate") is not None:
+				row.per_day_rate = flt(values["per_day_rate"])
+			if values.get("amount") is not None:
+				row.amount = flt(values["amount"])
+			else:
+				fraction = sum(
+					flt(b["fraction"]) * int(getattr(row, f"band_{i}_count", 0) or 0)
+					for i, b in enumerate(bands, start=1)
+				)
+				row.amount = round(fraction * flt(row.per_day_rate))
+		touched.append(employee)
+
+	if touched:
+		doc.save()
+	return touched
+
+
 @frappe.whitelist()
-def create_processing_draft(kind, start_date=None, end_date=None, employees=None):
+def create_processing_draft(
+	kind, start_date=None, end_date=None, employees=None, overrides=None
+):
 	"""Create (or refresh) a DRAFT RAPL Overtime / Late Mark Processing.
 
 	Never submits. Submission stays in the document's own form, where the
@@ -436,7 +612,7 @@ def create_processing_draft(kind, start_date=None, end_date=None, employees=None
 	table (manual or previous fetch) -- don't touch it"), so manual overrides
 	survive a refresh.
 	"""
-	_require_hr()
+	_require_hr("read")
 	start_date, end_date = _period_bounds(start_date, end_date)
 
 	doctype = {
@@ -448,6 +624,17 @@ def create_processing_draft(kind, start_date=None, end_date=None, employees=None
 
 	if isinstance(employees, str):
 		employees = frappe.parse_json(employees)
+	if isinstance(overrides, str):
+		overrides = frappe.parse_json(overrides)
+	overrides = overrides or {}
+
+	# An employee with Employee.custom_ot = 0 is skipped by get_employees()'s
+	# default mode, so a manually entered OT figure for them would be dropped.
+	# Naming them explicitly switches get_employees() to its first mode --
+	# "exactly those employees", which bypasses the custom_ot filter by design
+	# -- so a manual override always survives.
+	if overrides:
+		employees = sorted(set(employees or []) | set(overrides.keys()))
 
 	name = _existing_draft(doctype, start_date, end_date)
 	if name:
@@ -475,7 +662,11 @@ def create_processing_draft(kind, start_date=None, end_date=None, employees=None
 	result = get_employees(doc.name, all_employees=False, employees=employees or None)
 
 	doc.reload()
+	overridden = _apply_overrides(doc, kind, overrides, get_band_definitions(get_automation_settings()))
+	doc.reload()
+
 	return {
+		"overridden": overridden,
 		"doctype": doctype,
 		"name": doc.name,
 		"reused": reused,

@@ -84,3 +84,9 @@
 .ac-foot { display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
 	margin-top: 10px; padding-top: 9px; border-top: 1px solid var(--border-color); font-size: 12px; }
 .ac-dirty-text { color: var(--blue-600, #2a5fa8); font-weight: 600; }
+
+.ac-emp-head thead th { background: var(--subtle-fg, var(--control-bg)); font-size: 10.5px; padding: 5px 3px; }
+.ac-emp-head { margin-bottom: 0; }
+.ac-emp tr.ac-ov { background: var(--bg-purple, #f2eefb); }
+.ac-sum { text-align: right; font-size: 11.5px; }
+.ac-band { max-width: 44px; }

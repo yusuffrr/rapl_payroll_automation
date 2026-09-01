@@ -1,183 +1,197 @@
 {
-  "doctype": "DocType",
-  "name": "RAPL Payroll Automation Settings",
-  "module": "RAPL Payroll Automation",
-  "issingle": 1,
-  "engine": "InnoDB",
-  "field_order": [
-    "shift_section",
-    "reference_shift_type",
-    "column_break_shift",
-    "half_day_leave_type",
-    "late_mark_section",
-    "late_mark_bands",
-    "early_exit_section",
-    "early_exit_cutoff",
-    "overtime_section",
-    "ot_minimum_minutes",
-    "ot_hours_divisor",
-    "column_break_ot",
-    "ot_rate_base_fieldname",
-    "overtime_salary_component",
-    "late_mark_salary_component",
-    "statutory_section",
-    "pf_salary_component",
-    "pt_salary_component",
-    "esi_salary_component",
-    "grade_rules_section",
-    "grade_ot_rules"
-  ],
-  "fields": [
-    {
-      "fieldname": "shift_section",
-      "fieldtype": "Section Break",
-      "label": "Shift Reference"
-    },
-    {
-      "fieldname": "reference_shift_type",
-      "fieldtype": "Link",
-      "label": "Reference Shift Type",
-      "options": "Shift Type",
-      "reqd": 1,
-      "description": "Shift start/end times are read dynamically from this Shift Type record. Avoids hardcoding literal times in scripts."
-    },
-    {
-      "fieldname": "column_break_shift",
-      "fieldtype": "Column Break"
-    },
-    {
-      "fieldname": "half_day_leave_type",
-      "fieldtype": "Link",
-      "label": "Half Day Leave Type (dedicated)",
-      "options": "Leave Type",
-      "reqd": 1,
-      "description": "CRITICAL: must be a Leave Type with BOTH 'Is LWP' and 'Is Partially Paid Leave' UNTICKED. Using an LWP/PPL type here causes a double-deduction (verified against source: get_half_absent_days() and calculate_lwp_ppl_and_absent_days_based_on_attendance() are independent and both fire, subtracting payment_days twice, if this Leave Type is in leave_type_map). Create a dedicated Leave Type for this purpose, e.g. 'Attendance-Based Half Day', with no allocation policy needed."
-    },
-    {
-      "fieldname": "late_mark_section",
-      "fieldtype": "Section Break",
-      "label": "Late Mark Bands"
-    },
-    {
-      "fieldname": "late_mark_bands",
-      "fieldtype": "Table",
-      "options": "RAPL Late Mark Band",
-      "label": "Late Mark Bands",
-      "description": "Add one row per time band, e.g. Label='9:46-10:00', From=09:46:00, To=10:00:00, Fraction=0.1667. Anything after the LATEST band's To Time triggers native Half Day instead of a fraction deduction. Maximum 5 bands (matches the fixed count columns on RAPL Late Mark Processing)."
-    },
-    {
-      "fieldname": "early_exit_section",
-      "fieldtype": "Section Break",
-      "label": "Early Exit"
-    },
-    {
-      "fieldname": "early_exit_cutoff",
-      "fieldtype": "Time",
-      "label": "Early Exit Cutoff (checkout before this = Half Day)",
-      "default": "17:00:00",
-      "reqd": 1
-    },
-    {
-      "fieldname": "overtime_section",
-      "fieldtype": "Section Break",
-      "label": "Overtime"
-    },
-    {
-      "fieldname": "ot_minimum_minutes",
-      "fieldtype": "Int",
-      "label": "Minimum Overrun Minutes (regular days)",
-      "default": "45",
-      "reqd": 1,
-      "description": "On non-Sunday/non-holiday days, OT only counts if checkout is more than this many minutes past shift end."
-    },
-    {
-      "fieldname": "ot_hours_divisor",
-      "fieldtype": "Float",
-      "label": "OT Hours Divisor",
-      "default": "8",
-      "precision": "2",
-      "reqd": 1,
-      "description": "Used as: monthly_salary / working_days / divisor = hourly OT rate. RAPL: 8 actual working hours (break excluded), even though shift span is 8.5 hours."
-    },
-    {
-      "fieldname": "column_break_ot",
-      "fieldtype": "Column Break"
-    },
-    {
-      "fieldname": "ot_rate_base_fieldname",
-      "fieldtype": "Data",
-      "label": "OT Rate Base Fieldname (on Employee)",
-      "default": "custom_monthly_salary",
-      "reqd": 1,
-      "description": "Which Employee fieldname supplies the OT rate base. Change here if the field is ever renamed, without touching code."
-    },
-    {
-      "fieldname": "overtime_salary_component",
-      "fieldtype": "Link",
-      "label": "Overtime Salary Component",
-      "options": "Salary Component",
-      "default": "Overtime",
-      "reqd": 1
-    },
-    {
-      "fieldname": "late_mark_salary_component",
-      "fieldtype": "Link",
-      "label": "Late Mark Salary Component",
-      "options": "Salary Component",
-      "default": "Late Mark",
-      "reqd": 1
-    },
-    {
-      "fieldname": "statutory_section",
-      "fieldtype": "Section Break",
-      "label": "Statutory Deduction Components"
-    },
-    {
-      "fieldname": "pf_salary_component",
-      "fieldtype": "Link",
-      "label": "PF Salary Component",
-      "options": "Salary Component",
-      "default": "PF",
-      "reqd": 1
-    },
-    {
-      "fieldname": "pt_salary_component",
-      "fieldtype": "Link",
-      "label": "PT Salary Component",
-      "options": "Salary Component",
-      "default": "Professional Tax",
-      "reqd": 1
-    },
-    {
-      "fieldname": "esi_salary_component",
-      "fieldtype": "Link",
-      "label": "ESI Salary Component",
-      "options": "Salary Component",
-      "default": "ESI",
-      "reqd": 1
-    },
-    {
-      "fieldname": "grade_rules_section",
-      "fieldtype": "Section Break",
-      "label": "Grade OT Denominator Rules"
-    },
-    {
-      "fieldname": "grade_ot_rules",
-      "fieldtype": "Table",
-      "options": "RAPL Grade OT Denominator Rule",
-      "label": "Grade OT Rules"
-    }
-  ],
-  "permissions": [
-    {
-      "role": "HR Manager",
-      "read": 1,
-      "write": 1
-    },
-    {
-      "role": "System Manager",
-      "read": 1,
-      "write": 1
-    }
-  ]
+ "doctype": "DocType",
+ "name": "RAPL Payroll Automation Settings",
+ "module": "RAPL Payroll Automation",
+ "issingle": 1,
+ "engine": "InnoDB",
+ "field_order": [
+  "shift_section",
+  "reference_shift_type",
+  "column_break_shift",
+  "half_day_leave_type",
+  "late_mark_section",
+  "late_mark_bands",
+  "early_exit_section",
+  "early_exit_cutoff",
+  "overtime_section",
+  "ot_minimum_minutes",
+  "ot_hours_divisor",
+  "column_break_ot",
+  "ot_rate_base_fieldname",
+  "overtime_salary_component",
+  "late_mark_salary_component",
+  "late_mark_rules_section",
+  "count_late_marks_only_when_present",
+  "statutory_section",
+  "pf_salary_component",
+  "pt_salary_component",
+  "esi_salary_component",
+  "grade_rules_section",
+  "grade_ot_rules"
+ ],
+ "fields": [
+  {
+   "fieldname": "shift_section",
+   "fieldtype": "Section Break",
+   "label": "Shift Reference"
+  },
+  {
+   "fieldname": "reference_shift_type",
+   "fieldtype": "Link",
+   "label": "Reference Shift Type",
+   "options": "Shift Type",
+   "reqd": 1,
+   "description": "Shift start/end times are read dynamically from this Shift Type record. Avoids hardcoding literal times in scripts."
+  },
+  {
+   "fieldname": "column_break_shift",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "half_day_leave_type",
+   "fieldtype": "Link",
+   "label": "Half Day Leave Type (dedicated)",
+   "options": "Leave Type",
+   "reqd": 1,
+   "description": "CRITICAL: must be a Leave Type with BOTH 'Is LWP' and 'Is Partially Paid Leave' UNTICKED. Using an LWP/PPL type here causes a double-deduction (verified against source: get_half_absent_days() and calculate_lwp_ppl_and_absent_days_based_on_attendance() are independent and both fire, subtracting payment_days twice, if this Leave Type is in leave_type_map). Create a dedicated Leave Type for this purpose, e.g. 'Attendance-Based Half Day', with no allocation policy needed."
+  },
+  {
+   "fieldname": "late_mark_section",
+   "fieldtype": "Section Break",
+   "label": "Late Mark Bands"
+  },
+  {
+   "fieldname": "late_mark_bands",
+   "fieldtype": "Table",
+   "options": "RAPL Late Mark Band",
+   "label": "Late Mark Bands",
+   "description": "Add one row per time band, e.g. Label='9:46-10:00', From=09:46:00, To=10:00:00, Fraction=0.1667. Anything after the LATEST band's To Time triggers native Half Day instead of a fraction deduction. Maximum 5 bands (matches the fixed count columns on RAPL Late Mark Processing)."
+  },
+  {
+   "fieldname": "early_exit_section",
+   "fieldtype": "Section Break",
+   "label": "Early Exit"
+  },
+  {
+   "fieldname": "early_exit_cutoff",
+   "fieldtype": "Time",
+   "label": "Early Exit Cutoff (checkout before this = Half Day)",
+   "default": "17:00:00",
+   "reqd": 1
+  },
+  {
+   "fieldname": "overtime_section",
+   "fieldtype": "Section Break",
+   "label": "Overtime"
+  },
+  {
+   "fieldname": "ot_minimum_minutes",
+   "fieldtype": "Int",
+   "label": "Minimum Overrun Minutes (regular days)",
+   "default": "45",
+   "reqd": 1,
+   "description": "On non-Sunday/non-holiday days, OT only counts if checkout is more than this many minutes past shift end."
+  },
+  {
+   "fieldname": "ot_hours_divisor",
+   "fieldtype": "Float",
+   "label": "OT Hours Divisor",
+   "default": "8",
+   "precision": "2",
+   "reqd": 1,
+   "description": "Used as: monthly_salary / working_days / divisor = hourly OT rate. RAPL: 8 actual working hours (break excluded), even though shift span is 8.5 hours."
+  },
+  {
+   "fieldname": "column_break_ot",
+   "fieldtype": "Column Break"
+  },
+  {
+   "fieldname": "ot_rate_base_fieldname",
+   "fieldtype": "Data",
+   "label": "OT Rate Base Fieldname (on Employee)",
+   "default": "custom_monthly_salary",
+   "reqd": 1,
+   "description": "Which Employee fieldname supplies the OT rate base. Change here if the field is ever renamed, without touching code."
+  },
+  {
+   "fieldname": "overtime_salary_component",
+   "fieldtype": "Link",
+   "label": "Overtime Salary Component",
+   "options": "Salary Component",
+   "default": "Overtime",
+   "reqd": 1
+  },
+  {
+   "fieldname": "late_mark_salary_component",
+   "fieldtype": "Link",
+   "label": "Late Mark Salary Component",
+   "options": "Salary Component",
+   "default": "Late Mark",
+   "reqd": 1
+  },
+  {
+   "fieldname": "late_mark_rules_section",
+   "fieldtype": "Section Break",
+   "label": "Late Mark Rules"
+  },
+  {
+   "fieldname": "count_late_marks_only_when_present",
+   "fieldtype": "Check",
+   "label": "Count Late Marks Only on Present / Half Day",
+   "default": "1",
+   "description": "When ticked, RAPL Late Mark Processing ignores a late mark band sitting on an Absent, On Leave or Work From Home record. A band on such a day would otherwise deduct a late mark for a day the employee was not at work -- on top of the absence itself. Leave this ON unless you have a specific reason not to."
+  },
+  {
+   "fieldname": "statutory_section",
+   "fieldtype": "Section Break",
+   "label": "Statutory Deduction Components"
+  },
+  {
+   "fieldname": "pf_salary_component",
+   "fieldtype": "Link",
+   "label": "PF Salary Component",
+   "options": "Salary Component",
+   "default": "PF",
+   "reqd": 1
+  },
+  {
+   "fieldname": "pt_salary_component",
+   "fieldtype": "Link",
+   "label": "PT Salary Component",
+   "options": "Salary Component",
+   "default": "Professional Tax",
+   "reqd": 1
+  },
+  {
+   "fieldname": "esi_salary_component",
+   "fieldtype": "Link",
+   "label": "ESI Salary Component",
+   "options": "Salary Component",
+   "default": "ESI",
+   "reqd": 1
+  },
+  {
+   "fieldname": "grade_rules_section",
+   "fieldtype": "Section Break",
+   "label": "Grade OT Denominator Rules"
+  },
+  {
+   "fieldname": "grade_ot_rules",
+   "fieldtype": "Table",
+   "options": "RAPL Grade OT Denominator Rule",
+   "label": "Grade OT Rules"
+  }
+ ],
+ "permissions": [
+  {
+   "role": "HR Manager",
+   "read": 1,
+   "write": 1
+  },
+  {
+   "role": "System Manager",
+   "read": 1,
+   "write": 1
+  }
+ ]
 }
