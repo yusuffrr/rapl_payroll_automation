@@ -292,11 +292,10 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 	});
 
 	function combine($tr, time_value) {
-		if (!time_value) return null;
-		const row = find_row($tr.closest(".ac-group").data("employee"), $tr.data("name"));
-		if (!row) return null;
-		const t = time_value.length === 5 ? time_value + ":00" : time_value;
-		return `${row.date} ${t}`;
+		// Deliberately returns the bare "HH:MM". The server combines it with
+		// the record's own attendance_date, so the browser never builds a
+		// datetime and cannot get the date wrong.
+		return time_value ? String(time_value).trim() : null;
 	}
 
 	function find_attendance(name) {
@@ -353,12 +352,9 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 			const att = find_attendance(name);
 			if (!att) return;
 			const entry = state.pending.get(name) || { name, modified: att.modified };
-			if (out) {
-				const row = row_for(name);
-				entry.out_time = row ? `${row.date} ${out.length === 5 ? out + ":00" : out}` : entry.out_time;
-			}
+			if (out) entry.out_time = String(out).trim();
 			if (st) entry.status = st;
-			if (!("in_time" in entry)) entry.in_time = att.in_time;
+			if (!("in_time" in entry)) entry.in_time = hhmm(att.in_time) || null;
 			state.pending.set(name, entry);
 		});
 		render();
@@ -397,8 +393,10 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 				  options: `<p class="text-muted">${employee} &middot; ${frappe.datetime.str_to_user(date)}</p>` },
 				{ fieldname: "status", label: __("Status"), fieldtype: "Select",
 				  options: ["Present", "Absent", "Half Day", "On Leave", "Work From Home"], default: "Present" },
-				{ fieldname: "in_time", label: __("In"), fieldtype: "Time" },
-				{ fieldname: "out_time", label: __("Out"), fieldtype: "Time" },
+				{ fieldname: "in_time", label: __("In"), fieldtype: "Data",
+				  description: __("24-hour, e.g. 09:33") },
+				{ fieldname: "out_time", label: __("Out"), fieldtype: "Data",
+				  description: __("24-hour, e.g. 18:04") },
 			],
 			primary_action_label: __("Create"),
 			primary_action(values) {
@@ -406,18 +404,28 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 				frappe.call({
 					method: "rapl_payroll_automation.api.attendance_console.create_attendance",
 					args: {
+						// Bare "HH:MM" -- the server combines it with
+						// attendance_date. Building the datetime here was the
+						// source of silently-created records with no punches.
 						rows: JSON.stringify([{
 							employee,
 							attendance_date: date,
 							status: values.status,
-							in_time: values.in_time ? `${date} ${values.in_time}` : null,
-							out_time: values.out_time ? `${date} ${values.out_time}` : null,
+							in_time: values.in_time || null,
+							out_time: values.out_time || null,
 						}]),
 					},
 					freeze: true,
 					callback(r) {
 						const res = r.message || {};
 						(res.created || []).forEach((c) => {
+							if ((values.in_time || values.out_time) && !c.in_time && !c.out_time) {
+								frappe.msgprint({
+									title: __("Created without punch times"),
+									indicator: "orange",
+									message: __("The times were not saved. Check the format is HH:MM."),
+								});
+							}
 							if (c.status_changed) {
 								frappe.msgprint(
 									__("Created as {0} instead of what you chose &mdash; an approved Leave Application covers this day.", [c.status])

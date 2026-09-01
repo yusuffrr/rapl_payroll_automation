@@ -230,8 +230,8 @@ def apply_edits(changes):
 		for field in EDITABLE_FIELDS:
 			if field in change:
 				value = change[field] or None
-				if field in ("in_time", "out_time") and value:
-					value = get_datetime(value)
+				if field in ("in_time", "out_time"):
+					value = _combine(current.attendance_date, value)
 				record[field] = value
 
 		if record["in_time"] and record["out_time"]:
@@ -361,10 +361,12 @@ def create_attendance(rows):
 			doc.employee = row["employee"]
 			doc.attendance_date = getdate(row["attendance_date"])
 			doc.status = row.get("status") or "Present"
-			if row.get("in_time"):
-				doc.in_time = get_datetime(row["in_time"])
-			if row.get("out_time"):
-				doc.out_time = get_datetime(row["out_time"])
+			# Times are combined with the date HERE, not in the browser. The
+			# dialog sends a bare "HH:MM"; concatenating it client-side was
+			# fragile and silently produced nulls, creating records with no
+			# punches at all.
+			doc.in_time = _combine(doc.attendance_date, row.get("in_time"))
+			doc.out_time = _combine(doc.attendance_date, row.get("out_time"))
 			if row.get("shift"):
 				doc.shift = row["shift"]
 			doc.insert()
@@ -376,6 +378,9 @@ def create_attendance(rows):
 				"status": doc.status,
 				"status_changed": doc.status != (row.get("status") or "Present"),
 				"leave_type": doc.leave_type,
+				"in_time": str(doc.in_time) if doc.in_time else None,
+				"out_time": str(doc.out_time) if doc.out_time else None,
+				"working_hours": flt(doc.working_hours, 2),
 			})
 		except Exception as e:
 			frappe.db.rollback(save_point=savepoint)
@@ -389,6 +394,24 @@ def create_attendance(rows):
 
 
 # ---------------------------------------------------------------- drafts
+
+
+def _combine(attendance_date, value):
+	"""Accept "HH:MM", "HH:MM:SS" or a full datetime and return a datetime on
+	attendance_date. Returns None for anything empty."""
+	if not value:
+		return None
+	value = str(value).strip()
+	if not value:
+		return None
+	if len(value) > 10 and (" " in value or "T" in value):
+		return get_datetime(value)          # already a full datetime
+	parts = value.split(":")
+	if len(parts) == 2:
+		value = f"{value}:00"
+	elif len(parts) != 3:
+		frappe.throw(f"Could not read the time '{value}'. Use HH:MM.")
+	return get_datetime(f"{getdate(attendance_date)} {value}")
 
 
 def _existing_draft(doctype, start_date, end_date):
