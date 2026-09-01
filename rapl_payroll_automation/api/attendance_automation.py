@@ -61,7 +61,7 @@
 # docstring and the Settings doctype's validate_half_day_leave_type()).
 
 import frappe
-from frappe.utils import flt, get_datetime, getdate, time_diff_in_hours
+from frappe.utils import cint, flt, get_datetime, getdate, time_diff_in_hours
 
 from rapl_payroll_automation.api.payroll_automation_utils import (
 	get_all_holiday_dates,
@@ -89,6 +89,8 @@ def derive_attendance_fields(
 	employee, attendance_date, in_time, out_time, working_hours, status,
 	leave_type, shift, settings, holiday_dates=None, ot_eligible=None,
 	leave_application=None, half_day_status=None,
+	overtime_manual=0, late_mark_manual=0, current_overtime_hours=None,
+	current_late_mark_band=None,
 ):
 	"""Apply every attendance rule to a set of VALUES and return the derived
 	fields. No document, no writes.
@@ -104,6 +106,15 @@ def derive_attendance_fields(
 	Returns a dict of the fields to write. Callers assign them; this never does.
 	Guard ORDER is significant and preserved exactly from the original hook.
 	"""
+	# Manual overrides. These fields are recomputed on EVERY save, so a figure
+	# typed by hand in the Attendance Console would be silently overwritten the
+	# next time the record is touched. custom_overtime_manual /
+	# custom_late_mark_manual pin the value instead. Two flags, not one,
+	# because the decisions are independent: waiving a late mark says nothing
+	# about that day's overtime, and a shared flag would freeze both.
+	overtime_manual = cint(overtime_manual)
+	late_mark_manual = cint(late_mark_manual)
+
 	derived = {
 		# "rules_applied" False means an early guard fired (leave day, no
 		# check-in, or holiday). The original hook returned at those points
@@ -113,9 +124,11 @@ def derive_attendance_fields(
 		# days.
 		"rules_applied": False,
 		"working_hours": working_hours,
-		"custom_overtime_hours": 0,
-		"custom_overtime": 0,
-		"custom_late_mark_band": None,
+		# Seeded with the pinned values so an early guard (leave day, no
+		# check-in) cannot zero a figure HR set by hand.
+		"custom_overtime_hours": flt(current_overtime_hours or 0) if cint(overtime_manual) else 0,
+		"custom_overtime": 1 if (cint(overtime_manual) and flt(current_overtime_hours or 0) > 0) else 0,
+		"custom_late_mark_band": current_late_mark_band if cint(late_mark_manual) else None,
 		"early_exit": 0,
 		"status": status,
 		"half_day_status": half_day_status,
@@ -131,6 +144,14 @@ def derive_attendance_fields(
 
 	if ot_eligible is None:
 		ot_eligible = is_ot_eligible(employee)
+
+	def _pin(field, computed):
+		"""Return the pinned value when the manual flag is set, else computed."""
+		if field == "ot" and overtime_manual:
+			return flt(current_overtime_hours or 0)
+		if field == "band" and late_mark_manual:
+			return current_late_mark_band
+		return computed
 
 	def _ot(current_status):
 		if not in_time or not out_time:
@@ -184,7 +205,7 @@ def derive_attendance_fields(
 
 	# --- Guard 3: Sunday or any holiday -- OT only, no lateness rules ---
 	if holiday_dates and getdate(attendance_date) in holiday_dates:
-		hours = _ot(status)
+		hours = _pin("ot", _ot(status))
 		derived["custom_overtime_hours"] = hours
 		derived["custom_overtime"] = 1 if hours > 0 else 0
 		return derived
@@ -200,12 +221,13 @@ def derive_attendance_fields(
 	# for a day already deducted as an absence. Verified: that counter filters
 	# only on docstatus and the band label, never on status.
 	if status in NON_ATTENDING_STATUSES:
-		derived["custom_late_mark_band"] = None
-		derived["custom_overtime_hours"] = 0
-		derived["custom_overtime"] = 0
+		derived["custom_late_mark_band"] = _pin("band", None)
+		hours = _pin("ot", 0)
+		derived["custom_overtime_hours"] = hours
+		derived["custom_overtime"] = 1 if flt(hours) > 0 else 0
 		return derived
 
-	derived["custom_late_mark_band"] = band_label
+	derived["custom_late_mark_band"] = _pin("band", band_label)
 
 	if out_time and is_early_exit(out_time, attendance_date, settings):
 		is_half_day = True
@@ -241,9 +263,9 @@ def derive_attendance_fields(
 		derived["half_day_status"] = half_day_status or "Absent"
 
 	# Overtime last: it reads the status the Half Day branch may have changed.
-	hours = _ot(derived["status"])
+	hours = _pin("ot", _ot(derived["status"]))
 	derived["custom_overtime_hours"] = hours
-	derived["custom_overtime"] = 1 if hours > 0 else 0
+	derived["custom_overtime"] = 1 if flt(hours) > 0 else 0
 	return derived
 
 
@@ -277,6 +299,10 @@ def apply_attendance_deduction_logic(doc, method):
 		holiday_dates=holiday_dates,
 		leave_application=doc.get("leave_application"),
 		half_day_status=doc.get("half_day_status"),
+		overtime_manual=doc.get("custom_overtime_manual"),
+		late_mark_manual=doc.get("custom_late_mark_manual"),
+		current_overtime_hours=doc.get("custom_overtime_hours"),
+		current_late_mark_band=doc.get("custom_late_mark_band"),
 	)
 
 	# Always assigned: the original filled working_hours and reset the OT

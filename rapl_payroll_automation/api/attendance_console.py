@@ -28,7 +28,7 @@
 # than assuming success.
 
 import frappe
-from frappe.utils import flt, get_datetime, getdate, now
+from frappe.utils import cint, flt, get_datetime, getdate, now
 
 from rapl_payroll_automation.api.attendance_automation import derive_attendance_fields
 from rapl_payroll_automation.api.attendance_data import (
@@ -49,6 +49,13 @@ from erpnext.setup.doctype.employee.employee import get_holiday_list_for_employe
 
 HR_ROLES = {"HR Manager", "HR User"}
 EDITABLE_FIELDS = ("in_time", "out_time", "status")
+
+#: Day-level manual overrides. Each pins one derived field so the rules stop
+#: recalculating it. Sending None resets that field back to automatic.
+OVERRIDE_FIELDS = {
+	"custom_overtime_hours": "custom_overtime_manual",
+	"custom_late_mark_band": "custom_late_mark_manual",
+}
 
 
 MAX_ROWS_PER_APPLY = 500
@@ -227,6 +234,10 @@ def _recompute(record, settings):
 		holiday_dates=holiday_dates,
 		leave_application=record.get("leave_application"),
 		half_day_status=record.get("half_day_status"),
+		overtime_manual=record.get("custom_overtime_manual"),
+		late_mark_manual=record.get("custom_late_mark_manual"),
+		current_overtime_hours=record.get("custom_overtime_hours"),
+		current_late_mark_band=record.get("custom_late_mark_band"),
 	)
 
 
@@ -269,7 +280,8 @@ def apply_edits(changes, confirm_processed=0):
 			"Attendance", name,
 			["name", "employee", "attendance_date", "docstatus", "status", "leave_type",
 			 "leave_application", "half_day_status", "in_time", "out_time",
-			 "working_hours", "shift", "modified"],
+			 "working_hours", "shift", "modified", "custom_overtime_hours",
+			 "custom_late_mark_band", "custom_overtime_manual", "custom_late_mark_manual"],
 			as_dict=True,
 		)
 		if not current:
@@ -351,6 +363,19 @@ def apply_edits(changes, confirm_processed=0):
 		# working_hours is recomputed from scratch, so clear it first -- the
 		# rules only FILL it when empty and would otherwise keep a stale value
 		# from the punches this edit just replaced.
+		# Day-level manual overrides. "" resets a field to automatic; any other
+		# value pins it so derive_attendance_fields() stops recalculating it.
+		for field, flag in OVERRIDE_FIELDS.items():
+			if field not in change:
+				continue
+			value = change[field]
+			if value in (None, ""):
+				record[flag] = 0
+				record[field] = None
+			else:
+				record[flag] = 1
+				record[field] = flt(value) if field.endswith("_hours") else value
+
 		record["working_hours"] = 0
 		derived = _recompute(record, settings)
 
@@ -362,6 +387,8 @@ def apply_edits(changes, confirm_processed=0):
 			"custom_overtime": derived["custom_overtime"],
 			"modified": now(),
 			"modified_by": frappe.session.user,
+			"custom_overtime_manual": cint(record.get("custom_overtime_manual")),
+			"custom_late_mark_manual": cint(record.get("custom_late_mark_manual")),
 		}
 		if derived["rules_applied"]:
 			update["custom_late_mark_band"] = derived["custom_late_mark_band"]
@@ -422,7 +449,8 @@ def _audit(name, before, after):
 	"""
 	changed = []
 	for field in ("in_time", "out_time", "status", "working_hours", "leave_type",
-				  "custom_late_mark_band", "custom_overtime_hours", "early_exit"):
+				  "custom_late_mark_band", "custom_overtime_hours", "early_exit",
+				  "custom_overtime_manual", "custom_late_mark_manual"):
 		if field not in after:
 			continue
 		old, new = before.get(field), after.get(field)

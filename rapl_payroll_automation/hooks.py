@@ -91,6 +91,8 @@ fixtures = [
 					"Attendance-custom_late_mark_band",
 					"Attendance-custom_overtime",
 					"Attendance-custom_overtime_hours",
+					"Attendance-custom_overtime_manual",
+					"Attendance-custom_late_mark_manual",
 					"Employee-custom_ot",
 					"Employee-custom_monthly_salary",
 					"Employee-custom_pf",

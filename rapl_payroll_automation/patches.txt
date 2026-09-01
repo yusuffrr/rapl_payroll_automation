@@ -1,2 +1,4 @@
-# Patches will be listed here as [module].patches.[patch_name]
-# None required for initial install.
+[pre_model_sync]
+
+[post_model_sync]
+rapl_payroll_automation.patches.v0_2.add_manual_override_fields

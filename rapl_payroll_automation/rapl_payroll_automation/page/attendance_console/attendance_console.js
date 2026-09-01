@@ -126,6 +126,25 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 
 	// ---------------------------------------------------------------- render
 
+	// ONE table for the whole grid. The employee summary row and its day rows
+	// share a single column set, so every summary value sits directly above the
+	// day-level column it is the total of: Cut over Cut, OT h over OT h,
+	// OT money over OT money. Two separate tables could never line up, and the
+	// mismatched widths were the reason the page looked unbalanced.
+	const COLS = [
+		{ w: "3%" }, { w: "4%" },
+		{ w: "16%", label: () => __("Employee") + " / " + __("Date") },
+		{ w: "9%", label: () => __("In") },
+		{ w: "9%", label: () => __("Out") },
+		{ w: "7%", label: () => __("Hrs"), num: true },
+		{ w: "13%", label: () => __("Status") },
+		{ w: "10%", label: () => __("Late") },
+		{ w: "9%", label: () => __("OT h:mm"), num: true },
+		{ w: "6%", label: () => __("OT h"), num: true },
+		{ w: "7%", label: () => __("Cut") + " \u20b9", num: true },
+		{ w: "7%", label: () => __("OT") + " \u20b9", num: true },
+	];
+
 	function render() {
 		if (!state.data || !state.data.groups.length) {
 			status(__("Nothing to show for this period."));
@@ -134,60 +153,15 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		}
 		status("");
 		const bands = state.data.bands || [];
-		const html = state.data.groups.map((g) => render_group(g, bands)).join("");
+		const head = COLS.map(
+			(c) => `<th style="width:${c.w}" class="${c.num ? "ac-num" : ""}">${c.label ? c.label() : ""}</th>`
+		).join("");
+		const body = state.data.groups.map((g) => render_group(g, bands)).join("");
 		$body.find(".ac-out").html(
-			`<div class="ac-groups">${render_emp_header(bands)}${html}</div>`
+			`<table class="ea-table ac-grid"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`
 		);
 		render_bulk();
 		render_footer();
-	}
-
-	function render_emp_header(bands) {
-		// The summary row previously had no header, so its numbers read as
-		// unexplained gaps. These are the RAPL Overtime / Late Mark Processing
-		// Entry columns, in the same order the entry rows carry them.
-		const band_th = bands
-			.map((b) => `<th class="ac-num" style="width:5%">${frappe.utils.escape_html(b.label)}</th>`)
-			.join("");
-		return `
-			<table class="ea-table ac-emp-head">
-				<thead><tr>
-					<th style="width:3%"></th>
-					<th style="width:17%">${__("Employee")}</th>
-					<th style="width:7%">${__("Grade")}</th>
-					<th style="width:12%">${__("Attendance")}</th>
-					<th class="ac-num" style="width:8%">${__("OT h:mm")}</th>
-					<th class="ac-num" style="width:6%">${__("OT h")}</th>
-					<th class="ac-num" style="width:8%">${__("Rate/hr")}</th>
-					<th class="ac-num" style="width:9%">${__("OT")} &#8377;</th>
-					${band_th}
-					<th class="ac-num" style="width:8%">${__("Per day")} &#8377;</th>
-					<th class="ac-num" style="width:9%">${__("Cut")} &#8377;</th>
-					<th class="ac-num" style="width:5%">&#9873;</th>
-				</tr></thead>
-			</table>`;
-	}
-
-	function ov(employee, field, fallback) {
-		const o = state.overrides.get(employee);
-		return o && field in o ? o[field] : fallback;
-	}
-
-	function set_ov(employee, field, value) {
-		const o = state.overrides.get(employee) || {};
-		o[field] = value;
-		state.overrides.set(employee, o);
-	}
-
-	function hhmm_from_seconds(seconds) {
-		const s = Math.max(0, Math.round(flt(seconds)));
-		return `${String(Math.floor(s / 3600)).padStart(2, "0")}:${String(Math.floor((s % 3600) / 60)).padStart(2, "0")}`;
-	}
-
-	function seconds_from_hhmm(text) {
-		const m = String(text || "").trim().match(/^(\d{1,3}):([0-5]?\d)$/);
-		if (!m) return null;
-		return parseInt(m[1], 10) * 3600 + parseInt(m[2], 10) * 60;
 	}
 
 	function render_group(g, bands) {
@@ -196,17 +170,17 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		const e = g.entry;
 		const emp = g.employee;
 		const ot_secs = ov(emp, "ot_hours_hhmm", e.ot_hours_hhmm);
-		const ot_hours = flt(ot_secs) / 3600;
 		const ot_rate = ov(emp, "ot_rate", e.ot_rate);
 		const ot_amount = ov(emp, "amount", e.ot_amount);
 		const per_day = ov(emp, "per_day_rate", e.per_day_rate);
 		const late_amount = ov(emp, "late_amount", e.late_amount);
 		const dirty = state.overrides.has(emp);
 
-		const band_cells = bands
+		const band_inputs = bands
 			.map((b, i) => {
 				const v = ov(emp, `band_${i + 1}_count`, e.band_counts[b.label] || 0);
-				return `<td class="ac-num"><input class="ac-cell ac-sum ac-band" data-employee="${emp}" data-field="band_${i + 1}_count" value="${v || ""}" placeholder="0"></td>`;
+				return `<span class="ac-band-wrap"><label>${frappe.utils.escape_html(b.label)}</label>` +
+					`<input class="ac-cell ac-sum ac-band" data-employee="${emp}" data-field="band_${i + 1}_count" value="${v || ""}" placeholder="0"></span>`;
 			})
 			.join("");
 
@@ -214,115 +188,121 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		if (e.ot_already_processed) processed.push(__("OT paid"));
 		if (e.late_already_processed) processed.push(__("Late paid"));
 
-		return `
-			<div class="ac-group" data-employee="${g.employee}">
-				<table class="ea-table ac-emp">
-					<tr class="${open ? "ac-open" : ""} ${dirty ? "ac-ov" : ""}">
-						<td style="width:3%"><i class="ac-caret fa fa-chevron-${open ? "down" : "right"}"></i></td>
-						<td style="width:17%"><b>${g.employee}</b> ${frappe.utils.escape_html(g.employee_name || "")}${
-							g.employee_status && g.employee_status !== "Active"
-								? ` <span class="ea-dim">&middot; ${__("left")} ${g.relieving_date ? frappe.datetime.str_to_user(g.relieving_date) : ""}</span>`
-								: ""
-						}
-							${g.ot_eligible ? "" : `<span class="ea-dim" title="${__("Employee.custom_ot is off -- automatic OT is not calculated, but you can still enter it by hand")}">&middot; ${__("manual OT")}</span>`}</td>
-						<td style="width:7%" class="ea-dim">${frappe.utils.escape_html(g.grade || "")}</td>
-						<td style="width:12%" class="ea-dim">P ${s.present} &middot; HD ${s.half_day} &middot; L ${s.on_leave}</td>
-						<td style="width:8%" class="ac-num"><input class="ac-cell ac-sum" data-employee="${emp}" data-field="ot_hours_hhmm" value="${ot_secs ? hhmm_from_seconds(ot_secs) : ""}" placeholder="0:00"></td>
-						<td style="width:6%" class="ac-num ea-dim">${ot_hours ? flt(ot_hours, 2) : "&mdash;"}</td>
-						<td style="width:8%" class="ac-num"><input class="ac-cell ac-sum" data-employee="${emp}" data-field="ot_rate" value="${ot_rate || ""}" placeholder="0"></td>
-						<td style="width:9%" class="ac-num"><input class="ac-cell ac-sum ea-ot" data-employee="${emp}" data-field="amount" value="${ot_amount || ""}" placeholder="0"></td>
-						${band_cells}
-						<td style="width:8%" class="ac-num"><input class="ac-cell ac-sum" data-employee="${emp}" data-field="per_day_rate" value="${per_day || ""}" placeholder="0"></td>
-						<td style="width:9%" class="ac-num"><input class="ac-cell ac-sum ea-cut" data-employee="${emp}" data-field="late_amount" value="${late_amount || ""}" placeholder="0"></td>
-						<td style="width:5%" class="ac-num">
-							${s.red_flags ? `<span class="ea-cut">${s.red_flags}</span>` : ""}
-							${s.amber_flags ? `<span class="ea-late" style="margin-left:4px">${s.amber_flags}</span>` : ""}
-							${!s.red_flags && !s.amber_flags ? '<span class="ea-dim">&mdash;</span>' : ""}
-						</td>
-					</tr>
-				</table>
-				${processed.length ? `<div class="ac-note">${processed.join(" &middot; ")} &mdash; ${__("already in Additional Salary for this period")}</div>` : ""}
-				<div class="ac-days" style="display:${open ? "block" : "none"}">${open ? render_days(g) : ""}</div>
-			</div>`;
+		const rows = [`
+			<tr class="ac-emp-row ${open ? "ac-open" : ""} ${dirty ? "ac-ov" : ""}" data-employee="${emp}">
+				<td><i class="ac-caret fa fa-chevron-${open ? "down" : "right"}"></i></td>
+				<td class="ac-num">${s.red_flags ? `<span class="ea-cut">${s.red_flags}</span>` : ""}${
+					s.amber_flags ? `<span class="ea-late" style="margin-left:3px">${s.amber_flags}</span>` : ""
+				}${!s.red_flags && !s.amber_flags ? '<span class="ea-dim">&mdash;</span>' : ""}</td>
+				<td><b>${emp}</b> ${frappe.utils.escape_html(g.employee_name || "")}${
+					g.employee_status && g.employee_status !== "Active"
+						? ` <span class="ea-dim">&middot; ${__("left")} ${g.relieving_date ? frappe.datetime.str_to_user(g.relieving_date) : ""}</span>`
+						: ""
+				}${
+					g.ot_eligible ? "" : ` <span class="ea-dim" title="${__("Employee.custom_ot is off - automatic OT is not calculated, but you can still enter it by hand")}">&middot; ${__("manual OT")}</span>`
+				}${processed.length ? ` <span class="ea-late">&middot; ${processed.join(" &middot; ")}</span>` : ""}</td>
+				<td colspan="4" class="ac-rates">
+					<span class="ea-dim">${frappe.utils.escape_html(g.grade || "")} &middot; P ${s.present} &middot; HD ${s.half_day} &middot; L ${s.on_leave}</span>
+					<span class="ac-band-wrap"><label>&#8377;/${__("day")}</label>
+						<input class="ac-cell ac-sum" data-employee="${emp}" data-field="per_day_rate" value="${per_day || ""}" placeholder="0"></span>
+					<span class="ac-band-wrap"><label>&#8377;/${__("hr")}</label>
+						<input class="ac-cell ac-sum" data-employee="${emp}" data-field="ot_rate" value="${ot_rate || ""}" placeholder="0"></span>
+				</td>
+				<td class="ac-rates">${band_inputs}</td>
+				<td class="ac-num"><input class="ac-cell ac-sum" data-employee="${emp}" data-field="ot_hours_hhmm" value="${ot_secs ? hhmm_from_seconds(ot_secs) : ""}" placeholder="0:00"></td>
+				<td class="ac-num ea-dim">${flt(s.overtime_hours, 2) || "&mdash;"}</td>
+				<td class="ac-num"><input class="ac-cell ac-sum ea-cut" data-employee="${emp}" data-field="late_amount" value="${late_amount || ""}" placeholder="0"></td>
+				<td class="ac-num"><input class="ac-cell ac-sum ea-ot" data-employee="${emp}" data-field="amount" value="${ot_amount || ""}" placeholder="0"></td>
+			</tr>`];
+
+		if (open) rows.push(g.rows.map((row) => render_day(g, row, bands)).join(""));
+		return rows.join("");
 	}
 
-	function render_days(g) {
-		const rows = g.rows.map((row) => render_day(g, row)).join("");
-		return `
-			<table class="ea-table ac-day-table">
-				<thead><tr>
-					<th style="width:5%"></th><th style="width:5%"></th>
-					<th style="width:14%">${__("Date")}</th>
-					<th style="width:13%">${__("In")}</th>
-					<th style="width:13%">${__("Out")}</th>
-					<th style="width:9%" class="ac-num">${__("Hrs")}</th>
-					<th style="width:17%">${__("Status")}</th>
-					<th style="width:12%">${__("Late")}</th>
-					<th style="width:12%" class="ac-num">${__("OT")}</th>
-				</tr></thead>
-				<tbody>${rows}</tbody>
-			</table>`;
-	}
-
-	function render_day(g, row) {
+	function render_day(g, row, bands) {
 		const att = row.attendance;
 		const date_label = `${row.day_label} ${row.date.slice(8, 10)}`;
 		const flag = top_flag(row.flags);
 		const flag_cell = flag
-			? `<td class="${flag.level === "red" ? "ea-cut" : flag.level === "amber" ? "ea-late" : "ea-dim"}" title="${frappe.utils.escape_html(flag.message)}">&#9679;</td>`
-			: "<td></td>";
+			? `<td class="ac-num ${flag.level === "red" ? "ea-cut" : flag.level === "amber" ? "ea-late" : "ea-dim"}" title="${frappe.utils.escape_html(flag.message)}">&#9679;</td>`
+			: '<td class="ac-num"></td>';
+		const dash = '<td class="ac-num ea-dim">&mdash;</td>';
 
 		if (!att) {
 			if (row.is_holiday) {
-				return `<tr class="ea-off"><td></td>${flag_cell}
-					<td class="ea-dim">${date_label}</td>
+				return `<tr class="ac-day ea-off"><td></td>${flag_cell}
+					<td class="ea-dim ac-indent">${date_label}</td>
 					<td colspan="3" class="ea-dim">${row.is_weekly_off ? __("Weekly off") : frappe.utils.escape_html(row.holiday_description || __("Holiday"))}</td>
-					<td class="ea-dim">&mdash;</td><td class="ea-dim">&mdash;</td><td class="ac-num ea-dim">&mdash;</td></tr>`;
+					<td class="ea-dim">&mdash;</td><td class="ea-dim">&mdash;</td>${dash}${dash}${dash}${dash}</tr>`;
 			}
 			if (!row.in_service) return "";
 			const cancelled = (row.flags || []).some((f) => f.code === "cancelled_only");
-			// Attendance.validate() calls validate_active_employee(), which throws
-			// on insert for a non-Active employee. Creation is not offered rather
-			// than offered and then rejected.
 			const action = g.can_create
 				? `<button class="btn btn-xs ac-create">${__("Create")}</button>`
 				: `<span class="ea-dim">${__("Left")}</span>`;
-			return `<tr class="ea-missing" data-date="${row.date}" data-employee="${g.employee}">
+			return `<tr class="ac-day ea-missing" data-date="${row.date}" data-employee="${g.employee}">
 					<td></td>${flag_cell}
-					<td>${date_label}</td>
-					<td colspan="4">${cancelled ? __("Only a cancelled record exists") : __("No attendance record")}</td>
-					<td colspan="2" class="ac-num">${action}</td>
+					<td class="ac-indent">${date_label}</td>
+					<td colspan="5">${cancelled ? __("Only a cancelled record exists") : __("No attendance record")}</td>
+					<td colspan="4" class="ac-num">${action}</td>
 				</tr>`;
 		}
 
 		const pending = state.pending.get(att.name);
-		const dirty = Boolean(pending);
 		const val = (f) => (pending && f in pending ? pending[f] : att[f]);
-		const checked = state.selected.has(att.name);
+		const e = g.entry;
+		// Per-day money is display only -- the payable figures live on the
+		// summary row above, and now sit in the same columns as these.
+		const ot_amount = flt(att.overtime_hours) * flt(ov(g.employee, "ot_rate", e.ot_rate));
+		const band = bands.find((b) => b.label === att.late_mark_band);
+		const cut = band ? flt(band.fraction) * flt(ov(g.employee, "per_day_rate", e.per_day_rate)) : 0;
 
-		return `<tr class="${dirty ? "ac-dirty" : ""} ${row.is_holiday ? "ea-worked-off" : ""}" data-name="${att.name}">
-				<td><input type="checkbox" class="ac-pick" ${checked ? "checked" : ""}></td>
+		return `<tr class="ac-day ${pending ? "ac-dirty" : ""} ${row.is_holiday ? "ea-worked-off" : ""}" data-name="${att.name}">
+				<td><input type="checkbox" class="ac-pick" ${state.selected.has(att.name) ? "checked" : ""}></td>
 				${flag_cell}
-				<td>${date_label}</td>
+				<td class="ac-indent">${date_label}</td>
 				<td><input class="ac-in ac-cell" value="${hhmm(val("in_time"))}" placeholder="--:--"></td>
 				<td><input class="ac-out ac-cell" value="${hhmm(val("out_time"))}" placeholder="--:--"></td>
 				<td class="ac-num">${att.working_hours ? flt(att.working_hours, 2) : '<span class="ea-dim">&mdash;</span>'}</td>
-				<td>${status_select(val("status"), att.leave_type)}</td>
-				<td>${att.late_mark_band ? `<b class="ea-late">${frappe.utils.escape_html(att.late_mark_band)}</b>` : '<span class="ea-dim">&mdash;</span>'}</td>
-				<td class="ac-num">${att.overtime_hours ? `<b>${flt(att.overtime_hours, 2)}</b>` : '<span class="ea-dim">&mdash;</span>'}</td>
+				<td>${status_select(val("status"), att)}</td>
+				<td>${band_select(val("custom_late_mark_band"), att, bands)}</td>
+				<td class="ac-num"><input class="ac-cell ac-day-ot ${att.overtime_manual ? "ac-pinned" : ""}"
+					value="${hhmm_from_seconds(flt(val("custom_overtime_hours")) * 3600)}" placeholder="0:00"
+					title="${att.overtime_manual ? __("Set by hand - the rules will not recalculate this day") : __("Leave blank for automatic")}"></td>
+				<td class="ac-num ea-dim">${att.overtime_hours ? flt(att.overtime_hours, 2) : "&mdash;"}</td>
+				<td class="ac-num">${cut ? `<span class="ea-cut">${Math.round(cut)}</span>` : '<span class="ea-dim">&mdash;</span>'}</td>
+				<td class="ac-num">${ot_amount ? `<span class="ea-ot">${Math.round(ot_amount)}</span>` : '<span class="ea-dim">&mdash;</span>'}</td>
 			</tr>`;
 	}
 
-	function status_select(value, leave_type) {
-		if (leave_type) {
-			return `<span class="ea-dim" title="${frappe.utils.escape_html(leave_type)}">${frappe.utils.escape_html(value)} &middot; ${__("leave")}</span>`;
+	function band_select(value, att, bands) {
+		// Editable so a single day's late mark can be waived without falsifying
+		// the punch. Choosing anything here sets custom_late_mark_manual, which
+		// stops the rules recalculating this day; "auto" clears it again.
+		const opts = ['<option value="">' + __("none") + "</option>"]
+			.concat(bands.map((b) =>
+				`<option value="${frappe.utils.escape_html(b.label)}" ${b.label === value ? "selected" : ""}>${frappe.utils.escape_html(b.label)}</option>`))
+			.join("");
+		return `<select class="ac-cell ac-day-band ${att.late_mark_manual ? "ac-pinned" : ""}"
+			title="${att.late_mark_manual ? __("Set by hand - the rules will not recalculate this day") : __("Automatic")}">
+			<option value="__auto__">${__("auto")}</option>${opts}</select>`;
+	}
+
+	function status_select(value, att) {
+		// Locked ONLY for a real leave -- one backed by a Leave Application, or
+		// carrying a leave type the automation did not write. An auto-applied
+		// half day also has a leave_type, and locking those made the punch
+		// behind them impossible to correct.
+		if (att.genuine_leave) {
+			return `<span class="ea-dim" title="${frappe.utils.escape_html(att.leave_type || "")}">${frappe.utils.escape_html(value)} &middot; ${__("leave")}</span>`;
 		}
-		// "On Leave" is deliberately absent. Setting it here writes the status by
-		// SQL with no leave_type or leave_application, because check_leave_record()
-		// never runs -- payroll would find no leave to deduct against. On Leave
-		// belongs to an approved Leave Application.
+		// "On Leave" is deliberately absent. Setting it here writes the status
+		// by SQL with no leave_type or leave_application, because
+		// check_leave_record() never runs -- payroll would find no leave to
+		// deduct against. On Leave belongs to an approved Leave Application.
 		const options = ["Present", "Absent", "Half Day", "Work From Home"];
-		return `<select class="ac-status ac-cell">${options
+		const auto_hd = att.leave_type && !att.genuine_leave;
+		return `<select class="ac-status ac-cell" ${auto_hd ? 'title="' + __("Auto half day - editable") + '"' : ""}>${options
 			.map((o) => `<option value="${o}" ${o === value ? "selected" : ""}>${__(o)}</option>`)
 			.join("")}</select>`;
 	}
@@ -343,9 +323,9 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 
 	// ---------------------------------------------------------------- editing
 
-	$body.on("click", ".ac-emp tr", function (e) {
+	$body.on("click", ".ac-emp-row", function (e) {
 		if ($(e.target).is("input, select, button")) return;
-		const employee = $(this).closest(".ac-group").data("employee");
+		const employee = $(this).data("employee");
 		if (state.expanded.has(employee)) state.expanded.delete(employee);
 		else state.expanded.add(employee);
 		render();
@@ -395,7 +375,32 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		render();
 	});
 
-	$body.on("change", ".ac-cell:not(.ac-sum)", function () {
+	$body.on("change", ".ac-day-ot, .ac-day-band", function () {
+		const $tr = $(this).closest("tr");
+		const name = $tr.data("name");
+		const att = find_attendance(name);
+		if (!att) return;
+		const entry = state.pending.get(name) || { name, modified: att.modified };
+		if ($(this).hasClass("ac-day-ot")) {
+			const v = String($(this).val() || "").trim();
+			// Blank resets this day to automatic; a value pins it.
+			entry.custom_overtime_hours = v === "" ? "" : seconds_from_hhmm(v) / 3600;
+		} else {
+			const v = $(this).val();
+			entry.custom_late_mark_band = v === "__auto__" ? "" : v;
+		}
+		state.pending.set(name, entry);
+		$tr.addClass("ac-dirty");
+		render_footer();
+	});
+
+	function seconds_from_hhmm(v) {
+		const parts = String(v).split(":");
+		if (parts.length === 2) return (parseInt(parts[0], 10) || 0) * 3600 + (parseInt(parts[1], 10) || 0) * 60;
+		return Math.round((parseFloat(v) || 0) * 3600);
+	}
+
+	$body.on("change", ".ac-in, .ac-out, .ac-status", function () {
 		const $tr = $(this).closest("tr");
 		const name = $tr.data("name");
 		if (!name) return;
@@ -432,10 +437,8 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		return null;
 	}
 
-	function find_row(employee, name) {
-		const g = state.data.groups.find((x) => x.employee === employee);
-		if (!g) return null;
-		return g.rows.find((r) => r.attendance && r.attendance.name === name);
+	function find_row(name) {
+		return row_for(name);
 	}
 
 	$body.on("change", ".ac-pick", function () {

@@ -101,7 +101,7 @@ def _fetch_attendance(employee, start_date, end_date):
 			"in_time", "out_time", "working_hours", "shift", "late_entry",
 			"early_exit", "leave_type", "leave_application",
 			"custom_late_mark_band", "custom_overtime_hours", "custom_overtime",
-			"modified",
+			"custom_overtime_manual", "custom_late_mark_manual", "modified",
 		],
 		order_by="attendance_date, docstatus",
 	)
@@ -216,8 +216,17 @@ def build_month_rows(employee, start_date, end_date, settings=None):
 				"early_exit": record.early_exit,
 				"leave_type": record.leave_type,
 				"leave_application": record.leave_application,
+				# Set again in _add_record_flags, but the Console needs it on
+				# every row to decide whether the status picker is editable --
+				# an auto half day must stay editable, a real leave must not.
+				"genuine_leave": bool(record.leave_type) and (
+					bool(record.leave_application)
+					or record.leave_type != settings.half_day_leave_type
+				),
 				"late_mark_band": record.custom_late_mark_band,
 				"overtime_hours": flt(record.custom_overtime_hours, 2),
+				"overtime_manual": bool(record.custom_overtime_manual),
+				"late_mark_manual": bool(record.custom_late_mark_manual),
 				"modified": str(record.modified),
 			}
 			_add_record_flags(row, record, day, is_holiday, holiday_dates, settings, emp, ot_eligible)
@@ -325,7 +334,8 @@ def _add_record_flags(row, record, day, is_holiday, holiday_dates, settings, emp
 		1 if (not is_holiday and is_early_exit(record.out_time, day, settings)) else 0
 	)
 
-	if expected_ot is not None and abs(flt(expected_ot) - att["overtime_hours"]) > 0.01:
+	if (not record.custom_overtime_manual) and expected_ot is not None \
+			and abs(flt(expected_ot) - att["overtime_hours"]) > 0.01:
 		_flag(row, FLAG_OT_DRIFT,
 			  f"Overtime shows {att['overtime_hours']}h, rules give {expected_ot}h",
 			  {"stored": att["overtime_hours"], "expected": expected_ot})
@@ -339,7 +349,8 @@ def _add_record_flags(row, record, day, is_holiday, holiday_dates, settings, emp
 			_flag(row, FLAG_STATUS_DRIFT,
 				  "Half Day no longer applies to these punches; recalculate to clear it")
 
-	if (expected_band or None) != (att["late_mark_band"] or None):
+	if (not record.custom_late_mark_manual) and \
+			(expected_band or None) != (att["late_mark_band"] or None):
 		_flag(row, FLAG_LATE_DRIFT,
 			  f"Late mark shows {att['late_mark_band'] or 'none'}, "
 			  f"rules give {expected_band or 'none'}",
