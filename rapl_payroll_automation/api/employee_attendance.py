@@ -36,6 +36,7 @@ from rapl_payroll_automation.api.attendance_data import (
 	get_band_definitions,
 	summarise,
 )
+from rapl_payroll_automation.api.ot_engine import is_ot_eligible
 from rapl_payroll_automation.api.payroll_automation_utils import (
 	get_automation_settings,
 	get_grade_ot_rule,
@@ -110,6 +111,9 @@ def _build_statement(employee, start_date, end_date, show_money, settings):
 		"employee": data["employee"].name,
 		"employee_name": data["employee"].employee_name,
 		"grade": data["employee"].grade,
+		# Employee.custom_ot -- when 0 the OT columns are dropped from the
+		# statement entirely rather than shown as a column of zeros.
+		"ot_eligible": is_ot_eligible(data["employee"].name),
 		"start_date": str(start_date),
 		"end_date": str(end_date),
 		"rows": rows,

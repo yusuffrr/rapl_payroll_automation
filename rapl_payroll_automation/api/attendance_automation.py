@@ -61,7 +61,7 @@
 # docstring and the Settings doctype's validate_half_day_leave_type()).
 
 import frappe
-from frappe.utils import flt, get_datetime, time_diff_in_hours
+from frappe.utils import flt, get_datetime, getdate, time_diff_in_hours
 
 from rapl_payroll_automation.api.payroll_automation_utils import (
 	get_all_holiday_dates,
@@ -71,81 +71,202 @@ from rapl_payroll_automation.api.payroll_automation_utils import (
 )
 from rapl_payroll_automation.api.ot_engine import (
 	NightShiftNotSupported,
-	compute_ot_for_attendance_doc,
+	compute_day_ot,
+	is_ot_eligible,
+	resolve_shift,
 )
 from erpnext.setup.doctype.employee.employee import get_holiday_list_for_employee
 
 
-def apply_attendance_deduction_logic(doc, method):
-	# Working hours first: OT's holiday branch reads it, and guard 3 (holiday)
-	# returns early, so this must happen before any of the guards below.
-	_fill_working_hours(doc)
+def derive_attendance_fields(
+	employee, attendance_date, in_time, out_time, working_hours, status,
+	leave_type, shift, settings, holiday_dates=None, ot_eligible=None,
+	leave_application=None, half_day_status=None,
+):
+	"""Apply every attendance rule to a set of VALUES and return the derived
+	fields. No document, no writes.
 
-	# Reset OT every run. Guards 1 and 2 below return early, and without this a
-	# record that previously earned OT would keep a stale value if it later
-	# became a leave day or had its in_time cleared (e.g. on amend).
-	# _set_overtime_fields() overwrites these whenever a real value is computed.
-	doc.custom_overtime_hours = 0
-	doc.custom_overtime = 0
+	Extracted so the Attendance Console can apply the identical rules to
+	records it edits by SQL. Attendance has no allow_on_submit fields (verified
+	against hrms attendance.json), so a submitted record cannot be edited
+	through the ORM and validate() cannot be made to fire -- the Console writes
+	directly and calls this to recompute. Without a shared function that path
+	would need its own copy of the rules, which is exactly how the OT
+	calculation ended up with two disagreeing implementations.
 
-	# --- Guard 1: leave-application-driven day (incl. half-day paid leave) ---
+	Returns a dict of the fields to write. Callers assign them; this never does.
+	Guard ORDER is significant and preserved exactly from the original hook.
+	"""
+	derived = {
+		# "rules_applied" False means an early guard fired (leave day, no
+		# check-in, or holiday). The original hook returned at those points
+		# WITHOUT resetting custom_late_mark_band / early_exit / status, so
+		# callers must assign only working_hours and the OT fields in that
+		# case. Getting this wrong would silently clear late marks on leave
+		# days.
+		"rules_applied": False,
+		"working_hours": working_hours,
+		"custom_overtime_hours": 0,
+		"custom_overtime": 0,
+		"custom_late_mark_band": None,
+		"early_exit": 0,
+		"status": status,
+		"half_day_status": half_day_status,
+		"leave_type": leave_type,
+		"cleared_half_day": False,
+	}
+
+	# --- working hours: only fill when empty (never clobber auto-attendance) ---
+	if not working_hours and in_time and out_time:
+		in_dt, out_dt = get_datetime(in_time), get_datetime(out_time)
+		if out_dt > in_dt:
+			derived["working_hours"] = time_diff_in_hours(out_dt, in_dt)
+
+	if ot_eligible is None:
+		ot_eligible = is_ot_eligible(employee)
+
+	def _ot(current_status):
+		if not in_time or not out_time:
+			return 0.0
+		try:
+			return flt(
+				compute_day_ot(
+					in_time=in_time,
+					out_time=out_time,
+					working_hours=derived["working_hours"],
+					attendance_date=attendance_date,
+					status=current_status,
+					shift=resolve_shift(shift, settings),
+					settings=settings,
+					holiday_dates=holiday_dates or set(),
+					ot_eligible=ot_eligible,
+				),
+				2,
+			)
+		except NightShiftNotSupported as e:
+			frappe.log_error(str(e), "RAPL OT: night shift not supported")
+			return 0.0
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), "RAPL OT: compute failed")
+			return 0.0
+
+	# --- Guard 1: GENUINE leave day ---
 	# check_leave_record() (native, runs earlier in Attendance's own validate())
-	# will have already set doc.leave_type from a real, approved Leave
-	# Application if one exists for this date. If it did, don't let our
-	# attendance-time logic override that -- a genuine leave decision takes
-	# priority over our automated lateness/early-exit rules.
-	if doc.leave_type:
-		return
+	# sets leave_type AND leave_application from a real approved Leave
+	# Application. A genuine leave decision outranks our lateness rules.
+	#
+	# BUT this guard used to test `leave_type` alone, and THIS function sets
+	# leave_type = settings.half_day_leave_type whenever it applies a Half Day.
+	# So every auto-applied Half Day tripped its own guard on the next save and
+	# froze: the band never recomputed, OT stayed 0, and correcting the punch
+	# could never lift the Half Day. Records sat wrong permanently.
+	#
+	# The automation's own marker is now recognised as ours and recomputed.
+	# Anything else -- a real Leave Application, or a manually chosen leave
+	# type -- still short-circuits untouched.
+	own_marker = settings.half_day_leave_type
+	genuine_leave = bool(leave_type) and (
+		bool(leave_application) or leave_type != own_marker
+	)
+	if genuine_leave:
+		return derived
 
-	# --- Guard 2: no check-in data at all (Absent, or genuinely not yet arrived) ---
-	if not doc.in_time:
-		return
+	# --- Guard 2: no check-in data at all ---
+	if not in_time:
+		return derived
 
-	# doc.in_time/out_time can arrive as plain strings (not yet cast to
-	# datetime) on a fresh, client-submitted document at this point in the
-	# save lifecycle -- confirmed via a real TypeError in production
-	# ('str' - 'datetime.datetime'). get_datetime() is idempotent: safe to
-	# call whether the value is already a datetime or still a string.
-	doc.in_time = get_datetime(doc.in_time)
+	# --- Guard 3: Sunday or any holiday -- OT only, no lateness rules ---
+	if holiday_dates and getdate(attendance_date) in holiday_dates:
+		hours = _ot(status)
+		derived["custom_overtime_hours"] = hours
+		derived["custom_overtime"] = 1 if hours > 0 else 0
+		return derived
+
+	derived["rules_applied"] = True
+
+	band_label, past_all_bands = match_late_band(in_time, settings)
+	derived["custom_late_mark_band"] = band_label
+	is_half_day = past_all_bands
+
+	if out_time and is_early_exit(out_time, attendance_date, settings):
+		is_half_day = True
+		derived["early_exit"] = 1
+
+	if is_half_day:
+		derived["status"] = "Half Day"
+		derived["half_day_status"] = "Absent"
+		derived["leave_type"] = settings.half_day_leave_type
+	elif status == "Half Day" and leave_type == own_marker and not leave_application:
+		# The rules no longer call for a Half Day and the existing one is OUR
+		# marker (not a real Leave Application, not a manual choice), so it was
+		# applied by an earlier run against punches that have since been
+		# corrected. Clear it. Without this the Half Day is one-way: the rules
+		# could add it but never remove it, so fixing a late punch left the
+		# employee on a half day's pay.
+		derived["status"] = "Present"
+		derived["half_day_status"] = None
+		derived["leave_type"] = None
+		derived["cleared_half_day"] = True
+
+	# Overtime last: it reads the status the Half Day branch may have changed.
+	hours = _ot(derived["status"])
+	derived["custom_overtime_hours"] = hours
+	derived["custom_overtime"] = 1 if hours > 0 else 0
+	return derived
+
+
+def apply_attendance_deduction_logic(doc, method):
+	"""Thin wrapper: gather values, apply the rules, assign the results."""
+	if doc.in_time:
+		# in_time/out_time can arrive as plain strings on a fresh document at
+		# this point in the save lifecycle -- confirmed via a real TypeError in
+		# production ('str' - 'datetime.datetime'). get_datetime() is
+		# idempotent, so this is safe either way.
+		doc.in_time = get_datetime(doc.in_time)
 	if doc.out_time:
 		doc.out_time = get_datetime(doc.out_time)
 
 	settings = get_automation_settings()
-
-	# --- Guard 3: Sunday or any holiday, per the configured Holiday List ---
-	# Voluntary-attendance days (overtime only) -- late-mark/half-day/early-exit
-	# rules don't apply here at all. Driven entirely by the Holiday List, not a
-	# hardcoded weekday check, so this respects whatever "Weekly Off" is
-	# actually configured (confirmed = Sunday for RAPL's "Public Holidays 2026").
 	holiday_list = get_holiday_list_for_employee(doc.employee)
-	if get_all_holiday_dates(holiday_list, doc.attendance_date, doc.attendance_date):
-		# Late/half-day/early-exit rules don't apply, but voluntary attendance on
-		# a holiday IS the main source of overtime -- so OT is still computed.
-		_set_overtime_fields(doc, settings)
+	holiday_dates = set(
+		get_all_holiday_dates(holiday_list, doc.attendance_date, doc.attendance_date) or []
+	)
+
+	derived = derive_attendance_fields(
+		employee=doc.employee,
+		attendance_date=doc.attendance_date,
+		in_time=doc.in_time,
+		out_time=doc.out_time,
+		working_hours=doc.working_hours,
+		status=doc.status,
+		leave_type=doc.leave_type,
+		shift=doc.get("shift"),
+		settings=settings,
+		holiday_dates=holiday_dates,
+		leave_application=doc.get("leave_application"),
+		half_day_status=doc.get("half_day_status"),
+	)
+
+	# Always assigned: the original filled working_hours and reset the OT
+	# fields before any guard could return.
+	doc.working_hours = derived["working_hours"]
+	doc.custom_overtime_hours = derived["custom_overtime_hours"]
+	doc.custom_overtime = derived["custom_overtime"]
+
+	if not derived["rules_applied"]:
 		return
 
-	# Reset our own field every run so re-validation (e.g. amend) recomputes cleanly
-	doc.custom_late_mark_band = None
-
-	band_label, past_all_bands = match_late_band(doc.in_time, settings)
-	doc.custom_late_mark_band = band_label
-	is_half_day = past_all_bands
-
-	# --- Early exit check -- stacks additively with any late-arrival band above ---
+	doc.custom_late_mark_band = derived["custom_late_mark_band"]
 	if doc.out_time:
-		doc.early_exit = 0
-		if is_early_exit(doc.out_time, doc.attendance_date, settings):
-			is_half_day = True
-			doc.early_exit = 1
-
-	if is_half_day:
+		doc.early_exit = derived["early_exit"]
+	if derived["status"] == "Half Day":
 		doc.status = "Half Day"
-		doc.half_day_status = "Absent"
-		doc.leave_type = settings.half_day_leave_type
-
-	# Overtime last: compute_day_ot() reads doc.status, which the Half Day
-	# assignment above may have just changed. A Half Day earns no OT.
-	_set_overtime_fields(doc, settings)
+		doc.half_day_status = derived["half_day_status"]
+		doc.leave_type = derived["leave_type"]
+	elif derived["cleared_half_day"]:
+		doc.status = derived["status"]
+		doc.half_day_status = None
+		doc.leave_type = None
 
 
 def match_late_band(in_time, settings):
@@ -191,50 +312,3 @@ def is_early_exit(out_time, attendance_date, settings):
 	return get_datetime(out_time) < cutoff
 
 
-def _fill_working_hours(doc):
-	"""Populate working_hours when it is empty.
-
-	ERPNext only ever calculates working_hours inside auto-attendance:
-	shift_type.process_auto_attendance() -> get_attendance() ->
-	employee_checkin.calculate_working_hours(), which derives it from Employee
-	Checkin logs. attendance.py itself contains no working_hours logic at all,
-	so an Attendance created by hand, by import, or without checkin logs keeps
-	working_hours = 0 no matter how many times it is saved.
-
-	Only fills when the field is empty. Never overwrites a value auto-attendance
-	produced -- under "Every Valid Check-in and Check-out" that value legitimately
-	excludes mid-day gaps, and clobbering it with a raw span would be wrong.
-
-	Matches ERPNext's own formula for the shift's current mode, "First Check-in
-	and Last Check-out": frappe.utils.time_diff_in_hours(out, in), i.e. the raw
-	span with no break deduction, rounded to 6 places.
-	"""
-	if doc.working_hours:
-		return
-	if not doc.in_time or not doc.out_time:
-		return
-
-	in_time = get_datetime(doc.in_time)
-	out_time = get_datetime(doc.out_time)
-	if out_time <= in_time:
-		# Bad punch (e.g. an in_time typed as 02:00). Leave it at 0 rather than
-		# invent a number -- a wrong working_hours would feed holiday OT.
-		return
-
-	doc.working_hours = time_diff_in_hours(out_time, in_time)
-
-
-def _set_overtime_fields(doc, settings):
-	"""Write custom_overtime_hours / custom_overtime. Never raises -- a shift
-	misconfiguration must not block an Attendance save."""
-	try:
-		ot_hours = compute_ot_for_attendance_doc(doc, settings)
-	except NightShiftNotSupported as e:
-		frappe.log_error(str(e), "RAPL OT: night shift not supported")
-		return
-	except Exception:
-		frappe.log_error(frappe.get_traceback(), "RAPL OT: compute failed")
-		return
-
-	doc.custom_overtime_hours = round(flt(ot_hours), 2)
-	doc.custom_overtime = 1 if doc.custom_overtime_hours > 0 else 0

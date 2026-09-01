@@ -34,6 +34,7 @@ from rapl_payroll_automation.api.attendance_automation import (
 from rapl_payroll_automation.api.ot_engine import (
 	NightShiftNotSupported,
 	compute_day_ot,
+	is_ot_eligible,
 	resolve_shift,
 )
 from rapl_payroll_automation.api.payroll_automation_utils import (
@@ -51,6 +52,7 @@ FLAG_OT_DRIFT = "ot_drift"
 FLAG_LATE_DRIFT = "late_drift"
 FLAG_OFF_DAY_WORKED = "off_day_worked"
 FLAG_ON_LEAVE = "on_leave"
+FLAG_STATUS_DRIFT = "status_drift"
 
 FLAG_LEVELS = {
 	FLAG_MISSING_PUNCH: "red",
@@ -59,6 +61,7 @@ FLAG_LEVELS = {
 	FLAG_OT_DRIFT: "amber",
 	FLAG_LATE_DRIFT: "amber",
 	FLAG_OFF_DAY_WORKED: "amber",
+	FLAG_STATUS_DRIFT: "amber",
 	FLAG_ON_LEAVE: "info",
 }
 
@@ -143,6 +146,9 @@ def build_month_rows(employee, start_date, end_date, settings=None):
 	holiday_list = get_holiday_list_for_employee(employee)
 	holiday_dates = set(get_all_holiday_dates(holiday_list, start_date, end_date) or [])
 
+	# Employee.custom_ot -- looked up once for the whole period, not per day.
+	ot_eligible = is_ot_eligible(employee)
+
 	holiday_names = {}
 	if holiday_list:
 		for h in frappe.get_all(
@@ -200,7 +206,7 @@ def build_month_rows(employee, start_date, end_date, settings=None):
 				"overtime_hours": flt(record.custom_overtime_hours, 2),
 				"modified": str(record.modified),
 			}
-			_add_record_flags(row, record, day, is_holiday, holiday_dates, settings, emp)
+			_add_record_flags(row, record, day, is_holiday, holiday_dates, settings, emp, ot_eligible)
 		elif in_service:
 			if cancelled_only:
 				_flag(row, FLAG_CANCELLED_ONLY, "Only a cancelled record exists for this day")
@@ -219,11 +225,23 @@ def _flag(row, code, message, extra=None):
 	row["flags"].append(entry)
 
 
-def _add_record_flags(row, record, day, is_holiday, holiday_dates, settings, emp):
+def _add_record_flags(row, record, day, is_holiday, holiday_dates, settings, emp, ot_eligible=True):
 	att = row["attendance"]
 
+	# A genuine leave is one backed by a Leave Application, or carrying a leave
+	# type the automation did not write. The automation's own half-day marker
+	# is NOT a leave for drift purposes -- treating it as one would skip
+	# recomputation on exactly the records most likely to be stale.
+	own_marker = settings.half_day_leave_type
+	genuine_leave = bool(record.leave_type) and (
+		bool(record.leave_application) or record.leave_type != own_marker
+	)
+	att["genuine_leave"] = genuine_leave
+
 	if record.leave_type:
-		_flag(row, FLAG_ON_LEAVE, f"On leave: {record.leave_type}",
+		_flag(row, FLAG_ON_LEAVE,
+			  f"On leave: {record.leave_type}" if genuine_leave
+			  else f"Auto half day ({record.leave_type})",
 			  {"leave_application": record.leave_application})
 
 	if record.status == "Present" and (not record.in_time or not record.out_time):
@@ -241,11 +259,13 @@ def _add_record_flags(row, record, day, is_holiday, holiday_dates, settings, emp
 			expected_working_hours = flt(time_diff_in_hours(out_dt, in_dt), 2)
 
 	expected_band = None
-	if not record.leave_type and not is_holiday and record.in_time:
-		expected_band, _past_all = match_late_band(record.in_time, settings)
+	expected_half_day = False
+	if not genuine_leave and not is_holiday and record.in_time:
+		expected_band, past_all_bands = match_late_band(record.in_time, settings)
+		expected_half_day = past_all_bands or is_early_exit(record.out_time, day, settings)
 
 	expected_ot = None
-	if not record.leave_type:
+	if not genuine_leave:
 		try:
 			expected_ot = flt(
 				compute_day_ot(
@@ -257,6 +277,7 @@ def _add_record_flags(row, record, day, is_holiday, holiday_dates, settings, emp
 					shift=resolve_shift(record.shift, settings),
 					settings=settings,
 					holiday_dates=holiday_dates,
+					ot_eligible=ot_eligible,
 				),
 				2,
 			)
@@ -264,6 +285,7 @@ def _add_record_flags(row, record, day, is_holiday, holiday_dates, settings, emp
 			expected_ot = None
 
 	att["expected_working_hours"] = expected_working_hours
+	att["expected_half_day"] = expected_half_day
 	att["expected_late_mark_band"] = expected_band
 	att["expected_overtime_hours"] = expected_ot
 	att["expected_early_exit"] = (
@@ -274,6 +296,15 @@ def _add_record_flags(row, record, day, is_holiday, holiday_dates, settings, emp
 		_flag(row, FLAG_OT_DRIFT,
 			  f"Overtime shows {att['overtime_hours']}h, rules give {expected_ot}h",
 			  {"stored": att["overtime_hours"], "expected": expected_ot})
+
+	if not genuine_leave and not is_holiday and record.in_time:
+		is_half_day_now = record.status == "Half Day"
+		if expected_half_day and not is_half_day_now:
+			_flag(row, FLAG_STATUS_DRIFT,
+				  "Rules call for Half Day; record shows " + (record.status or "-"))
+		elif is_half_day_now and not expected_half_day and record.leave_type == own_marker:
+			_flag(row, FLAG_STATUS_DRIFT,
+				  "Half Day no longer applies to these punches; recalculate to clear it")
 
 	if (expected_band or None) != (att["late_mark_band"] or None):
 		_flag(row, FLAG_LATE_DRIFT,

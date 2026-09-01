@@ -73,12 +73,37 @@ def resolve_shift(shift_name, settings):
 	return frappe.get_cached_doc("Shift Type", name)
 
 
-def compute_day_ot(in_time, out_time, working_hours, attendance_date, status, shift, settings, holiday_dates):
+def is_ot_eligible(employee):
+	"""Employee.custom_ot -- the OT-eligibility flag on the Employee master.
+
+	rapl_overtime_processing.get_employees() already filters its DEFAULT mode
+	on custom_ot = 1, so payroll has always been correct. But nothing gated the
+	Attendance field or the statement, so an ineligible employee accumulated
+	custom_overtime_hours they would never be paid for, and saw those hours on
+	their monthly statement. Gating here fixes all three surfaces at once.
+	"""
+	return bool(frappe.db.get_value("Employee", employee, "custom_ot"))
+
+
+def compute_day_ot(
+	in_time, out_time, working_hours, attendance_date, status, shift, settings,
+	holiday_dates, ot_eligible=True,
+):
 	"""Overtime hours for ONE day. Returns a float, never negative.
 
 	holiday_dates: a set/list of dates already resolved by the caller, so a
 	bulk loop resolves the Holiday List once rather than once per day.
+
+	ot_eligible: pass Employee.custom_ot. Defaults True so that
+	rapl_overtime_processing's two DELIBERATE override modes -- an explicit
+	employee list, and all_employees=True -- keep working exactly as documented
+	("every active Employee, regardless of attendance or custom_ot"). Its
+	default mode filters on custom_ot before it ever gets here, so passing True
+	from there is correct in all three modes.
 	"""
+	if not ot_eligible:
+		return 0.0
+
 	if not in_time or not out_time:
 		return 0.0
 
@@ -118,7 +143,12 @@ def compute_day_ot(in_time, out_time, working_hours, attendance_date, status, sh
 
 
 def compute_ot_for_attendance_doc(doc, settings):
-	"""Convenience wrapper for the Attendance validate hook (single document)."""
+	"""Convenience wrapper for the Attendance validate hook (single document).
+
+	Honours Employee.custom_ot: an employee not flagged for overtime never
+	accumulates custom_overtime_hours, so the field, the monthly statement and
+	what payroll actually pays cannot disagree.
+	"""
 	holiday_list = get_holiday_list_for_employee(doc.employee)
 	holiday_dates = get_all_holiday_dates(holiday_list, doc.attendance_date, doc.attendance_date)
 
@@ -133,4 +163,5 @@ def compute_ot_for_attendance_doc(doc, settings):
 		shift=shift,
 		settings=settings,
 		holiday_dates=holiday_dates,
+		ot_eligible=is_ot_eligible(doc.employee),
 	)

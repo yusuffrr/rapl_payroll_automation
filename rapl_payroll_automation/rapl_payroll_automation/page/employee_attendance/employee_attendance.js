@@ -174,6 +174,8 @@ frappe.pages["employee-attendance"].on_page_load = function (wrapper) {
 
 	function render_statement(s, page_break) {
 		const show = s.show_money;
+		// Employee.custom_ot = 0 -> drop the OT columns rather than print zeros.
+		const ot = s.ot_eligible !== false;
 		const pay = s.pay || {};
 		const totals = s.totals || {};
 		const brk = page_break ? "page-break-after: always;" : "";
@@ -186,11 +188,7 @@ frappe.pages["employee-attendance"].on_page_load = function (wrapper) {
 				</div>`
 			: "";
 
-		const money_headers = show
-			? `<th class="ea-num">${__("Cut")}</th><th class="ea-num">${__("OT")} &#8377;</th>`
-			: "";
-
-		const rows = s.rows.map((row) => render_row(row, show)).join("");
+		const rows = s.rows.map((row) => render_row(row, show, ot)).join("");
 
 		return `
 			<div class="ea-statement" style="${brk}">
@@ -211,22 +209,20 @@ frappe.pages["employee-attendance"].on_page_load = function (wrapper) {
 							<th class="ea-num" style="width:9%">${__("Hrs")}</th>
 							<th style="width:16%">${__("Status")}</th>
 							<th style="width:10%">${__("Late")}</th>
-							${show ? '<th class="ea-num" style="width:10%"></th>' : ""}
-							<th class="ea-num" style="width:9%">${__("OT")}</th>
-							${show ? '<th class="ea-num" style="width:11%"></th>' : ""}
+							${show ? `<th class="ea-num" style="width:10%">${__("Cut")}</th>` : ""}
+							${ot ? `<th class="ea-num" style="width:9%">${__("OT")}</th>` : ""}
+							${ot && show ? `<th class="ea-num" style="width:11%">${__("OT")} &#8377;</th>` : ""}
 						</tr>
 					</thead>
 					<tbody>${rows}</tbody>
 				</table>
-				${render_footer(s, show, totals)}
+				${render_footer(s, show, totals, ot)}
 			</div>`;
 	}
 
-	function render_row(row, show) {
+	function render_row(row, show, ot) {
 		const att = row.attendance;
 		const date_label = `${row.day_label} ${row.date.slice(8, 10)}`;
-		const money_cells = show ? '<td class="ea-num ea-dim">&mdash;</td><td class="ea-num ea-dim">&mdash;</td>' : "";
-
 		if (!att) {
 			if (row.is_holiday) {
 				const label = row.is_weekly_off
@@ -238,8 +234,8 @@ frappe.pages["employee-attendance"].on_page_load = function (wrapper) {
 						<td class="ea-dim">${row.is_weekly_off ? __("Weekly off") : __("Holiday")}</td>
 						<td class="ea-dim">&mdash;</td>
 						${show ? '<td class="ea-num ea-dim">&mdash;</td>' : ""}
-						<td class="ea-num ea-dim">&mdash;</td>
-						${show ? '<td class="ea-num ea-dim">&mdash;</td>' : ""}
+						${ot ? '<td class="ea-num ea-dim">&mdash;</td>' : ""}
+						${ot && show ? '<td class="ea-num ea-dim">&mdash;</td>' : ""}
 					</tr>`;
 			}
 			if (!row.in_service) return "";
@@ -248,8 +244,8 @@ frappe.pages["employee-attendance"].on_page_load = function (wrapper) {
 					<td colspan="3">${__("No attendance record")}</td>
 					<td>&mdash;</td><td class="ea-dim">&mdash;</td>
 					${show ? '<td class="ea-num ea-dim">&mdash;</td>' : ""}
-					<td class="ea-num ea-dim">&mdash;</td>
-					${show ? '<td class="ea-num ea-dim">&mdash;</td>' : ""}
+					${ot ? '<td class="ea-num ea-dim">&mdash;</td>' : ""}
+					${ot && show ? '<td class="ea-num ea-dim">&mdash;</td>' : ""}
 				</tr>`;
 		}
 
@@ -264,7 +260,7 @@ frappe.pages["employee-attendance"].on_page_load = function (wrapper) {
 				? `<td class="ea-num ea-cut">${money(att.late_deduction_amount)}</td>`
 				: '<td class="ea-num ea-dim">&mdash;</td>'
 			: "";
-		const ot_amount = show
+		const ot_amount = ot && show
 			? att.overtime_amount
 				? `<td class="ea-num ea-ot">${money(att.overtime_amount)}</td>`
 				: '<td class="ea-num ea-dim">&mdash;</td>'
@@ -278,7 +274,7 @@ frappe.pages["employee-attendance"].on_page_load = function (wrapper) {
 				<td>${status_label}</td>
 				<td>${att.late_mark_band ? '<b class="ea-late">' + frappe.utils.escape_html(att.late_mark_band) + "</b>" : '<span class="ea-dim">&mdash;</span>'}</td>
 				${cut}
-				<td class="ea-num">${att.overtime_hours ? "<b>" + flt(att.overtime_hours, 2) + "</b>" : '<span class="ea-dim">&mdash;</span>'}</td>
+				${ot ? `<td class="ea-num">${att.overtime_hours ? "<b>" + flt(att.overtime_hours, 2) + "</b>" : '<span class="ea-dim">&mdash;</span>'}</td>` : ""}
 				${ot_amount}
 			</tr>`;
 	}
@@ -288,7 +284,7 @@ frappe.pages["employee-attendance"].on_page_load = function (wrapper) {
 		return value.slice(11, 16);
 	}
 
-	function render_footer(s, show, totals) {
+	function render_footer(s, show, totals, ot) {
 		const bands = s.bands || [];
 		const counts = s.summary.band_counts || {};
 
@@ -317,12 +313,12 @@ frappe.pages["employee-attendance"].on_page_load = function (wrapper) {
 					${band_lines || '<div class="ea-dim">' + __("None") + "</div>"}
 					${show ? `<div class="ea-total"><span>${__("Deducted")}</span><b class="ea-cut">${money(totals.late_deduction_amount)}</b></div>` : ""}
 				</div>
-				<div>
+				${!ot ? "" : `<div>
 					<div class="ea-foot-h">${__("Overtime")}</div>
 					<div><span>${__("Hours")}</span><b>${flt(s.summary.overtime_hours, 2)}</b></div>
 					${show ? `<div><span>${flt(s.summary.overtime_hours, 2)} &times; ${money(s.pay.hourly_rate)}</span></div>` : ""}
 					${show ? `<div class="ea-total"><span>${__("Earned")}</span><b class="ea-ot">${money(totals.overtime_amount)}</b></div>` : ""}
-				</div>
+				</div>`}
 			</div>`;
 	}
 };
