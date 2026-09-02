@@ -145,6 +145,33 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		{ w: "7%", label: () => __("OT") + " \u20b9", num: true },
 	];
 
+	// ---------------------------------------------------------------- overrides
+	//
+	// Summary-row overrides live here, keyed by employee, and are session only:
+	// the durable record is the RAPL Overtime / Late Mark Processing draft the
+	// values are written into. Day-level pins are different -- those persist on
+	// the Attendance record itself via custom_overtime_manual /
+	// custom_late_mark_manual, because that is what future saves recompute.
+
+	function ov(employee, field, computed) {
+		const o = state.overrides.get(employee);
+		return o && field in o ? o[field] : computed;
+	}
+
+	function set_ov(employee, field, value) {
+		const o = state.overrides.get(employee) || {};
+		o[field] = value;
+		state.overrides.set(employee, o);
+	}
+
+	function hhmm_from_seconds(seconds) {
+		const s = Math.max(0, Math.round(flt(seconds)));
+		if (!s) return "";
+		const h = Math.floor(s / 3600);
+		const m = Math.round((s % 3600) / 60);
+		return `${h}:${String(m).padStart(2, "0")}`;
+	}
+
 	function render() {
 		if (!state.data || !state.data.groups.length) {
 			status(__("Nothing to show for this period."));
@@ -250,6 +277,13 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 
 		const pending = state.pending.get(att.name);
 		const val = (f) => (pending && f in pending ? pending[f] : att[f]);
+		// The pending map is keyed by the SERVER field names (apply_edits reads
+		// custom_overtime_hours / custom_late_mark_band), but attendance_data
+		// publishes them to the browser without the custom_ prefix. Reading the
+		// prefixed name straight off att gave undefined, so the OT input
+		// rendered blank on every row and the band never preselected.
+		const pv = (pending_key, att_value) =>
+			pending && pending_key in pending ? pending[pending_key] : att_value;
 		const e = g.entry;
 		// Per-day money is display only -- the payable figures live on the
 		// summary row above, and now sit in the same columns as these.
@@ -265,9 +299,9 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 				<td><input class="ac-out ac-cell" value="${hhmm(val("out_time"))}" placeholder="--:--"></td>
 				<td class="ac-num">${att.working_hours ? flt(att.working_hours, 2) : '<span class="ea-dim">&mdash;</span>'}</td>
 				<td>${status_select(val("status"), att)}</td>
-				<td>${band_select(val("custom_late_mark_band"), att, bands)}</td>
+				<td>${band_select(pv("custom_late_mark_band", att.late_mark_band), att, bands)}</td>
 				<td class="ac-num"><input class="ac-cell ac-day-ot ${att.overtime_manual ? "ac-pinned" : ""}"
-					value="${hhmm_from_seconds(flt(val("custom_overtime_hours")) * 3600)}" placeholder="0:00"
+					value="${hhmm_from_seconds(flt(pv("custom_overtime_hours", att.overtime_hours)) * 3600)}" placeholder="0:00"
 					title="${att.overtime_manual ? __("Set by hand - the rules will not recalculate this day") : __("Leave blank for automatic")}"></td>
 				<td class="ac-num ea-dim">${att.overtime_hours ? flt(att.overtime_hours, 2) : "&mdash;"}</td>
 				<td class="ac-num">${cut ? `<span class="ea-cut">${Math.round(cut)}</span>` : '<span class="ea-dim">&mdash;</span>'}</td>
@@ -279,7 +313,10 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		// Editable so a single day's late mark can be waived without falsifying
 		// the punch. Choosing anything here sets custom_late_mark_manual, which
 		// stops the rules recalculating this day; "auto" clears it again.
-		const opts = ['<option value="">' + __("none") + "</option>"]
+		// "none" must NOT send an empty string: the server treats empty as
+		// "reset to automatic", so waiving a late mark would silently come back
+		// on the next save. __none__ means "pinned, and the band is cleared".
+		const opts = ['<option value="__none__"' + (value === null || value === "" ? " selected" : "") + ">" + __("none") + "</option>"]
 			.concat(bands.map((b) =>
 				`<option value="${frappe.utils.escape_html(b.label)}" ${b.label === value ? "selected" : ""}>${frappe.utils.escape_html(b.label)}</option>`))
 			.join("");
@@ -387,6 +424,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 			entry.custom_overtime_hours = v === "" ? "" : seconds_from_hhmm(v) / 3600;
 		} else {
 			const v = $(this).val();
+			// "" resets to automatic; "__none__" pins a cleared band.
 			entry.custom_late_mark_band = v === "__auto__" ? "" : v;
 		}
 		state.pending.set(name, entry);

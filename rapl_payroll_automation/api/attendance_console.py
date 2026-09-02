@@ -370,7 +370,14 @@ def apply_edits(changes, confirm_processed=0):
 				continue
 			value = change[field]
 			if value in (None, ""):
+				# Reset this day to automatic -- the rules take it back over.
 				record[flag] = 0
+				record[field] = None
+			elif value == "__none__":
+				# Pinned, but cleared: a deliberately waived late mark. Distinct
+				# from "" so the waiver survives future saves instead of being
+				# recalculated straight back.
+				record[flag] = 1
 				record[field] = None
 			else:
 				record[flag] = 1
@@ -609,8 +616,16 @@ def _apply_overrides(doc, kind, overrides, bands):
 					setattr(row, key, int(values[key] or 0))
 			if values.get("per_day_rate") is not None:
 				row.per_day_rate = flt(values["per_day_rate"])
-			if values.get("amount") is not None:
-				row.amount = flt(values["amount"])
+			# The Console keys the late-mark total as "late_amount", not
+			# "amount": one employee has BOTH an overtime amount and a late-mark
+			# amount, and the override dict is keyed per employee, so a single
+			# "amount" key would collide. "amount" is still accepted as a
+			# fallback for any older payload.
+			late_amount = values.get("late_amount")
+			if late_amount is None:
+				late_amount = values.get("amount")
+			if late_amount is not None:
+				row.amount = flt(late_amount)
 			else:
 				fraction = sum(
 					flt(b["fraction"]) * int(getattr(row, f"band_{i}_count", 0) or 0)
