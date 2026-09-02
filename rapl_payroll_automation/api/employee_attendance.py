@@ -183,7 +183,7 @@ def get_bulk_statements(employees, start_date=None, end_date=None):
 	if not start_date or not end_date:
 		frappe.throw("Set a period first")
 
-	employees = frappe.parse_json(employees)
+	employees = frappe.parse_json(employees) if employees not in (None, "") else []
 	settings = get_automation_settings()
 	return [
 		_build_statement(emp, start_date, end_date, True, settings)

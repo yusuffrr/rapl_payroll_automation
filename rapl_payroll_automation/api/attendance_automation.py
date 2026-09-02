@@ -90,7 +90,7 @@ def derive_attendance_fields(
 	leave_type, shift, settings, holiday_dates=None, ot_eligible=None,
 	leave_application=None, half_day_status=None,
 	overtime_manual=0, late_mark_manual=0, current_overtime_hours=None,
-	current_late_mark_band=None,
+	current_late_mark_band=None, status_manual=0,
 ):
 	"""Apply every attendance rule to a set of VALUES and return the derived
 	fields. No document, no writes.
@@ -114,6 +114,15 @@ def derive_attendance_fields(
 	# about that day's overtime, and a shared flag would freeze both.
 	overtime_manual = cint(overtime_manual)
 	late_mark_manual = cint(late_mark_manual)
+	# status_manual pins status, half_day_status AND leave_type together --
+	# they move as a set. Pinning the status alone would leave a stale
+	# "Auto Attendance Half Day Leave" marker on a day now marked Present,
+	# and Guard 1 would then freeze the record on the next save.
+	#
+	# This pin is the consequential one: status drives payment days
+	# (salary_slip counts Absent, and Half Day + half_day_status == "Absent"),
+	# so a pinned Present on a day someone left early is a full day's pay.
+	status_manual = cint(status_manual)
 
 	derived = {
 		# "rules_applied" False means an early guard fired (leave day, no
@@ -236,7 +245,14 @@ def derive_attendance_fields(
 	# ORDER MATTERS. Clearing must be tested BEFORE the "ensure half_day_status"
 	# branch, or an incoming Half Day would always re-assert itself and a
 	# corrected punch could never lift it.
-	if is_half_day:
+	if status_manual:
+		# Held by hand. Leave status, half_day_status and leave_type exactly as
+		# they are -- but the band and overtime above still recompute, because
+		# pinning "Present" says nothing about how late someone arrived.
+		derived["status"] = status
+		derived["half_day_status"] = half_day_status
+		derived["leave_type"] = leave_type
+	elif is_half_day:
 		derived["status"] = "Half Day"
 		derived["half_day_status"] = "Absent"
 		derived["leave_type"] = settings.half_day_leave_type
@@ -300,6 +316,7 @@ def apply_attendance_deduction_logic(doc, method):
 		leave_application=doc.get("leave_application"),
 		half_day_status=doc.get("half_day_status"),
 		overtime_manual=doc.get("custom_overtime_manual"),
+		status_manual=doc.get("custom_status_manual"),
 		late_mark_manual=doc.get("custom_late_mark_manual"),
 		current_overtime_hours=doc.get("custom_overtime_hours"),
 		current_late_mark_band=doc.get("custom_late_mark_band"),
@@ -317,7 +334,9 @@ def apply_attendance_deduction_logic(doc, method):
 	doc.custom_late_mark_band = derived["custom_late_mark_band"]
 	if doc.out_time:
 		doc.early_exit = derived["early_exit"]
-	if derived["status"] == "Half Day":
+	if cint(doc.get("custom_status_manual")):
+		pass  # held by hand -- the band and OT above are still refreshed
+	elif derived["status"] == "Half Day":
 		doc.status = "Half Day"
 		doc.half_day_status = derived["half_day_status"]
 		doc.leave_type = derived["leave_type"]

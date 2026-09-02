@@ -57,8 +57,27 @@ OVERRIDE_FIELDS = {
 	"custom_late_mark_band": "custom_late_mark_manual",
 }
 
+#: Visit types. NOT statuses -- attendance.py hardcodes the allowed status list
+#: and throws on anything outside it, so "Site Visit" cannot be one.
+VISIT_TYPES = ("Site Visit", "Client Visit", "Vendor Visit")
+
 
 MAX_ROWS_PER_APPLY = 500
+
+
+def _json(value, default=None):
+	"""Parse a JSON argument that may arrive as an empty string.
+
+	A JS `null` sent through frappe.call arrives server-side as "" -- not None.
+	isinstance("", str) is True, so guarding on the type alone still reached
+	frappe.parse_json(""), which raises JSONDecodeError on a zero-length
+	document. Every optional JSON argument on this page hit that.
+	"""
+	if value is None or value == "":
+		return default
+	if isinstance(value, str):
+		return frappe.parse_json(value)
+	return value
 
 
 def _require_hr(ptype="read"):
@@ -116,8 +135,7 @@ def get_console_data(start_date=None, end_date=None, employees=None, only_flagge
 	_require_hr("read")
 	start_date, end_date = _period_bounds(start_date, end_date)
 
-	if isinstance(employees, str):
-		employees = frappe.parse_json(employees)
+	employees = _json(employees)
 	only_flagged = int(only_flagged or 0)
 
 	settings = get_automation_settings()
@@ -235,6 +253,7 @@ def _recompute(record, settings):
 		leave_application=record.get("leave_application"),
 		half_day_status=record.get("half_day_status"),
 		overtime_manual=record.get("custom_overtime_manual"),
+		status_manual=record.get("custom_status_manual"),
 		late_mark_manual=record.get("custom_late_mark_manual"),
 		current_overtime_hours=record.get("custom_overtime_hours"),
 		current_late_mark_band=record.get("custom_late_mark_band"),
@@ -256,8 +275,7 @@ def apply_edits(changes, confirm_processed=0):
 	are written and invalid ones are returned with a reason.
 	"""
 	_require_hr("write")
-	if isinstance(changes, str):
-		changes = frappe.parse_json(changes)
+	changes = _json(changes, [])
 	if not changes:
 		return {"applied": [], "failed": []}
 	if len(changes) > MAX_ROWS_PER_APPLY:
@@ -268,7 +286,7 @@ def apply_edits(changes, confirm_processed=0):
 
 	settings = get_automation_settings()
 	applied, failed = [], []
-	confirmed = frappe.parse_json(confirm_processed) if isinstance(confirm_processed, str) else confirm_processed
+	confirmed = _json(confirm_processed, 0)
 
 	for change in changes:
 		name = change.get("name")
@@ -281,7 +299,9 @@ def apply_edits(changes, confirm_processed=0):
 			["name", "employee", "attendance_date", "docstatus", "status", "leave_type",
 			 "leave_application", "half_day_status", "in_time", "out_time",
 			 "working_hours", "shift", "modified", "custom_overtime_hours",
-			 "custom_late_mark_band", "custom_overtime_manual", "custom_late_mark_manual"],
+			 "custom_late_mark_band", "custom_overtime_manual",
+			 "custom_late_mark_manual", "custom_status_manual",
+			 "custom_attendance_type"],
 			as_dict=True,
 		)
 		if not current:
@@ -348,6 +368,22 @@ def apply_edits(changes, confirm_processed=0):
 			continue
 
 		record = dict(current)
+
+		# Choosing a status by hand pins it: without this the rules re-apply
+		# Half Day for a late arrival or early exit on the very next save, and
+		# a deliberate override could never stick.
+		if "status" in change and change["status"] and change["status"] != current.status:
+			record["custom_status_manual"] = 1
+		elif change.get("reset_status") :
+			record["custom_status_manual"] = 0
+
+		if "custom_attendance_type" in change:
+			value = change["custom_attendance_type"] or None
+			if value and value not in VISIT_TYPES:
+				failed.append({"name": name, "error": f"Unknown visit type '{value}'"})
+				continue
+			record["custom_attendance_type"] = value
+
 		for field in EDITABLE_FIELDS:
 			if field in change:
 				value = change[field] or None
@@ -359,6 +395,19 @@ def apply_edits(changes, confirm_processed=0):
 			if get_datetime(record["out_time"]) <= get_datetime(record["in_time"]):
 				failed.append({"name": name, "error": "Check-out is not after check-in"})
 				continue
+
+		# A Present day with no punches at all needs a reason, or every site
+		# visit reads as a forgotten punch and the missing-punch flag stops
+		# meaning anything. Enforced HERE rather than in Attendance.validate()
+		# so the doctype stays usable for imports and manual entry.
+		if (record["status"] == "Present" and not record["in_time"]
+				and not record["out_time"] and not record.get("custom_attendance_type")):
+			failed.append({
+				"name": name,
+				"error": "Present with no check-in or check-out needs a visit type "
+						 "(Site / Client / Vendor Visit).",
+			})
+			continue
 
 		# working_hours is recomputed from scratch, so clear it first -- the
 		# rules only FILL it when empty and would otherwise keep a stale value
@@ -396,6 +445,8 @@ def apply_edits(changes, confirm_processed=0):
 			"modified_by": frappe.session.user,
 			"custom_overtime_manual": cint(record.get("custom_overtime_manual")),
 			"custom_late_mark_manual": cint(record.get("custom_late_mark_manual")),
+			"custom_status_manual": cint(record.get("custom_status_manual")),
+			"custom_attendance_type": record.get("custom_attendance_type"),
 		}
 		if derived["rules_applied"]:
 			update["custom_late_mark_band"] = derived["custom_late_mark_band"]
@@ -457,7 +508,8 @@ def _audit(name, before, after):
 	changed = []
 	for field in ("in_time", "out_time", "status", "working_hours", "leave_type",
 				  "custom_late_mark_band", "custom_overtime_hours", "early_exit",
-				  "custom_overtime_manual", "custom_late_mark_manual"):
+				  "custom_overtime_manual", "custom_late_mark_manual",
+				  "custom_status_manual", "custom_attendance_type"):
 		if field not in after:
 			continue
 		old, new = before.get(field), after.get(field)
@@ -482,8 +534,7 @@ def recalculate(names):
 	"""Re-apply the rules without changing punches -- clears drift on records
 	corrected outside the app."""
 	_require_hr("write")
-	if isinstance(names, str):
-		names = frappe.parse_json(names)
+	names = _json(names, [])
 	return apply_edits([{"name": n} for n in (names or [])])
 
 
@@ -502,8 +553,7 @@ def create_attendance(rows):
 	a status that changed underneath is visible rather than silent.
 	"""
 	_require_hr("create")
-	if isinstance(rows, str):
-		rows = frappe.parse_json(rows)
+	rows = _json(rows, [])
 
 	created, failed = [], []
 	for index, row in enumerate(rows or []):
@@ -665,10 +715,8 @@ def create_processing_draft(
 	if not doctype:
 		frappe.throw("Unknown processing type")
 
-	if isinstance(employees, str):
-		employees = frappe.parse_json(employees)
-	if isinstance(overrides, str):
-		overrides = frappe.parse_json(overrides)
+	employees = _json(employees)
+	overrides = _json(overrides, {})
 	overrides = overrides or {}
 
 	# An employee with Employee.custom_ot = 0 is skipped by get_employees()'s

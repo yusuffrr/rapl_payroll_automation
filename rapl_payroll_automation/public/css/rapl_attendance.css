@@ -107,3 +107,10 @@ select.ac-cell { padding-right: 2px; }
    recalculate it until it is reset to automatic. */
 .ac-pinned { border-color: var(--orange-400, #e5a44b) !important;
 	background: var(--bg-orange, #fdf5e9) !important; font-weight: 600; }
+
+/* Visit type required but empty: a Present day with no punches at all. */
+.ac-required { border-color: var(--red-400, #e08b8b) !important;
+	background: var(--bg-red, #fceaea) !important; }
+
+/* Inline Create sits beside the row's message, not adrift on the far right. */
+.ac-create-inline { margin-left: 10px; }

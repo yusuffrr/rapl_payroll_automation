@@ -123,7 +123,7 @@ def _serialize(rows):
 
 @frappe.whitelist()
 def get_bulk_attendance_data(employees, month, year):
-	employees = frappe.parse_json(employees)
+	employees = frappe.parse_json(employees) if employees not in (None, "") else []
 	results = {}
 
 	for emp in employees:
@@ -140,7 +140,7 @@ def get_bulk_attendance_data(employees, month, year):
 
 @frappe.whitelist()
 def get_bulk_attendance_pdf(employees, month, year):
-	employees = frappe.parse_json(employees)
+	employees = frappe.parse_json(employees) if employees not in (None, "") else []
 	from frappe.utils.pdf import get_pdf
 
 	html_parts = []

@@ -101,7 +101,8 @@ def _fetch_attendance(employee, start_date, end_date):
 			"in_time", "out_time", "working_hours", "shift", "late_entry",
 			"early_exit", "leave_type", "leave_application",
 			"custom_late_mark_band", "custom_overtime_hours", "custom_overtime",
-			"custom_overtime_manual", "custom_late_mark_manual", "modified",
+			"custom_overtime_manual", "custom_late_mark_manual",
+			"custom_status_manual", "custom_attendance_type", "modified",
 		],
 		order_by="attendance_date, docstatus",
 	)
@@ -227,6 +228,8 @@ def build_month_rows(employee, start_date, end_date, settings=None):
 				"overtime_hours": flt(record.custom_overtime_hours, 2),
 				"overtime_manual": bool(record.custom_overtime_manual),
 				"late_mark_manual": bool(record.custom_late_mark_manual),
+				"status_manual": bool(record.custom_status_manual),
+				"attendance_type": record.custom_attendance_type,
 				"modified": str(record.modified),
 			}
 			_add_record_flags(row, record, day, is_holiday, holiday_dates, settings, emp, ot_eligible)
@@ -287,8 +290,11 @@ def _add_record_flags(row, record, day, is_holiday, holiday_dates, settings, emp
 				  f"check-in {str(first)[11:16]}")
 
 	if record.status == "Present" and (not record.in_time or not record.out_time):
-		missing = "check-out" if record.in_time else "check-in"
-		_flag(row, FLAG_MISSING_PUNCH, f"Missing {missing}")
+		if not (record.custom_attendance_type and not record.in_time and not record.out_time):
+			# A Present day with BOTH punches empty and a visit type recorded is
+			# a site visit, not a forgotten punch. Anything else still flags.
+			missing = "check-out" if record.in_time else "check-in"
+			_flag(row, FLAG_MISSING_PUNCH, f"Missing {missing}")
 
 	if is_holiday:
 		_flag(row, FLAG_OFF_DAY_WORKED, "Attendance marked on a holiday or weekly off")
@@ -363,7 +369,7 @@ def summarise(rows, settings=None):
 
 	summary = {
 		"present": 0, "half_day": 0, "absent": 0, "on_leave": 0,
-		"holiday": 0, "no_record": 0,
+		"holiday": 0, "no_record": 0, "wfh": 0,
 		"overtime_hours": 0.0, "band_counts": {},
 		"red_flags": 0, "amber_flags": 0,
 	}
@@ -383,10 +389,15 @@ def summarise(rows, settings=None):
 				summary["no_record"] += 1
 			continue
 
+		# Work From Home is a separate status but is a working day and is paid
+		# in full, so it counts toward Present. Tracked separately too, so the
+		# figure can be explained.
 		status_key = {
-			"Present": "present", "Half Day": "half_day",
-			"Absent": "absent", "On Leave": "on_leave",
+			"Present": "present", "Work From Home": "present",
+			"Half Day": "half_day", "Absent": "absent", "On Leave": "on_leave",
 		}.get(att["status"])
+		if att["status"] == "Work From Home":
+			summary["wfh"] = summary.get("wfh", 0) + 1
 		if status_key:
 			summary[status_key] += 1
 

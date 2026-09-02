@@ -131,18 +131,19 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 	// day-level column it is the total of: Cut over Cut, OT h over OT h,
 	// OT money over OT money. Two separate tables could never line up, and the
 	// mismatched widths were the reason the page looked unbalanced.
+	const VISIT_TYPES = ["Site Visit", "Client Visit", "Vendor Visit"];
+
 	const COLS = [
-		{ w: "3%" }, { w: "4%" },
-		{ w: "16%", label: () => __("Employee") + " / " + __("Date") },
-		{ w: "9%", label: () => __("In") },
-		{ w: "9%", label: () => __("Out") },
+		{ w: "5%" }, { w: "4%" },
+		{ w: "13%", label: () => __("Date") },
+		{ w: "10%", label: () => __("In") },
+		{ w: "10%", label: () => __("Out") },
 		{ w: "7%", label: () => __("Hrs"), num: true },
-		{ w: "13%", label: () => __("Status") },
+		{ w: "14%", label: () => __("Status") },
+		{ w: "12%", label: () => __("Visit") },
 		{ w: "10%", label: () => __("Late") },
-		{ w: "9%", label: () => __("OT h:mm"), num: true },
-		{ w: "6%", label: () => __("OT h"), num: true },
+		{ w: "8%", label: () => __("OT h:mm"), num: true },
 		{ w: "7%", label: () => __("Cut") + " \u20b9", num: true },
-		{ w: "7%", label: () => __("OT") + " \u20b9", num: true },
 	];
 
 	// ---------------------------------------------------------------- overrides
@@ -229,7 +230,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 					g.ot_eligible ? "" : ` <span class="ea-dim" title="${__("Employee.custom_ot is off - automatic OT is not calculated, but you can still enter it by hand")}">&middot; ${__("manual OT")}</span>`
 				}${processed.length ? ` <span class="ea-late">&middot; ${processed.join(" &middot; ")}</span>` : ""}</td>
 				<td colspan="4" class="ac-rates">
-					<span class="ea-dim">${frappe.utils.escape_html(g.grade || "")} &middot; P ${s.present} &middot; HD ${s.half_day} &middot; L ${s.on_leave}</span>
+					<span class="ea-dim">${frappe.utils.escape_html(g.grade || "")} &middot; ${__("Present")} <b>${s.present}</b>${s.wfh ? ` <span class="ea-dim">(${__("incl. {0} WFH", [s.wfh])})</span>` : ""} &middot; ${__("Half day")} <b>${s.half_day}</b> &middot; ${__("Leave")} <b>${s.on_leave}</b> &middot; ${__("Absent")} <b>${s.absent}</b></span>
 					<span class="ac-band-wrap"><label>&#8377;/${__("day")}</label>
 						<input class="ac-cell ac-sum" data-employee="${emp}" data-field="per_day_rate" value="${per_day || ""}" placeholder="0"></span>
 					<span class="ac-band-wrap"><label>&#8377;/${__("hr")}</label>
@@ -239,7 +240,6 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 				<td class="ac-num"><input class="ac-cell ac-sum" data-employee="${emp}" data-field="ot_hours_hhmm" value="${ot_secs ? hhmm_from_seconds(ot_secs) : ""}" placeholder="0:00"></td>
 				<td class="ac-num ea-dim">${flt(s.overtime_hours, 2) || "&mdash;"}</td>
 				<td class="ac-num"><input class="ac-cell ac-sum ea-cut" data-employee="${emp}" data-field="late_amount" value="${late_amount || ""}" placeholder="0"></td>
-				<td class="ac-num"><input class="ac-cell ac-sum ea-ot" data-employee="${emp}" data-field="amount" value="${ot_amount || ""}" placeholder="0"></td>
 			</tr>`];
 
 		if (open) rows.push(g.rows.map((row) => render_day(g, row, bands)).join(""));
@@ -257,21 +257,21 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 
 		if (!att) {
 			if (row.is_holiday) {
-				return `<tr class="ac-day ea-off"><td></td>${flag_cell}
+				return `<tr class="ac-day ea-off" data-date="${row.date}" data-employee="${g.employee}"><td></td>${flag_cell}
 					<td class="ea-dim ac-indent">${date_label}</td>
-					<td colspan="3" class="ea-dim">${row.is_weekly_off ? __("Weekly off") : frappe.utils.escape_html(row.holiday_description || __("Holiday"))}</td>
-					<td class="ea-dim">&mdash;</td><td class="ea-dim">&mdash;</td>${dash}${dash}${dash}${dash}</tr>`;
+					<td colspan="8" class="ea-dim">${row.is_weekly_off ? __("Weekly off") : frappe.utils.escape_html(row.holiday_description || __("Holiday"))}
+						${g.can_create ? `<button class="btn btn-xs ac-create ac-create-inline">${__("Create")}</button>` : ""}</td>
+				</tr>`;
 			}
 			if (!row.in_service) return "";
 			const cancelled = (row.flags || []).some((f) => f.code === "cancelled_only");
 			const action = g.can_create
-				? `<button class="btn btn-xs ac-create">${__("Create")}</button>`
+				? `<button class="btn btn-xs ac-create ac-create-inline">${__("Create")}</button>`
 				: `<span class="ea-dim">${__("Left")}</span>`;
 			return `<tr class="ac-day ea-missing" data-date="${row.date}" data-employee="${g.employee}">
 					<td></td>${flag_cell}
 					<td class="ac-indent">${date_label}</td>
-					<td colspan="5">${cancelled ? __("Only a cancelled record exists") : __("No attendance record")}</td>
-					<td colspan="4" class="ac-num">${action}</td>
+					<td colspan="8">${cancelled ? __("Only a cancelled record exists") : __("No attendance record")} ${action}</td>
 				</tr>`;
 		}
 
@@ -299,13 +299,12 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 				<td><input class="ac-out ac-cell" value="${hhmm(val("out_time"))}" placeholder="--:--"></td>
 				<td class="ac-num">${att.working_hours ? flt(att.working_hours, 2) : '<span class="ea-dim">&mdash;</span>'}</td>
 				<td>${status_select(val("status"), att)}</td>
+				<td>${visit_select(pv("custom_attendance_type", att.attendance_type), att, val)}</td>
 				<td>${band_select(pv("custom_late_mark_band", att.late_mark_band), att, bands)}</td>
 				<td class="ac-num"><input class="ac-cell ac-day-ot ${att.overtime_manual ? "ac-pinned" : ""}"
 					value="${hhmm_from_seconds(flt(pv("custom_overtime_hours", att.overtime_hours)) * 3600)}" placeholder="0:00"
 					title="${att.overtime_manual ? __("Set by hand - the rules will not recalculate this day") : __("Leave blank for automatic")}"></td>
-				<td class="ac-num ea-dim">${att.overtime_hours ? flt(att.overtime_hours, 2) : "&mdash;"}</td>
 				<td class="ac-num">${cut ? `<span class="ea-cut">${Math.round(cut)}</span>` : '<span class="ea-dim">&mdash;</span>'}</td>
-				<td class="ac-num">${ot_amount ? `<span class="ea-ot">${Math.round(ot_amount)}</span>` : '<span class="ea-dim">&mdash;</span>'}</td>
 			</tr>`;
 	}
 
@@ -325,6 +324,20 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 			<option value="__auto__">${__("auto")}</option>${opts}</select>`;
 	}
 
+	function visit_select(value, att, val) {
+		// Required only when Present with BOTH punches empty. Without it every
+		// site visit reads as a forgotten punch and the flag stops meaning
+		// anything. Never required when a punch exists, or for Work From Home.
+		const status = val("status");
+		const required = status === "Present" && !val("in_time") && !val("out_time");
+		const opts = ['<option value="">&mdash;</option>']
+			.concat(VISIT_TYPES.map((t) =>
+				`<option value="${t}" ${t === value ? "selected" : ""}>${__(t)}</option>`))
+			.join("");
+		return `<select class="ac-cell ac-visit ${required && !value ? "ac-required" : ""} ${value ? "" : "ea-dim"}"
+			title="${required ? __("Required: Present with no punch times") : __("Optional")}">${opts}</select>`;
+	}
+
 	function status_select(value, att) {
 		// Locked ONLY for a real leave -- one backed by a Leave Application, or
 		// carrying a leave type the automation did not write. An auto-applied
@@ -338,8 +351,9 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		// check_leave_record() never runs -- payroll would find no leave to
 		// deduct against. On Leave belongs to an approved Leave Application.
 		const options = ["Present", "Absent", "Half Day", "Work From Home"];
-		const auto_hd = att.leave_type && !att.genuine_leave;
-		return `<select class="ac-status ac-cell" ${auto_hd ? 'title="' + __("Auto half day - editable") + '"' : ""}>${options
+		const pinned = att.status_manual;
+		return `<select class="ac-status ac-cell ${pinned ? "ac-pinned" : ""}"
+			title="${pinned ? __("Status set by hand - the rules will not re-apply Half Day for this day") : __("Automatic")}">${options
 			.map((o) => `<option value="${o}" ${o === value ? "selected" : ""}>${__(o)}</option>`)
 			.join("")}</select>`;
 	}
@@ -410,6 +424,18 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		}
 		state.overrides.set(employee, o);
 		render();
+	});
+
+	$body.on("change", ".ac-visit", function () {
+		const $tr = $(this).closest("tr");
+		const name = $tr.data("name");
+		const att = find_attendance(name);
+		if (!att) return;
+		const entry = state.pending.get(name) || { name, modified: att.modified };
+		entry.custom_attendance_type = $(this).val() || "";
+		state.pending.set(name, entry);
+		$tr.addClass("ac-dirty");
+		render_footer();
 	});
 
 	$body.on("change", ".ac-day-ot, .ac-day-band", function () {
