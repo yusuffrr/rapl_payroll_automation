@@ -53,45 +53,66 @@
 }
 
 /* ---- Attendance Console ---- */
-/* ONE table. The employee summary row and its day rows share a single column
-   set, so each total sits directly above the column it totals. Two tables with
-   independent widths could never line up. */
 .ac-grid { font-size: 12px; border: 1px solid var(--border-color);
 	border-radius: var(--border-radius-md); overflow: hidden; }
 .ac-grid thead th { background: var(--subtle-fg, var(--control-bg));
-	font-size: 11px; font-weight: 400; color: var(--text-muted); padding: 7px 6px; }
-.ac-grid td { padding: 5px 6px; border-bottom: 1px solid var(--border-color); }
+	font-size: 11px; font-weight: 400; color: var(--text-muted);
+	padding: 7px 6px; vertical-align: middle; }
+.ac-grid td { padding: 5px 6px; border-bottom: 1px solid var(--border-color);
+	vertical-align: middle; }
 .ac-num { text-align: right; }
 
-.ac-emp-row { background: var(--subtle-fg, var(--control-bg)); cursor: pointer; }
-.ac-emp-row:hover { background: var(--bg-light-gray, #f4f5f6); }
-.ac-emp-row.ac-open { background: var(--bg-blue, #eef3fa); }
-.ac-emp-row.ac-ov td { box-shadow: inset 0 -2px 0 var(--orange-300, #edb46b); }
-.ac-emp-row td { padding: 7px 6px; }
-.ac-caret { font-size: 10px; color: var(--text-muted); }
+/* --- employee summary: a free-form BLOCK, not a row of the grid --- */
+.ac-emp-row { cursor: pointer; }
+.ac-emp-cell { background: var(--bg-light-gray, #f4f5f6); padding: 8px 10px !important; }
+.ac-emp-row.ac-open .ac-emp-cell { background: var(--bg-blue, #eef3fa); }
+.ac-emp-row.ac-ov .ac-emp-cell { box-shadow: inset 3px 0 0 var(--orange-400, #e5a44b); }
 
+.ac-emp-top { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.ac-caret { font-size: 10px; color: var(--text-muted); }
+.ac-emp-id { min-width: 150px; }
+.ac-emp-name { font-weight: 600; }
+.ac-emp-sub { font-size: 10px; color: var(--text-muted); display: flex; gap: 7px; flex-wrap: wrap; }
+.ac-emp-counts { flex: 1; text-align: center; color: var(--text-muted); }
+.ac-emp-counts b { color: var(--text-color); }
+
+.ac-emp-zones { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 7px; }
+.ac-zone { flex: 1; min-width: 250px; background: var(--fg-color, #fff);
+	border: 1px solid var(--border-color); border-radius: var(--border-radius-sm); padding: 5px 9px; }
+.ac-zone-h { font-size: 9.5px; letter-spacing: .04em; color: var(--text-muted); margin-bottom: 4px; }
+.ac-zone-body { display: flex; align-items: center; gap: 10px; flex-wrap: nowrap; overflow-x: auto; }
+.ac-spacer { flex: 1; min-width: 4px; }
+
+/* label and input side by side -- inline-flex, or Frappe's block-level label
+   stacks them and the row grows to three lines. */
+.ac-field { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+.ac-field label { font-size: 10px; color: var(--text-muted); margin: 0; font-weight: 400; }
+.ac-field .ac-cell { width: 56px; }
+.ac-field .ac-band { width: 34px; }
+
+/* --- day rows --- */
 .ac-day td { background: var(--fg-color, #fff); }
 .ac-indent { padding-left: 16px !important; }
 .ac-day.ac-dirty td { background: var(--bg-blue, #eef3fa); }
 .ac-day.ea-off td, .ac-day.ea-missing td { background: var(--subtle-fg, var(--control-bg)); }
 .ac-day.ea-worked-off td { background: var(--bg-green, #eaf3de); }
 .ac-day.ea-missing td { color: var(--red-600, #a32d2d); }
+.ac-create-inline { margin-left: 10px; }
 
-/* Editable cells must LOOK editable. Transparent inputs read as plain text,
-   which is why every value on the summary row was assumed read-only. */
+/* --- editable cells must look editable --- */
 .ac-cell { height: 25px; font-size: 12px; padding: 1px 4px; width: 100%;
 	border: 1px solid var(--border-color); border-radius: var(--border-radius-sm);
 	background: var(--fg-color, #fff); }
 .ac-cell:hover { border-color: var(--gray-400, #9ea3a8); }
 .ac-cell:focus { border-color: var(--blue-500, #4187e0);
 	box-shadow: 0 0 0 2px var(--blue-100, #dbe9fb); outline: none; }
-.ac-emp-row .ac-cell { text-align: right; }
+.ac-emp-cell .ac-cell { text-align: right; }
 select.ac-cell { padding-right: 2px; }
 
-.ac-rates { white-space: nowrap; }
-.ac-band-wrap { display: inline-flex; align-items: center; gap: 3px; margin-right: 5px; }
-.ac-band-wrap label { font-size: 10px; color: var(--text-muted); margin: 0; }
-.ac-band-wrap .ac-cell { width: 42px; }
+.ac-pinned { border-color: var(--orange-400, #e5a44b) !important;
+	background: var(--bg-orange, #fdf5e9) !important; font-weight: 600; }
+.ac-required { border-color: var(--red-400, #e08b8b) !important;
+	background: var(--bg-red, #fceaea) !important; }
 
 .ac-bulk { display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
 	background: var(--bg-blue, #eef3fa); border-radius: var(--border-radius-md);
@@ -102,15 +123,3 @@ select.ac-cell { padding-right: 2px; }
 .ac-foot { display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
 	margin-top: 10px; padding-top: 9px; border-top: 1px solid var(--border-color); font-size: 12px; }
 .ac-dirty-text { color: var(--blue-600, #2a5fa8); font-weight: 600; }
-
-/* A pinned day-level value: HR set it by hand and the rules will not
-   recalculate it until it is reset to automatic. */
-.ac-pinned { border-color: var(--orange-400, #e5a44b) !important;
-	background: var(--bg-orange, #fdf5e9) !important; font-weight: 600; }
-
-/* Visit type required but empty: a Present day with no punches at all. */
-.ac-required { border-color: var(--red-400, #e08b8b) !important;
-	background: var(--bg-red, #fceaea) !important; }
-
-/* Inline Create sits beside the row's message, not adrift on the far right. */
-.ac-create-inline { margin-left: 10px; }

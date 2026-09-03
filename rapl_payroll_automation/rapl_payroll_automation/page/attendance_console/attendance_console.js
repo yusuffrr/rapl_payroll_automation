@@ -207,7 +207,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		const band_inputs = bands
 			.map((b, i) => {
 				const v = ov(emp, `band_${i + 1}_count`, e.band_counts[b.label] || 0);
-				return `<span class="ac-band-wrap"><label>${frappe.utils.escape_html(b.label)}</label>` +
+				return `<span class="ac-field"><label>${frappe.utils.escape_html(b.label)}</label>` +
 					`<input class="ac-cell ac-sum ac-band" data-employee="${emp}" data-field="band_${i + 1}_count" value="${v || ""}" placeholder="0"></span>`;
 			})
 			.join("");
@@ -216,30 +216,67 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		if (e.ot_already_processed) processed.push(__("OT paid"));
 		if (e.late_already_processed) processed.push(__("Late paid"));
 
+		// The summary is a free-form BLOCK spanning the whole grid, not a table
+		// row. It has no In, Out or Hrs, and its Late cell holds a count per
+		// band rather than one label -- forcing it into the day columns made it
+		// cramped and made the whole page read as misaligned.
 		const rows = [`
 			<tr class="ac-emp-row ${open ? "ac-open" : ""} ${dirty ? "ac-ov" : ""}" data-employee="${emp}">
-				<td><i class="ac-caret fa fa-chevron-${open ? "down" : "right"}"></i></td>
-				<td class="ac-num">${s.red_flags ? `<span class="ea-cut">${s.red_flags}</span>` : ""}${
-					s.amber_flags ? `<span class="ea-late" style="margin-left:3px">${s.amber_flags}</span>` : ""
-				}${!s.red_flags && !s.amber_flags ? '<span class="ea-dim">&mdash;</span>' : ""}</td>
-				<td><b>${emp}</b> ${frappe.utils.escape_html(g.employee_name || "")}${
-					g.employee_status && g.employee_status !== "Active"
-						? ` <span class="ea-dim">&middot; ${__("left")} ${g.relieving_date ? frappe.datetime.str_to_user(g.relieving_date) : ""}</span>`
-						: ""
-				}${
-					g.ot_eligible ? "" : ` <span class="ea-dim" title="${__("Employee.custom_ot is off - automatic OT is not calculated, but you can still enter it by hand")}">&middot; ${__("manual OT")}</span>`
-				}${processed.length ? ` <span class="ea-late">&middot; ${processed.join(" &middot; ")}</span>` : ""}</td>
-				<td colspan="4" class="ac-rates">
-					<span class="ea-dim">${frappe.utils.escape_html(g.grade || "")} &middot; ${__("Present")} <b>${s.present}</b>${s.wfh ? ` <span class="ea-dim">(${__("incl. {0} WFH", [s.wfh])})</span>` : ""} &middot; ${__("Half day")} <b>${s.half_day}</b> &middot; ${__("Leave")} <b>${s.on_leave}</b> &middot; ${__("Absent")} <b>${s.absent}</b></span>
-					<span class="ac-band-wrap"><label>&#8377;/${__("day")}</label>
-						<input class="ac-cell ac-sum" data-employee="${emp}" data-field="per_day_rate" value="${per_day || ""}" placeholder="0"></span>
-					<span class="ac-band-wrap"><label>&#8377;/${__("hr")}</label>
-						<input class="ac-cell ac-sum" data-employee="${emp}" data-field="ot_rate" value="${ot_rate || ""}" placeholder="0"></span>
+				<td colspan="${COLS.length}" class="ac-emp-cell">
+					<div class="ac-emp-top">
+						<span class="ac-caret fa fa-chevron-${open ? "down" : "right"}"></span>
+						<div class="ac-emp-id">
+							<div class="ac-emp-name">${emp} ${frappe.utils.escape_html(g.employee_name || "")}</div>
+							<div class="ac-emp-sub">
+								<span>${frappe.utils.escape_html(g.grade || "")}</span>
+								${s.red_flags ? `<span class="ea-cut">&#9873; ${s.red_flags}</span>` : ""}
+								${s.amber_flags ? `<span class="ea-late">&#9873; ${s.amber_flags}</span>` : ""}
+								${g.employee_status && g.employee_status !== "Active"
+									? `<span class="ea-dim">${__("left")} ${g.relieving_date ? frappe.datetime.str_to_user(g.relieving_date) : ""}</span>` : ""}
+								${g.ot_eligible ? "" : `<span class="ea-dim" title="${__("Employee.custom_ot is off - automatic OT is not calculated, but you can still enter it by hand")}">${__("manual OT")}</span>`}
+								${processed.length ? `<span class="ea-late">${processed.join(" &middot; ")}</span>` : ""}
+							</div>
+						</div>
+						<div class="ac-emp-counts">
+							${__("Present")} <b>${s.present}</b>${s.wfh ? ` <span class="ea-dim">(${__("incl. {0} WFH", [s.wfh])})</span>` : ""}
+							&nbsp;&middot;&nbsp; ${__("Half day")} <b>${s.half_day}</b>
+							&nbsp;&middot;&nbsp; ${__("Leave")} <b>${s.on_leave}</b>
+							&nbsp;&middot;&nbsp; ${__("Absent")} <b>${s.absent}</b>
+						</div>
+					</div>
+					<div class="ac-emp-zones">
+						<div class="ac-zone">
+							<div class="ac-zone-h">${__("LATE MARK")}</div>
+							<div class="ac-zone-body">
+								${band_inputs}
+								<span class="ac-field"><label>&#8377;/${__("day")}</label>
+									<input class="ac-cell ac-sum" data-employee="${emp}" data-field="per_day_rate"
+										value="${per_day || ""}" placeholder="0"
+										title="${__("Monthly salary divided by calendar days in the period")}"></span>
+								<span class="ac-spacer"></span>
+								<span class="ac-field"><label>${__("Cut")}</label>
+									<input class="ac-cell ac-sum ea-cut" data-employee="${emp}" data-field="late_amount"
+										value="${late_amount || ""}" placeholder="0"></span>
+							</div>
+						</div>
+						<div class="ac-zone">
+							<div class="ac-zone-h">${__("OVERTIME")}</div>
+							<div class="ac-zone-body">
+								<span class="ac-field"><label>h:mm</label>
+									<input class="ac-cell ac-sum" data-employee="${emp}" data-field="ot_hours_hhmm"
+										value="${ot_secs ? hhmm_from_seconds(ot_secs) : ""}" placeholder="0:00"></span>
+								<span class="ac-field"><label>&#8377;/${__("hr")}</label>
+									<input class="ac-cell ac-sum" data-employee="${emp}" data-field="ot_rate"
+										value="${ot_rate || ""}" placeholder="0"
+										title="${__("Per-day rate divided by the overtime hours divisor. The denominator depends on grade.")}"></span>
+								<span class="ac-spacer"></span>
+								<span class="ac-field"><label>${__("Earned")}</label>
+									<input class="ac-cell ac-sum ea-ot" data-employee="${emp}" data-field="amount"
+										value="${ot_amount || ""}" placeholder="0"></span>
+							</div>
+						</div>
+					</div>
 				</td>
-				<td class="ac-rates">${band_inputs}</td>
-				<td class="ac-num"><input class="ac-cell ac-sum" data-employee="${emp}" data-field="ot_hours_hhmm" value="${ot_secs ? hhmm_from_seconds(ot_secs) : ""}" placeholder="0:00"></td>
-				<td class="ac-num ea-dim">${flt(s.overtime_hours, 2) || "&mdash;"}</td>
-				<td class="ac-num"><input class="ac-cell ac-sum ea-cut" data-employee="${emp}" data-field="late_amount" value="${late_amount || ""}" placeholder="0"></td>
 			</tr>`];
 
 		if (open) rows.push(g.rows.map((row) => render_day(g, row, bands)).join(""));
@@ -315,13 +352,15 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		// "none" must NOT send an empty string: the server treats empty as
 		// "reset to automatic", so waiving a late mark would silently come back
 		// on the next save. __none__ means "pinned, and the band is cleared".
-		const opts = ['<option value="__none__"' + (value === null || value === "" ? " selected" : "") + ">" + __("none") + "</option>"]
+		// "auto" is selected when nothing is pinned. Marking "none" selected made
+		// every ordinary row look like a deliberately waived late mark.
+		const opts = ['<option value="__none__"' + (att.late_mark_manual && !value ? " selected" : "") + ">" + __("none") + "</option>"]
 			.concat(bands.map((b) =>
 				`<option value="${frappe.utils.escape_html(b.label)}" ${b.label === value ? "selected" : ""}>${frappe.utils.escape_html(b.label)}</option>`))
 			.join("");
 		return `<select class="ac-cell ac-day-band ${att.late_mark_manual ? "ac-pinned" : ""}"
 			title="${att.late_mark_manual ? __("Set by hand - the rules will not recalculate this day") : __("Automatic")}">
-			<option value="__auto__">${__("auto")}</option>${opts}</select>`;
+			<option value="__auto__" ${att.late_mark_manual ? "" : "selected"}>${__("auto")}</option>${opts}</select>`;
 	}
 
 	function visit_select(value, att, val) {
