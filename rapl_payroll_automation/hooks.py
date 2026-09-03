@@ -69,7 +69,12 @@ doc_events = {
 # Shared stylesheet for the Employee Attendance statement and the Attendance
 # Console. Both render the same table shape, so the colour meanings (amber =
 # late mark, red = money out, green = money in) must be defined in one place.
-app_include_css = "/assets/rapl_payroll_automation/css/rapl_attendance.css"
+# MUST end in .bundle.css. Verified in frappe/esbuild/esbuild.js: the builder
+# only discovers public/**/*.bundle.{js,ts,css,...}, and jinja_globals
+# .bundled_asset() only rewrites a path containing ".bundle.". A plain
+# public/css/x.css is never compiled and never reaches assets.json, so the
+# stylesheet silently never loads and the page renders unstyled.
+app_include_css = "rapl_attendance.bundle.css"
 
 # Fixtures ---------------------------------------------------------------
 # Filtered by explicit dt + fieldname rather than by module. The previous
