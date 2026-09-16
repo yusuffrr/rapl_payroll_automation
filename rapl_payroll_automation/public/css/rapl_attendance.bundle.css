@@ -163,3 +163,8 @@ select.ac-cell { padding-right: 2px; }
 .ac-emp-zones > .ac-zone:nth-child(2) { flex: 1 1 270px; min-width: 270px; }
 .ac-emp-zones > .ac-zone:nth-child(3) { flex: 1 1 250px; min-width: 250px; }
 .ac-spacer { flex: 1; min-width: 6px; }
+
+/* --- paid leave --- */
+.ac-leave-head { display: inline-flex; align-items: center; gap: 4px;
+	white-space: nowrap; font-size: 11px; }
+.ac-leave-pick { margin: 0; }

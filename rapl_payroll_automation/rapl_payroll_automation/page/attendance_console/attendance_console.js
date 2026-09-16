@@ -32,6 +32,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		adv: new Map(),       // employee -> Set of ticked Employee Advance names
 		netpay: new Map(),    // employee -> computed pay result
 		netopen: new Set(),   // employees whose breakdown is expanded
+		leave: new Map(),     // employee -> Set of ticked absent dates
 	};
 
 	const month_field = page.add_field({
@@ -128,6 +129,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 				// Every recoverable advance starts ticked -- HR usually recovers
 				// everything and unticks the exceptions.
 				state.adv.clear();
+				state.leave.clear();
 				(state.data.groups || []).forEach((g) => {
 					state.adv.set(g.employee, new Set((g.advances || []).map((a) => a.name)));
 				});
@@ -159,7 +161,8 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		{ w: "7%", label: () => __("Hrs"), num: true },
 		{ w: "14%", label: () => __("Status") },
 		{ w: "12%", label: () => __("Visit") },
-		{ w: "10%", label: () => __("Late") },
+		{ w: "5%", label: () => __("PL"), num: true, title: () => __("Paid leave") },
+		{ w: "9%", label: () => __("Late") },
 		{ w: "8%", label: () => __("OT h:mm"), num: true },
 		{ w: "7%", label: () => __("Cut") + " \u20b9", num: true },
 	];
@@ -200,7 +203,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		status("");
 		const bands = state.data.bands || [];
 		const head = COLS.map(
-			(c) => `<th style="width:${c.w}" class="${c.num ? "ac-num" : ""}">${c.label ? c.label() : ""}</th>`
+			(c) => `<th style="width:${c.w}" class="${c.num ? "ac-num" : ""}"${c.title ? ` title="${c.title()}"` : ""}>${c.label ? c.label() : ""}</th>`
 		).join("");
 		const body = state.data.groups.map((g) => render_group(g, bands)).join("");
 		$body.find(".ac-out").html(
@@ -261,6 +264,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 							&nbsp;&middot;&nbsp; ${__("Leave")} <b>${s.on_leave}</b>
 							&nbsp;&middot;&nbsp; ${__("Absent")} <b>${s.absent}</b>
 						</div>
+						${render_leave_head(g)}
 						${open ? "" : `<div class="ac-emp-money">
 							<span class="ea-ot">+${format_currency(ot_amount || 0)}</span>
 							<span class="ea-cut">&minus;${format_currency(late_amount || 0)}</span>
@@ -410,6 +414,49 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 			</div>` : ""}`;
 	}
 
+	// ---------------------------------------------------------------- leave
+	//
+	// Only Absent days can become leave. Leave Application's own
+	// validate_attendance() refuses a range covering any Present or Work From
+	// Home day, so offering the tick anywhere else would only produce an error.
+	//
+	// Eligibility comes from LEAVE ALLOCATION, not the custom_paid_leave flag
+	// on Employee -- that flag is wired to nothing.
+
+	function leave_picked(employee) {
+		return state.leave.get(employee) || new Set();
+	}
+
+	function render_leave_head(g) {
+		const lv = g.leave || {};
+		if (!lv.leave_type) return "";
+		const picked = leave_picked(g.employee);
+		if (!lv.eligible) {
+			return `<span class="ac-leave-head ea-dim"
+				title="${__("No leave allocation for this employee")}">${__("no")} ${frappe.utils.escape_html(lv.leave_type)}</span>`;
+		}
+		return `<span class="ac-leave-head">
+				<span class="ea-dim">${__("Leave Balance")}</span> <b>${flt(lv.balance, 1)}</b>
+				${lv.taken ? `<span class="ea-dim" style="margin-left:7px">${__("Leave Taken")}</span> <b>${lv.taken}</b>` : ""}
+				${picked.size ? `<button class="btn btn-xs ac-leave-create" data-employee="${g.employee}" style="margin-left:7px">${__("Create leave")} (${picked.size})</button>` : ""}
+			</span>`;
+	}
+
+	function leave_cell(g, row, att) {
+		const lv = g.leave || {};
+		if (!lv.leave_type) return '<span class="ea-dim">&mdash;</span>';
+		if (att.leave_application) {
+			return `<span class="ea-dim" title="${frappe.utils.escape_html(att.leave_application)}">&#10003;</span>`;
+		}
+		if (att.status !== "Absent") return '<span class="ea-dim">&mdash;</span>';
+		if (!lv.eligible) {
+			return `<span class="ea-dim" title="${__("No leave allocation")}">&#9633;</span>`;
+		}
+		const picked = leave_picked(g.employee);
+		return `<input type="checkbox" class="ac-leave-pick" data-employee="${g.employee}"
+			data-date="${row.date}" ${picked.has(row.date) ? "checked" : ""}>`;
+	}
+
 	function render_day(g, row, bands) {
 		const att = row.attendance;
 		const date_label = `${row.day_label} ${row.date.slice(8, 10)}`;
@@ -423,7 +470,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 			if (row.is_holiday) {
 				return `<tr class="ac-day ea-off" data-date="${row.date}" data-employee="${g.employee}"><td></td>${flag_cell}
 					<td class="ea-dim ac-indent">${date_label}</td>
-					<td colspan="8" class="ea-dim">${row.is_weekly_off ? __("Weekly off") : frappe.utils.escape_html(row.holiday_description || __("Holiday"))}
+					<td colspan="9" class="ea-dim">${row.is_weekly_off ? __("Weekly off") : frappe.utils.escape_html(row.holiday_description || __("Holiday"))}
 						${g.can_create ? `<button class="btn btn-xs ac-create ac-create-inline">${__("Create")}</button>` : ""}</td>
 				</tr>`;
 			}
@@ -435,7 +482,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 			return `<tr class="ac-day ea-missing" data-date="${row.date}" data-employee="${g.employee}">
 					<td></td>${flag_cell}
 					<td class="ac-indent">${date_label}</td>
-					<td colspan="8">${cancelled ? __("Only a cancelled record exists") : __("No attendance record")} ${action}</td>
+					<td colspan="9">${cancelled ? __("Only a cancelled record exists") : __("No attendance record")} ${action}</td>
 				</tr>`;
 		}
 
@@ -464,6 +511,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 				<td class="ac-num">${att.working_hours ? flt(att.working_hours, 2) : '<span class="ea-dim">&mdash;</span>'}</td>
 				<td>${status_select(val("status"), att)}</td>
 				<td>${visit_select(pv("custom_attendance_type", att.attendance_type), att, val)}</td>
+				<td class="ac-num">${leave_cell(g, row, att)}</td>
 				<td>${band_select(pv("custom_late_mark_band", att.late_mark_band), att, bands)}</td>
 				<td class="ac-num"><input class="ac-cell ac-day-ot ${att.overtime_manual ? "ac-pinned" : ""}"
 					value="${hhmm_from_seconds(flt(pv("custom_overtime_hours", att.overtime_hours)) * 3600)}" placeholder="0:00"
@@ -590,6 +638,64 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		}
 		state.overrides.set(employee, o);
 		render();
+	});
+
+	$body.on("change", ".ac-leave-pick", function (e) {
+		e.stopPropagation();
+		const emp = $(this).data("employee");
+		const date = String($(this).data("date"));
+		const g = state.data.groups.find((x) => x.employee === emp);
+		const picked = leave_picked(emp);
+
+		if (this.checked) {
+			// Hard stop at the balance. validate_balance_leaves() would throw on
+			// creation anyway, and a raw Frappe error after ticking eight days is
+			// a worse experience than refusing the seventh.
+			const balance = flt((g && g.leave && g.leave.balance) || 0);
+			if (picked.size + 1 > balance) {
+				this.checked = false;
+				frappe.show_alert({
+					message: __("Only {0} day(s) of leave available", [balance]),
+					indicator: "orange",
+				});
+				return;
+			}
+			picked.add(date);
+		} else {
+			picked.delete(date);
+		}
+		state.leave.set(emp, picked);
+		render();
+	});
+
+	$body.on("click", ".ac-leave-create", function (e) {
+		e.stopPropagation();
+		const emp = $(this).data("employee");
+		const dates = Array.from(leave_picked(emp));
+		if (!dates.length) return;
+		frappe.confirm(
+			__("Create approved leave for {0} day(s)? The attendance for those days becomes On Leave.", [dates.length]),
+			() => frappe.call({
+				method: "rapl_payroll_automation.api.attendance_console.create_leave_applications",
+				args: { employee: emp, dates: JSON.stringify(dates) },
+				freeze: true,
+				callback(r) {
+					const res = r.message || {};
+					frappe.msgprint({
+						title: __("{0} created, {1} failed",
+								  [(res.created || []).length, (res.failed || []).length]),
+						indicator: (res.failed || []).length ? "orange" : "green",
+						message:
+							(res.created || []).map((c) =>
+								`<div><a href="${c.route}" target="_blank">${c.name}</a> &mdash; ${frappe.datetime.str_to_user(c.from_date)} to ${frappe.datetime.str_to_user(c.to_date)} (${c.days})</div>`).join("") +
+							(res.failed || []).map((f) =>
+								`<div class="text-muted">${f.from_date}: ${frappe.utils.escape_html(f.error)}</div>`).join(""),
+					});
+					state.leave.delete(emp);
+					do_load(period());
+				},
+			})
+		);
 	});
 
 	$body.on("click", ".ac-adv-head", function (e) {

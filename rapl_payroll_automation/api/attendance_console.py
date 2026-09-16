@@ -145,6 +145,44 @@ def get_recoverable_advances(employee, cutoff):
 	return out
 
 
+def get_leave_context(employee, start_date, end_date, settings=None):
+	"""Paid-leave eligibility, balance and days already taken.
+
+	Eligibility is decided by LEAVE ALLOCATION, not by the custom_paid_leave
+	flag on Employee -- that flag is wired to nothing. validate_balance_leaves()
+	on Leave Application checks the allocation, so allocation is the only thing
+	that actually governs whether leave can be created.
+
+	Balance uses get_leave_balance_on(..., for_consumption=True), which returns
+	the CONSUMABLE figure: an employee may hold 10 days while an allocation
+	expiring next week caps what they can actually take at 1.
+	"""
+	settings = settings or get_automation_settings()
+	leave_type = settings.get("absent_leave_type")
+	ctx = {"leave_type": leave_type, "eligible": False, "balance": 0.0, "taken": 0}
+
+	if leave_type:
+		ctx["taken"] = frappe.db.count("Attendance", {
+			"employee": employee, "docstatus": 1, "status": "On Leave",
+			"attendance_date": ["between", [start_date, end_date]],
+		})
+		try:
+			from hrms.hr.doctype.leave_application.leave_application import get_leave_balance_on
+			balance = get_leave_balance_on(
+				employee, leave_type, getdate(end_date), for_consumption=True
+			)
+			if isinstance(balance, dict):
+				ctx["balance"] = flt(balance.get("leave_balance_for_consumption"), 2)
+			else:
+				ctx["balance"] = flt(balance, 2)
+			ctx["eligible"] = ctx["balance"] > 0
+		except Exception:
+			# No allocation, or the balance call refused -- not eligible, and
+			# not an error worth failing the whole page load for.
+			ctx["eligible"] = False
+	return ctx
+
+
 def _require_hr(ptype="read"):
 	"""Role AND real DocType permission.
 
@@ -241,6 +279,7 @@ def get_console_data(start_date=None, end_date=None, employees=None, only_flagge
 			"summary": summary,
 			"entry": _entry_preview(emp, start_date, end_date, summary, bands, settings),
 			"advances": get_recoverable_advances(emp.name, cutoff),
+			"leave": get_leave_context(emp.name, start_date, end_date, settings),
 			"rows": rows,
 		})
 
@@ -1013,3 +1052,79 @@ def compute_net_pay(employee, start_date=None, end_date=None, overtime=0,
 	# ALWAYS roll back -- nothing here is ever meant to persist.
 	frappe.db.rollback(save_point=savepoint)
 	return result
+
+
+def _contiguous_blocks(dates):
+	"""Group sorted dates into runs of consecutive days.
+
+	Three scattered absences become three Leave Applications, not one range --
+	a single from/to spanning them would swallow the working days in between
+	and mark those as leave too.
+	"""
+	blocks, run = [], []
+	for d in sorted(getdate(x) for x in dates):
+		if run and (d - run[-1]).days == 1:
+			run.append(d)
+		else:
+			if run:
+				blocks.append(run)
+			run = [d]
+	if run:
+		blocks.append(run)
+	return blocks
+
+
+@frappe.whitelist()
+def create_leave_applications(employee, dates):
+	"""Turn ticked Absent days into APPROVED Leave Applications.
+
+	The Console never rewrites Attendance for leave. Leave Application's own
+	update_attendance() does it on approve: it sets status to On Leave, fills
+	leave_type and leave_application, and on a holiday it CANCELS AND DELETES
+	the Attendance outright. Editing Attendance directly would be fighting that.
+
+	Created as Approved, so update_attendance() runs immediately.
+
+	Contiguous dates are grouped into one application per run.
+	"""
+	_require_hr("create")
+	dates = _json(dates, [])
+	if not dates:
+		return {"created": [], "failed": []}
+
+	settings = get_automation_settings()
+	leave_type = settings.get("absent_leave_type")
+	if not leave_type:
+		frappe.throw("Set 'Leave Type for Absent Days' in RAPL Payroll Automation Settings first.")
+
+	company = frappe.db.get_value("Employee", employee, "company")
+	created, failed = [], []
+
+	for index, block in enumerate(_contiguous_blocks(dates)):
+		savepoint = f"rapl_leave_{index}"
+		frappe.db.savepoint(savepoint)
+		try:
+			la = frappe.new_doc("Leave Application")
+			la.employee = employee
+			la.leave_type = leave_type
+			la.from_date = block[0]
+			la.to_date = block[-1]
+			la.company = company
+			la.posting_date = getdate()
+			la.status = "Approved"
+			la.follow_via_email = 0
+			la.description = "Created from the Attendance Console"
+			la.insert(ignore_permissions=True)
+			la.submit()
+			created.append({
+				"name": la.name, "from_date": str(block[0]), "to_date": str(block[-1]),
+				"days": flt(la.total_leave_days, 2),
+				"route": f"/app/leave-application/{la.name}",
+			})
+		except Exception as e:
+			frappe.db.rollback(save_point=savepoint)
+			failed.append({
+				"from_date": str(block[0]), "to_date": str(block[-1]),
+				"error": frappe.utils.strip_html(str(e))[:400],
+			})
+	return {"created": created, "failed": failed}
