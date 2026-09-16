@@ -29,6 +29,9 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		overrides: new Map(), // employee -> edited summary values (ot hours/rate/amount, band counts, per-day rate)
 		selected: new Set(),  // attendance names
 		expanded: new Set(),  // employee ids
+		adv: new Map(),       // employee -> Set of ticked Employee Advance names
+		netpay: new Map(),    // employee -> computed pay result
+		netopen: new Set(),   // employees whose breakdown is expanded
 	};
 
 	const month_field = page.add_field({
@@ -43,6 +46,10 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		fieldname: "employee", label: __("Employee"), fieldtype: "Link",
 		options: "Employee", get_query: () => ({ filters: { status: "Active" } }),
 	});
+	const cutoff_field = page.add_field({
+		fieldname: "advance_cutoff", label: __("Advances to"), fieldtype: "Date",
+	});
+
 	const filter_field = page.add_field({
 		fieldname: "only_flagged", label: __("Show"), fieldtype: "Select",
 		options: [__("Needs attention"), __("All records")],
@@ -110,12 +117,23 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 				end_date: range.end,
 				employees: employee ? JSON.stringify([employee]) : null,
 				only_flagged: filter_field.get_value() === __("Needs attention") ? 1 : 0,
+				advance_cutoff: cutoff_field.get_value() || null,
 			},
 			freeze: true,
 			freeze_message: __("Reading attendance..."),
 			callback(r) {
 				state.data = r.message;
 				state.selected.clear();
+				state.netpay.clear();
+				// Every recoverable advance starts ticked -- HR usually recovers
+				// everything and unticks the exceptions.
+				state.adv.clear();
+				(state.data.groups || []).forEach((g) => {
+					state.adv.set(g.employee, new Set((g.advances || []).map((a) => a.name)));
+				});
+				if (state.data.advance_cutoff && !cutoff_field.get_value()) {
+					cutoff_field.set_value(state.data.advance_cutoff);
+				}
 				if (state.data && state.data.groups.length === 1) {
 					state.expanded.add(state.data.groups[0].employee);
 				}
@@ -226,7 +244,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 					<div class="ac-emp-top">
 						<span class="ac-caret fa fa-chevron-${open ? "down" : "right"}"></span>
 						<div class="ac-emp-id">
-							<div class="ac-emp-name">${emp} ${frappe.utils.escape_html(g.employee_name || "")}</div>
+							<div class="ac-emp-name">${frappe.utils.escape_html(g.employee_name || "")} - ${emp}</div>
 							<div class="ac-emp-sub">
 								<span>${frappe.utils.escape_html(g.grade || "")}</span>
 								${s.red_flags ? `<span class="ea-cut">&#9873; ${s.red_flags}</span>` : ""}
@@ -243,6 +261,13 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 							&nbsp;&middot;&nbsp; ${__("Leave")} <b>${s.on_leave}</b>
 							&nbsp;&middot;&nbsp; ${__("Absent")} <b>${s.absent}</b>
 						</div>
+						${open ? "" : `<div class="ac-emp-money">
+							<span class="ea-ot">+${format_currency(ot_amount || 0)}</span>
+							<span class="ea-cut">&minus;${format_currency(late_amount || 0)}</span>
+							<span class="ea-cut">&minus;${format_currency(advance_total(g))}</span>
+							<b class="${(flt(ot_amount) - flt(late_amount) - advance_total(g)) < 0 ? "ea-cut" : "ea-ot"}">${
+								format_currency(flt(ot_amount) - flt(late_amount) - advance_total(g))}</b>
+						</div>`}
 					</div>
 					<div class="ac-emp-zones">
 						<div class="ac-zone">
@@ -254,9 +279,8 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 										value="${per_day || ""}" placeholder="0"
 										title="${__("Monthly salary divided by calendar days in the period")}"></span>
 								<span class="ac-spacer"></span>
-								<span class="ac-field"><label>${__("Cut")}</label>
-									<input class="ac-cell ac-sum ea-cut" data-employee="${emp}" data-field="late_amount"
-										value="${late_amount || ""}" placeholder="0"></span>
+								<input class="ac-cell ac-sum ea-cut" data-employee="${emp}" data-field="late_amount"
+									value="${late_amount || ""}" placeholder="0" title="${__("Total late mark deduction")}">
 							</div>
 						</div>
 						<div class="ac-zone">
@@ -268,19 +292,122 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 								<span class="ac-field"><label>&#8377;/${__("hr")}</label>
 									<input class="ac-cell ac-sum" data-employee="${emp}" data-field="ot_rate"
 										value="${ot_rate || ""}" placeholder="0"
-										title="${__("Per-day rate divided by the overtime hours divisor. The denominator depends on grade.")}"></span>
+										title="${__("Per-day rate divided by the overtime divisor. The denominator depends on grade.")}"></span>
 								<span class="ac-spacer"></span>
-								<span class="ac-field"><label>${__("Earned")}</label>
-									<input class="ac-cell ac-sum ea-ot" data-employee="${emp}" data-field="amount"
-										value="${ot_amount || ""}" placeholder="0"></span>
+								<input class="ac-cell ac-sum ea-ot" data-employee="${emp}" data-field="amount"
+									value="${ot_amount || ""}" placeholder="0" title="${__("Overtime earned")}">
 							</div>
 						</div>
+						${render_advance_zone(g)}
 					</div>
+					<div class="ac-effect">
+						<span class="ac-zone-h">${__("EFFECT")}</span>
+						<span class="ea-ot">${__("OT")} +${format_currency(ot_amount || 0)}</span>
+						<span class="ea-cut">${__("Cut")} &minus;${format_currency(late_amount || 0)}</span>
+						<span class="ea-cut">${__("Advance")} &minus;${format_currency(advance_total(g))}</span>
+						<span class="ac-spacer"></span>
+						<button class="btn btn-xs ac-netpay" data-employee="${emp}">${
+							state.netpay.has(emp) ? __("Recompute") : __("Compute net pay")}</button>
+					</div>
+					${render_netpay(g)}
 				</td>
 			</tr>`];
 
 		if (open) rows.push(g.rows.map((row) => render_day(g, row, bands)).join(""));
 		return rows.join("");
+	}
+
+	// ---------------------------------------------------------------- advances
+	//
+	// One line per unrecovered Employee Advance, because the draft creates one
+	// Additional Salary PER advance carrying ref_docname back to it. A single
+	// lump sum could not be linked to anything.
+
+	function advance_total(g) {
+		const picked = state.adv.get(g.employee) || new Set();
+		return (g.advances || [])
+			.filter((a) => picked.has(a.name))
+			.reduce((sum, a) => sum + flt(a.outstanding), 0);
+	}
+
+	function render_advance_zone(g) {
+		const list = g.advances || [];
+		if (!list.length) {
+			return `<div class="ac-zone"><div class="ac-zone-h">${__("ADVANCE")}</div>
+				<div class="ac-zone-body ea-dim">${__("Nothing to recover")}</div></div>`;
+		}
+		const picked = state.adv.get(g.employee) || new Set();
+		const outstanding = list.reduce((s, a) => s + flt(a.outstanding), 0);
+		const open = state.expanded.has("adv:" + g.employee);
+
+		const lines = list.map((a) => `
+			<div class="ac-adv-line">
+				<input type="checkbox" class="ac-adv-pick" data-employee="${g.employee}"
+					data-advance="${a.name}" ${picked.has(a.name) ? "checked" : ""}>
+				<span class="ac-adv-name">${a.name}</span>
+				<span class="ea-dim">${frappe.datetime.str_to_user(a.posting_date)}</span>
+				<span class="ea-dim ac-adv-purpose">${frappe.utils.escape_html(a.purpose || "")}</span>
+				<span class="ac-spacer"></span>
+				<span class="ea-cut">${format_currency(a.outstanding)}</span>
+			</div>`).join("");
+
+		return `<div class="ac-zone">
+			<div class="ac-zone-h">${__("ADVANCE")}</div>
+			<div class="ac-zone-body ac-adv-head" data-employee="${g.employee}">
+				<span class="ea-dim">${__("outstanding")} <b>${format_currency(outstanding)}</b></span>
+				<span class="ac-spacer"></span>
+				<span class="ea-cut"><b>${format_currency(advance_total(g))}</b></span>
+				<span class="ac-adv-toggle">${list.length} ${open ? "&#9652;" : "&#9662;"}</span>
+			</div>
+			${open ? `<div class="ac-adv-list">${lines}</div>` : ""}
+		</div>`;
+	}
+
+	// ---------------------------------------------------------------- net pay
+
+	function render_netpay(g) {
+		const res = state.netpay.get(g.employee);
+		if (!res) return "";
+		if (res.error) {
+			return `<div class="ac-netpay-bar ea-cut">${frappe.utils.escape_html(res.error)}</div>`;
+		}
+		const open = state.netopen.has(g.employee);
+		const rows = (list) => list.map((r) => `
+			<div class="ac-pay-row ${r.injected ? "ac-pay-injected" : ""}">
+				<span>${frappe.utils.escape_html(r.component)}</span>
+				<span>${format_currency(r.amount)}</span>
+			</div>`).join("");
+
+		return `
+			<div class="ac-netpay-bar" data-employee="${g.employee}">
+				<b>${__("Computed pay")}</b>
+				<span>${__("Net")} <b class="ac-net">${format_currency(res.net_pay)}</b></span>
+				<span class="ea-dim">${__("provisional")} &middot; ${flt(res.payment_days, 2)}/${flt(res.total_working_days, 2)} ${__("days")}</span>
+				<span class="ac-spacer"></span>
+				<span class="ac-pay-toggle">${__("breakdown")} ${open ? "&#9652;" : "&#9662;"}</span>
+			</div>
+			${open ? `
+			<div class="ac-pay-detail">
+				<div class="ac-pay-cols">
+					<div>
+						<div class="ac-zone-h">${__("EARNINGS")}</div>
+						${rows(res.earnings)}
+						<div class="ac-pay-row ac-pay-total"><span>${__("Gross")}</span><span>${format_currency(res.gross_pay)}</span></div>
+					</div>
+					<div>
+						<div class="ac-zone-h">${__("DEDUCTIONS")}</div>
+						${rows(res.deductions)}
+						<div class="ac-pay-row ac-pay-total"><span>${__("Total")}</span><span>${format_currency(res.total_deduction)}</span></div>
+					</div>
+				</div>
+				<div class="ac-pay-net">
+					<div>
+						<div class="ac-zone-h">${__("NET")}</div>
+						<div class="ac-net-big">${format_currency(res.net_pay)}</div>
+					</div>
+					<div class="ea-dim ac-pay-note">${__("Nothing is saved. Overtime, Late Mark and Advance are not yet submitted — this figure moves if attendance changes.")}</div>
+				</div>
+			</div>` : ""}`;
 	}
 
 	function render_day(g, row, bands) {
@@ -462,6 +589,61 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 			o.late_amount = Math.round(fraction * per_day);
 		}
 		state.overrides.set(employee, o);
+		render();
+	});
+
+	$body.on("click", ".ac-adv-head", function (e) {
+		e.stopPropagation();
+		const key = "adv:" + $(this).data("employee");
+		if (state.expanded.has(key)) state.expanded.delete(key);
+		else state.expanded.add(key);
+		render();
+	});
+
+	$body.on("click", ".ac-adv-pick", function (e) {
+		e.stopPropagation();
+		const emp = $(this).data("employee");
+		const adv = $(this).data("advance");
+		const picked = state.adv.get(emp) || new Set();
+		if (this.checked) picked.add(adv);
+		else picked.delete(adv);
+		state.adv.set(emp, picked);
+		render();
+	});
+
+	$body.on("click", ".ac-netpay", function (e) {
+		e.stopPropagation();
+		const emp = $(this).data("employee");
+		const g = state.data.groups.find((x) => x.employee === emp);
+		if (!g) return;
+		const range = period();
+		frappe.call({
+			method: "rapl_payroll_automation.api.attendance_console.compute_net_pay",
+			args: {
+				employee: emp,
+				start_date: range.start,
+				end_date: range.end,
+				// The Console's pending amounts -- not yet submitted, so the
+				// preview slip cannot see them on its own.
+				overtime: ov(emp, "amount", g.entry.ot_amount) || 0,
+				late_mark: ov(emp, "late_amount", g.entry.late_amount) || 0,
+				advance: advance_total(g),
+			},
+			freeze: true,
+			freeze_message: __("Computing..."),
+			callback(r) {
+				state.netpay.set(emp, r.message || {});
+				state.netopen.add(emp);
+				render();
+			},
+		});
+	});
+
+	$body.on("click", ".ac-pay-toggle", function (e) {
+		e.stopPropagation();
+		const emp = $(this).closest(".ac-netpay-bar").data("employee");
+		if (state.netopen.has(emp)) state.netopen.delete(emp);
+		else state.netopen.add(emp);
 		render();
 	});
 
@@ -688,8 +870,9 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 			${ovs ? `<span class="ac-dirty-text">${__("{0} manual override(s)", [ovs])}</span>` : ""}
 			<span class="ea-dim">${loaded ? __("Loaded {0}", [loaded.slice(11, 16)]) : ""}</span>
 			<span style="flex:1"></span>
-			<button class="btn btn-xs ac-draft-ot">${__("Create OT draft")}</button>
-			<button class="btn btn-xs ac-draft-lm">${__("Create late mark draft")}</button>
+			<button class="btn btn-xs ac-draft-ot">${__("OT draft")}</button>
+			<button class="btn btn-xs ac-draft-lm">${__("Late mark draft")}</button>
+			<button class="btn btn-xs ac-draft-adv">${__("Advance draft")}</button>
 			<button class="btn btn-xs ac-discard" ${count ? "" : "disabled"}>${__("Discard")}</button>
 			<button class="btn btn-xs btn-primary ac-apply" ${count ? "" : "disabled"}>${__("Apply changes")}</button>
 		`);
@@ -801,6 +984,36 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 			},
 		});
 	}
+
+	$body.on("click", ".ac-draft-adv", () => {
+		const picked = [];
+		(state.data.groups || []).forEach((g) => {
+			(state.adv.get(g.employee) || new Set()).forEach((a) => picked.push(a));
+		});
+		if (!picked.length) return frappe.msgprint(__("No advances selected."));
+		frappe.confirm(
+			__("Create {0} draft recovery record(s)?", [picked.length]),
+			() => frappe.call({
+				method: "rapl_payroll_automation.api.attendance_console.create_advance_drafts",
+				args: { advances: JSON.stringify(picked) },
+				freeze: true,
+				callback(r) {
+					const res = r.message || {};
+					frappe.msgprint({
+						title: __("{0} created, {1} failed",
+								  [(res.created || []).length, (res.failed || []).length]),
+						indicator: (res.failed || []).length ? "orange" : "green",
+						message:
+							(res.created || []).map((c) =>
+								`<div><a href="${c.route}" target="_blank">${c.name}</a> &mdash; ${c.advance} ${format_currency(c.amount)}</div>`).join("") +
+							(res.failed || []).map((f) =>
+								`<div class="text-muted">${f.advance}: ${frappe.utils.escape_html(f.error)}</div>`).join(""),
+					});
+					do_load(period());
+				},
+			})
+		);
+	});
 
 	$body.on("click", ".ac-draft-ot", () => make_draft("overtime"));
 	$body.on("click", ".ac-draft-lm", () => make_draft("late_mark"));

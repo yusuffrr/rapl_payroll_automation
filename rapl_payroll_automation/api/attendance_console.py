@@ -80,6 +80,71 @@ def _json(value, default=None):
 	return value
 
 
+def get_advance_cutoff(start_date, end_date, settings=None, override=None):
+	"""The date up to which unrecovered advances are offered for recovery.
+
+	Payroll does not run on a fixed day -- August 2026 ran on the 17th -- so the
+	Settings value is only a default and the Console passes an override.
+	"""
+	if override:
+		return getdate(override)
+	settings = settings or get_automation_settings()
+	day = cint(settings.get("advance_cutoff_day")) or 10
+	from frappe.utils import add_months, get_first_day
+	nxt = get_first_day(add_months(getdate(end_date), 1))
+	try:
+		return nxt.replace(day=day)
+	except ValueError:          # e.g. day 31 in a 30-day month
+		from frappe.utils import get_last_day
+		return get_last_day(nxt)
+
+
+def get_recoverable_advances(employee, cutoff):
+	"""Unrecovered Employee Advances that can be taken out of salary.
+
+	Filtered exactly as HRMS's own "Deduction from Salary" button is gated:
+	repay_unclaimed_amount_from_salary must be ticked, otherwise the advance is
+	settled by Journal Entry instead and must never appear here.
+
+	Outstanding is paid - claimed - returned, NOT HRMS's paid - claimed.
+	Recovery writes return_amount (confirmed against live data: every recovered
+	advance shows status 'Returned' with return_amount set), so HRMS's figure
+	would stay at the full amount after a partial return and offer money back
+	that has already been recovered.
+
+	A fully recovered advance drops out of this list on its own -- its
+	outstanding becomes zero. Nothing needs to remember what was recovered.
+	"""
+	rows = frappe.get_all(
+		"Employee Advance",
+		filters={
+			"docstatus": 1,
+			"employee": employee,
+			"repay_unclaimed_amount_from_salary": 1,
+			"posting_date": ["<=", getdate(cutoff)],
+		},
+		fields=["name", "posting_date", "purpose", "advance_amount", "paid_amount",
+				"claimed_amount", "return_amount", "status", "company", "currency",
+				"custom_outstanding_balance"],
+		order_by="posting_date, name",
+	)
+	out = []
+	for r in rows:
+		outstanding = flt(r.paid_amount) - flt(r.claimed_amount) - flt(r.return_amount)
+		if outstanding <= 0.005:
+			continue
+		out.append({
+			"name": r.name,
+			"posting_date": str(r.posting_date),
+			"purpose": r.purpose,
+			"outstanding": flt(outstanding, 2),
+			"status": r.status,
+			"company": r.company,
+			"currency": r.currency,
+		})
+	return out
+
+
 def _require_hr(ptype="read"):
 	"""Role AND real DocType permission.
 
@@ -130,7 +195,8 @@ def _period_bounds(start_date, end_date):
 
 
 @frappe.whitelist()
-def get_console_data(start_date=None, end_date=None, employees=None, only_flagged=0):
+def get_console_data(start_date=None, end_date=None, employees=None, only_flagged=0,
+					 advance_cutoff=None):
 	"""Employee summary rows + their day rows, for the grouped grid."""
 	_require_hr("read")
 	start_date, end_date = _period_bounds(start_date, end_date)
@@ -140,6 +206,7 @@ def get_console_data(start_date=None, end_date=None, employees=None, only_flagge
 
 	settings = get_automation_settings()
 	bands = get_band_definitions(settings)
+	cutoff = get_advance_cutoff(start_date, end_date, settings, advance_cutoff)
 
 	# Anyone with attendance in the period is included even if no longer
 	# Active -- a leaver's final month still needs correcting.
@@ -173,6 +240,7 @@ def get_console_data(start_date=None, end_date=None, employees=None, only_flagge
 			"ot_eligible": is_ot_eligible(emp.name),
 			"summary": summary,
 			"entry": _entry_preview(emp, start_date, end_date, summary, bands, settings),
+			"advances": get_recoverable_advances(emp.name, cutoff),
 			"rows": rows,
 		})
 
@@ -180,6 +248,7 @@ def get_console_data(start_date=None, end_date=None, employees=None, only_flagge
 		"start_date": str(start_date),
 		"end_date": str(end_date),
 		"bands": bands,
+		"advance_cutoff": str(cutoff),
 		"groups": groups,
 		"loaded_at": now(),
 	}
@@ -767,3 +836,180 @@ def create_processing_draft(
 		"result": result,
 		"route": f"/app/{frappe.scrub(doctype).replace('_', '-')}/{doc.name}",
 	}
+
+
+@frappe.whitelist()
+def create_advance_drafts(advances, payroll_date=None):
+	"""One DRAFT Additional Salary per selected Employee Advance.
+
+	advances: ["EA103", "EA117", ...] -- the advances HR ticked.
+
+	One record PER ADVANCE, not one lump sum, because each carries
+	ref_doctype/ref_docname back to its Employee Advance. That is how HRMS's own
+	"Deduction from Salary" button links them, and it is what lets the advance
+	show as recovered afterwards. A single combined record would recover money
+	against nothing.
+
+	Amount is the full outstanding: paid - claimed - returned. Partial recovery
+	is deliberately not offered yet.
+
+	Never submitted. Review and submit happen on the Additional Salary itself.
+	"""
+	_require_hr("create")
+	advances = _json(advances, [])
+	if not advances:
+		return {"created": [], "failed": []}
+
+	settings = get_automation_settings()
+	component = settings.get("advance_salary_component")
+	if not component:
+		frappe.throw(
+			"Set 'Advance Recovery Salary Component' in RAPL Payroll Automation Settings first."
+		)
+
+	created, failed = [], []
+	for index, advance_name in enumerate(advances):
+		savepoint = f"rapl_adv_{index}"
+		frappe.db.savepoint(savepoint)
+		try:
+			adv = frappe.get_doc("Employee Advance", advance_name)
+			if not cint(adv.repay_unclaimed_amount_from_salary):
+				raise frappe.ValidationError(
+					f"{advance_name} is not marked 'Repay Unclaimed Amount from Salary'"
+				)
+			outstanding = flt(adv.paid_amount) - flt(adv.claimed_amount) - flt(adv.return_amount)
+			if outstanding <= 0.005:
+				raise frappe.ValidationError(f"{advance_name} has nothing left to recover")
+
+			existing = frappe.db.exists(
+				"Additional Salary",
+				{"ref_doctype": "Employee Advance", "ref_docname": advance_name,
+				 "docstatus": ["<", 2]},
+			)
+			if existing:
+				raise frappe.ValidationError(
+					f"{advance_name} already has a recovery record ({existing})"
+				)
+
+			ads = frappe.new_doc("Additional Salary")
+			ads.employee = adv.employee
+			ads.company = adv.company
+			ads.currency = adv.currency
+			ads.salary_component = component
+			ads.amount = flt(outstanding, 2)
+			# MUST be 0. The field defaults to 1, which would REPLACE the
+			# structure amount for this component instead of adding to it.
+			ads.overwrite_salary_structure_amount = 0
+			ads.payroll_date = getdate(payroll_date) if payroll_date else getdate(adv.posting_date)
+			ads.ref_doctype = "Employee Advance"
+			ads.ref_docname = advance_name
+			ads.insert()
+
+			created.append({
+				"name": ads.name, "advance": advance_name, "employee": adv.employee,
+				"amount": flt(outstanding, 2),
+				"route": f"/app/additional-salary/{ads.name}",
+			})
+		except Exception as e:
+			frappe.db.rollback(save_point=savepoint)
+			failed.append({
+				"advance": advance_name,
+				"error": frappe.utils.strip_html(str(e))[:400],
+			})
+	return {"created": created, "failed": failed}
+
+
+@frappe.whitelist()
+def compute_net_pay(employee, start_date=None, end_date=None, overtime=0,
+					late_mark=0, advance=0):
+	"""Net pay from the LIVE Salary Structure, with the Console's pending
+	amounts injected. Computes in memory and saves nothing.
+
+	WHY INJECT RATHER THAN REIMPLEMENT
+	----------------------------------
+	salary_slip.get_additional_salaries() filters docstatus == 1, so a preview
+	slip cannot see the Overtime / Late Mark / Advance the Console is about to
+	create -- they are still drafts. Writing our own pay engine to work around
+	that would mean a second implementation of every structure formula, payment
+	day rule and tax slab, drifting from HRMS on every upgrade. That is exactly
+	the failure this app spent a month unwinding on overtime.
+
+	Instead the rows are appended to earnings/deductions BEFORE
+	calculate_net_pay() runs. Verified in salary_slip.py: calculate_net_pay()
+	does NOT clear those tables, and update_component_row() updates a matching
+	row rather than duplicating it. Because the injected earnings are present
+	before set_gross_pay_and_base_gross_pay(), gross_pay includes the overtime
+	and every formula that references gross_pay computes on the correct base.
+
+	The whole call runs inside a savepoint that is ALWAYS rolled back: this is
+	a preview, and it must be provably incapable of writing even if some path
+	inside HRMS does.
+	"""
+	_require_hr("read")
+	start_date, end_date = _period_bounds(start_date, end_date)
+	settings = get_automation_settings()
+
+	savepoint = "rapl_net_pay_preview"
+	frappe.db.savepoint(savepoint)
+	try:
+		slip = frappe.new_doc("Salary Slip")
+		slip.employee = employee
+		slip.start_date = start_date
+		slip.end_date = end_date
+		slip.payroll_frequency = "Monthly"
+		slip.get_emp_and_working_day_details()
+
+		pending = [
+			("earnings", settings.get("overtime_salary_component"), flt(overtime)),
+			("deductions", settings.get("late_mark_salary_component"), flt(late_mark)),
+			("deductions", settings.get("advance_salary_component"), flt(advance)),
+		]
+		injected = []
+		for table, component, amount in pending:
+			if not component or not amount:
+				continue
+			slip.append(table, {
+				"salary_component": component,
+				"abbr": frappe.db.get_value("Salary Component", component,
+											"salary_component_abbr") or component[:3],
+				"amount": amount,
+				"default_amount": amount,
+				"additional_amount": amount,
+				"is_additional_component": 1,
+				# Not prorated by payment days: an overtime or recovery figure
+				# is an absolute amount, not a monthly rate.
+				"depends_on_payment_days": 0,
+			})
+			injected.append({"table": table, "component": component, "amount": amount})
+
+		slip.calculate_net_pay()
+
+		result = {
+			"employee": employee,
+			"payment_days": flt(slip.payment_days, 2),
+			"total_working_days": flt(slip.total_working_days, 2),
+			"gross_pay": flt(slip.gross_pay, 2),
+			"total_deduction": flt(slip.total_deduction, 2),
+			"net_pay": flt(slip.net_pay, 2),
+			"earnings": [
+				{"component": r.salary_component, "amount": flt(r.amount, 2),
+				 "injected": any(i["component"] == r.salary_component and i["table"] == "earnings"
+								 for i in injected)}
+				for r in slip.earnings if flt(r.amount)
+			],
+			"deductions": [
+				{"component": r.salary_component, "amount": flt(r.amount, 2),
+				 "injected": any(i["component"] == r.salary_component and i["table"] == "deductions"
+								 for i in injected)}
+				for r in slip.deductions if flt(r.amount)
+			],
+			"injected": injected,
+		}
+	except Exception as e:
+		frappe.db.rollback(save_point=savepoint)
+		frappe.log_error(frappe.get_traceback(), "RAPL: net pay preview failed")
+		return {"error": frappe.utils.strip_html(str(e))[:500]}
+
+	# ALWAYS roll back -- nothing here is ever meant to persist.
+	frappe.db.rollback(save_point=savepoint)
+	return result

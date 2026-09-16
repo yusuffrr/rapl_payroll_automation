@@ -123,3 +123,43 @@ select.ac-cell { padding-right: 2px; }
 .ac-foot { display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
 	margin-top: 10px; padding-top: 9px; border-top: 1px solid var(--border-color); font-size: 12px; }
 .ac-dirty-text { color: var(--blue-600, #2a5fa8); font-weight: 600; }
+
+/* --- collapsed employee row: money at a glance --- */
+.ac-emp-money { display: flex; gap: 9px; align-items: center; white-space: nowrap; font-size: 11px; }
+
+/* --- EFFECT strip --- */
+.ac-effect { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+	margin-top: 6px; padding-top: 5px; border-top: 1px solid var(--border-color); font-size: 11px; }
+
+/* --- advance zone --- */
+.ac-adv-head { cursor: pointer; }
+.ac-adv-toggle { color: var(--text-muted); font-size: 10px; margin-left: 6px; }
+.ac-adv-list { margin-top: 5px; border-top: 1px solid var(--border-color); padding-top: 4px; }
+.ac-adv-line { display: flex; align-items: center; gap: 7px; padding: 2px 0; font-size: 11px; }
+.ac-adv-line input[type="checkbox"] { margin: 0; }
+.ac-adv-name { font-weight: 600; min-width: 52px; }
+.ac-adv-purpose { overflow: hidden; text-overflow: ellipsis; max-width: 110px; white-space: nowrap; }
+
+/* --- computed pay --- */
+.ac-netpay-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+	background: var(--fg-color, #fff); border-top: 1px solid var(--border-color);
+	padding: 6px 10px; font-size: 11px; cursor: pointer; }
+.ac-net { font-size: 13px; }
+.ac-pay-toggle { color: var(--blue-600, #2a5fa8); font-size: 10px; }
+.ac-pay-detail { background: var(--fg-color, #fff); border-top: 1px solid var(--border-color);
+	padding: 9px 11px; font-size: 11px; }
+.ac-pay-cols { display: flex; gap: 30px; flex-wrap: wrap; }
+.ac-pay-cols > div { min-width: 200px; }
+.ac-pay-row { display: flex; justify-content: space-between; gap: 20px; }
+.ac-pay-injected { color: var(--blue-600, #2a5fa8); }
+.ac-pay-total { border-top: 1px solid var(--border-color); margin-top: 4px; padding-top: 4px; font-weight: 600; }
+.ac-pay-net { display: flex; align-items: flex-end; gap: 16px; flex-wrap: wrap;
+	margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--border-color); }
+.ac-net-big { font-size: 24px; font-weight: 600; line-height: 1.15; }
+.ac-pay-note { flex: 1; font-size: 10px; padding-bottom: 3px; }
+
+/* zone bodies must not clip: min-width sized to real content, wrap, then scroll */
+.ac-emp-zones > .ac-zone:nth-child(1) { flex: 1 1 310px; min-width: 310px; }
+.ac-emp-zones > .ac-zone:nth-child(2) { flex: 1 1 270px; min-width: 270px; }
+.ac-emp-zones > .ac-zone:nth-child(3) { flex: 1 1 250px; min-width: 250px; }
+.ac-spacer { flex: 1; min-width: 6px; }

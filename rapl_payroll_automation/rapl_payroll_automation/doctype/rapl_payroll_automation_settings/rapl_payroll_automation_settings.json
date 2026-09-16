@@ -20,6 +20,9 @@
   "ot_rate_base_fieldname",
   "overtime_salary_component",
   "late_mark_salary_component",
+  "advance_section",
+  "advance_salary_component",
+  "advance_cutoff_day",
   "late_mark_rules_section",
   "count_late_marks_only_when_present",
   "statutory_section",
@@ -128,6 +131,25 @@
    "options": "Salary Component",
    "default": "Late Mark",
    "reqd": 1
+  },
+  {
+   "fieldname": "advance_section",
+   "fieldtype": "Section Break",
+   "label": "Employee Advance Recovery"
+  },
+  {
+   "fieldname": "advance_salary_component",
+   "fieldtype": "Link",
+   "options": "Salary Component",
+   "label": "Advance Recovery Salary Component",
+   "description": "Deduction component the Attendance Console creates when recovering an Employee Advance from salary. Typically 'Salary Advance Deductions'."
+  },
+  {
+   "fieldname": "advance_cutoff_day",
+   "fieldtype": "Int",
+   "default": "10",
+   "label": "Advance Cut-off Day",
+   "description": "Day of the month the Console pre-fills as the advance cut-off. Advances posted up to that date and still unrecovered are offered for recovery. Editable per run -- payroll does not always run on the same day."
   },
   {
    "fieldname": "late_mark_rules_section",
