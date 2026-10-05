@@ -14,7 +14,7 @@
 #   calendar day count of the period, identical for every employee.
 
 import frappe
-from frappe.utils import get_datetime, getdate, date_diff
+from frappe.utils import add_days, date_diff, get_datetime, getdate
 from erpnext.setup.doctype.employee.employee import get_holiday_list_for_employee
 from hrms.utils.holiday_list import get_holiday_dates_between
 
@@ -63,6 +63,89 @@ def get_weekly_off_dates(holiday_list, start_date, end_date):
 	return {r.holiday_date for r in records if r.weekly_off}
 
 
+# ---------------------------------------------------------------------------
+# Holidays for an employee OVER A PERIOD
+#
+# Every caller used to do get_holiday_list_for_employee(employee) with no date,
+# which returns the Holiday List assigned TODAY. Processing a past month after
+# the list changed -- e.g. December 2026 in January 2027, once the 2027 list is
+# assigned -- then used the wrong year's list: December's Sundays were not
+# holidays, Sunday work was priced as ordinary-day overtime, and the Floor-grade
+# OT denominator lost its weekly offs. The Salary Slip itself already resolves
+# the list for the period (HRMS 16.20+: per date via Holiday List Assignment).
+# ---------------------------------------------------------------------------
+
+
+def get_holiday_list_ranges(employee, start_date, end_date):
+	"""[(holiday_list, from_date, to_date), ...] covering [start_date, end_date].
+
+	HRMS 16.20+ provides get_holiday_list_ranges_for_employee (the same function
+	the Salary Slip uses), which handles any number of list changes. On older
+	HRMS the list is resolved as on the first and last day, and when they differ
+	the change-over day is found by bisection (one change per period assumed --
+	assignments are normally yearly).
+	"""
+	start, end = getdate(start_date), getdate(end_date)
+	if start > end:
+		return []
+
+	try:
+		from hrms.utils.holiday_list import get_holiday_list_ranges_for_employee
+	except ImportError:
+		get_holiday_list_ranges_for_employee = None
+
+	if get_holiday_list_ranges_for_employee:
+		return [
+			(r["holiday_list"], max(getdate(r["from_date"]), start), min(getdate(r["to_date"]), end))
+			for r in get_holiday_list_ranges_for_employee(employee, start, end)
+			if r.get("holiday_list")
+		]
+
+	def list_on(day):
+		return get_holiday_list_for_employee(employee, as_on=day)
+
+	first = list_on(start)
+	last = first if start == end else list_on(end)
+	if first == last:
+		return [(first, start, end)] if first else []
+
+	# Bisect for the first day that uses `last`.
+	lo, hi = start, end  # list_on(lo) == first, list_on(hi) == last
+	while date_diff(hi, lo) > 1:
+		mid = add_days(lo, date_diff(hi, lo) // 2)
+		if list_on(mid) == first:
+			lo = mid
+		else:
+			hi = mid
+	return [r for r in ((first, start, lo), (last, hi, end)) if r[0]]
+
+
+def get_employee_holiday_rows(employee, start_date, end_date):
+	"""Holiday rows (holiday_date, description, weekly_off) for the employee's period."""
+	rows = []
+	for holiday_list, frm, to in get_holiday_list_ranges(employee, start_date, end_date):
+		rows += frappe.get_all(
+			"Holiday",
+			filters={"parent": holiday_list, "holiday_date": ["between", [frm, to]]},
+			fields=["holiday_date", "description", "weekly_off"],
+		)
+	return rows
+
+
+def get_employee_holiday_dates(employee, start_date, end_date):
+	"""Weekly offs AND named holidays in force for the employee over the period."""
+	return {getdate(r.holiday_date) for r in get_employee_holiday_rows(employee, start_date, end_date)}
+
+
+def get_employee_weekly_off_dates(employee, start_date, end_date):
+	"""Weekly offs ONLY (Sundays) -- the Floor/Office OT denominator split."""
+	return {
+		getdate(r.holiday_date)
+		for r in get_employee_holiday_rows(employee, start_date, end_date)
+		if r.weekly_off
+	}
+
+
 def get_total_working_days(start_date, end_date):
 	"""
 	Matches native get_working_days_details() exactly for RAPL's settings
@@ -75,7 +158,9 @@ def get_total_working_days(start_date, end_date):
 
 
 def get_automation_settings():
-	return frappe.get_single("RAPL Payroll Automation Settings")
+	# Cached: this runs on every Attendance validate and every Salary Slip
+	# validate. A Single's cache is cleared when the Settings are saved.
+	return frappe.get_cached_doc("RAPL Payroll Automation Settings")
 
 
 def get_grade_ot_rule(settings, grade):
@@ -116,7 +201,7 @@ def get_additional_salary_total(employee, salary_component, start_date, end_date
 	return float(total[0][0]) if total else 0.0
 
 
-def additional_salary_already_exists(employee, salary_component, payroll_date):
+def additional_salary_already_exists(employee, salary_component, payroll_date, start_date=None):
 	"""
 	Duplicate-run guard: prevents the bulk Overtime/Late Mark functions from
 	double-processing an employee if accidentally run twice for the same period.
@@ -124,12 +209,15 @@ def additional_salary_already_exists(employee, salary_component, payroll_date):
 	ref_docname (verified in overtime_slip.py) -- we use a simpler existence
 	check against employee+component+payroll_date+docstatus=1 instead.
 	"""
+	# With start_date: ANY submitted record dated inside the period. Matching
+	# only the exact end date let a 1-15 run and a 1-30 run both pay the
+	# first fortnight.
 	return frappe.db.exists(
 		"Additional Salary",
 		{
 			"employee": employee,
 			"salary_component": salary_component,
-			"payroll_date": payroll_date,
+			"payroll_date": ["between", [start_date, payroll_date]] if start_date else payroll_date,
 			"docstatus": 1,
 		},
 	)

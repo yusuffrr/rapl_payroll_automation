@@ -40,6 +40,12 @@ def update_outstanding_balance_from_additional_salary(doc, method):
 def get_employee_advance_summary(employee, current_advance=None):
 	"""Returns submitted EAs for the employee with outstanding balance > 0
 	that were posted on or before the current advance, excluding the current one."""
+	# get_all ignores permissions, so check explicitly: the caller must be
+	# able to read this employee's advances (HR, or the employee's own).
+	if not frappe.has_permission("Employee", "read", doc=employee) or not frappe.has_permission(
+		"Employee Advance", "read"
+	):
+		frappe.throw("Not permitted", frappe.PermissionError)
 	filters = {
 		"employee": employee,
 		"docstatus": 1,
@@ -82,4 +88,7 @@ def _recalculate_outstanding(ea_name):
 	if not values:
 		return
 	outstanding = flt(values.paid_amount) - flt(values.claimed_amount) - flt(values.return_amount)
-	frappe.db.set_value("Employee Advance", ea_name, "custom_outstanding_balance", outstanding)
+	frappe.db.set_value(
+		"Employee Advance", ea_name, "custom_outstanding_balance", outstanding,
+		update_modified=False,
+	)

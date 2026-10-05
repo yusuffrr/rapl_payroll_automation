@@ -40,15 +40,22 @@ def get_employees_with_attendance_in_period(start_date, end_date, employees=None
 def get_attendance_for_employee(employee, start_date, end_date):
 	"""Explicit filters: docstatus=1 (submitted only), status=Present only --
 	Absent/On Leave/draft/cancelled records must never reach the OT calculation."""
+	# A day whose OT was PINNED by HR in the Attendance Console
+	# (custom_overtime_manual = 1) is returned whatever its status, so the
+	# pinned figure -- not a fresh recomputation -- is what gets paid. Without
+	# this the Console preview and the Processing document disagreed.
 	return frappe.get_all(
 		"Attendance",
 		filters={
 			"employee": employee,
 			"attendance_date": ["between", [start_date, end_date]],
 			"docstatus": 1,
-			"status": "Present",
 		},
+		or_filters=[["status", "=", "Present"], ["custom_overtime_manual", "=", 1]],
 		fields=[
+			"status",
+			"custom_overtime_manual",
+			"custom_overtime_hours",
 			"name",
 			"attendance_date",
 			"in_time",

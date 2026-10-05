@@ -59,6 +59,8 @@
 import frappe
 from frappe.utils import flt, getdate
 
+from rapl_payroll_automation.api.payroll_math import esi_employee_contribution, round_half_up
+
 from rapl_payroll_automation.api.payroll_automation_utils import (
 	get_additional_salary_total,
 	get_automation_settings,
@@ -90,8 +92,12 @@ def correct_statutory_deductions(doc, method):
 	if not doc.employee or not doc.start_date:
 		return
 
-	basic = _get_earning_amount(doc, "Basic")
-	hra = _get_earning_amount(doc, "HRA")
+	settings = get_automation_settings()
+	# Component names from Settings (defaults "Basic" / "HRA"). These were
+	# literal strings: a component named anything else read as 0, so PT / ESI
+	# were computed on a lower income without any warning.
+	basic = _get_earning_amount(doc, settings.get("basic_salary_component") or "Basic")
+	hra = _get_earning_amount(doc, settings.get("hra_salary_component") or "HRA")
 	conveyance = flt(doc.custom_conveyance_for_deductions)
 	overtime = flt(doc.custom_overtime_for_pt)
 
@@ -101,7 +107,6 @@ def correct_statutory_deductions(doc, method):
 	if not emp:
 		return
 
-	settings = get_automation_settings()
 	changed = False
 
 	if emp.custom_pf:
@@ -114,11 +119,22 @@ def correct_statutory_deductions(doc, method):
 		changed = _set_deduction_amount(doc, settings.pt_salary_component, pt_amount) or changed
 
 	if emp.custom_esi:
-		esi_amount = (basic + hra + conveyance + overtime) * 0.0075
-		changed = _set_deduction_amount(doc, settings.esi_salary_component, esi_amount) or changed
+		# ESIC rule: 0.75% of wages, rounded UP to the next whole rupee
+		# (113.06 -> 114), not to the nearest rupee.
+		esi_amount = esi_employee_contribution(basic + hra + conveyance + overtime)
+		changed = _set_deduction_amount(
+			doc, settings.esi_salary_component, esi_amount, rounding=int
+		) or changed
 
 	if changed:
 		doc.set_net_pay()
+		# HRMS computes the year/month-to-date figures inside its own
+		# validate(), BEFORE this hook runs, so they still hold the
+		# pre-correction amounts. Recompute them from the corrected rows.
+		for method in ("compute_year_to_date", "compute_month_to_date",
+					   "compute_component_wise_year_to_date"):
+			if hasattr(doc, method):
+				getattr(doc, method)()
 
 
 def _get_earning_amount(doc, component_name):
@@ -128,11 +144,13 @@ def _get_earning_amount(doc, component_name):
 	return 0.0
 
 
-def _set_deduction_amount(doc, component_name, amount):
+def _set_deduction_amount(doc, component_name, amount, rounding=None):
 	"""Overwrites the matching deduction row's amount, rounded to whole rupees
 	(matches RAPL's confirmed 'Round to Nearest Integer' convention on these
 	three components). Returns True if a matching row was found and updated."""
-	amount = round(amount)
+	# Half-up, not Python's round(): round() is banker's rounding
+	# (round(1234.5) == 1234, round(1235.5) == 1236).
+	amount = rounding(amount) if rounding else round_half_up(amount)
 	for row in doc.deductions:
 		if row.salary_component == component_name:
 			row.amount = amount
@@ -153,4 +171,10 @@ def _compute_pt(gender, basic, hra, conveyance, overtime, start_date):
 		if income > 25000:
 			return 300 if month == 2 else 200
 		return 0
+	# Any other / blank gender: PT slab is undefined -- record it rather than
+	# silently deducting nothing.
+	frappe.msgprint(
+		f"Professional Tax not computed: gender '{gender or '(blank)'}' has no PT slab.",
+		indicator="orange", alert=True,
+	)
 	return 0

@@ -11,6 +11,14 @@ from frappe.utils import getdate
 
 @frappe.whitelist()
 def run_preflight_check(start_date, end_date):
+	# Lists names and data problems for the whole company -- HR only.
+	from rapl_payroll_automation.api.employee_attendance import _is_hr
+
+	if not _is_hr() or not frappe.has_permission("Attendance", "read"):
+		frappe.throw("Payroll pre-flight check is restricted to HR.", frappe.PermissionError)
+	if not start_date or not end_date or getdate(start_date) > getdate(end_date):
+		frappe.throw("Set a valid period first")
+
 	issues = []
 
 	issues += _check_missing_checkout(start_date, end_date)
@@ -54,12 +62,22 @@ def _check_missing_monthly_salary(start_date, end_date):
 		distinct=True,
 	)
 	issues = []
-	for emp in employees:
-		salary = frappe.db.get_value("Employee", emp, "custom_monthly_salary")
-		if not salary:
-			name = frappe.db.get_value("Employee", emp, "employee_name")
-			issues.append({"employee": emp, "employee_name": name, "reason": "Missing custom_monthly_salary"})
+	for e in _employee_rows(employees):
+		if not e.custom_monthly_salary:
+			issues.append({"employee": e.name, "employee_name": e.employee_name,
+						   "reason": "Missing custom_monthly_salary"})
 	return issues
+
+
+def _employee_rows(employees):
+	"""One query for the whole list instead of 1-2 get_value calls per employee."""
+	if not employees:
+		return []
+	return frappe.get_all(
+		"Employee",
+		filters={"name": ["in", list(employees)]},
+		fields=["name", "employee_name", "grade", "custom_monthly_salary"],
+	)
 
 
 def _check_missing_grade_rule(start_date, end_date):
@@ -73,9 +91,8 @@ def _check_missing_grade_rule(start_date, end_date):
 		distinct=True,
 	)
 	issues = []
-	for emp in employees:
-		grade = frappe.db.get_value("Employee", emp, "grade")
-		name = frappe.db.get_value("Employee", emp, "employee_name")
+	for e in _employee_rows(employees):
+		emp, grade, name = e.name, e.grade, e.employee_name
 		if not grade:
 			issues.append({"employee": emp, "employee_name": name, "reason": "Missing Grade (needed for OT rate)"})
 		elif grade not in configured_grades:
@@ -143,15 +160,14 @@ def _check_missing_salary_structure_assignment(start_date, end_date):
 		pluck="employee",
 		distinct=True,
 	)
+	with_assignment = set(frappe.get_all(
+		"Salary Structure Assignment",
+		filters={"employee": ["in", employees or [""]], "docstatus": 1, "from_date": ["<=", end_date]},
+		pluck="employee",
+	))
 	issues = []
-	for emp in employees:
-		has_assignment = frappe.db.exists(
-			"Salary Structure Assignment",
-			{"employee": emp, "docstatus": 1, "from_date": ["<=", end_date]},
-		)
-		if not has_assignment:
-			name = frappe.db.get_value("Employee", emp, "employee_name")
-			issues.append(
-				{"employee": emp, "employee_name": name, "reason": "No active Salary Structure Assignment found"}
-			)
+	for e in _employee_rows(employees):
+		if e.name not in with_assignment:
+			issues.append({"employee": e.name, "employee_name": e.employee_name,
+						   "reason": "No active Salary Structure Assignment found"})
 	return issues

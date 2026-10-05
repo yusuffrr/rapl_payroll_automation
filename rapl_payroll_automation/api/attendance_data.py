@@ -38,9 +38,11 @@ from rapl_payroll_automation.api.ot_engine import (
 	resolve_shift,
 )
 from rapl_payroll_automation.api.payroll_automation_utils import (
-	get_all_holiday_dates,
+	get_employee_holiday_rows,
 	get_automation_settings,
 )
+from rapl_payroll_automation.api.payroll_math import day_totals, round_half_up
+from rapl_payroll_automation.api.payroll_automation_utils import time_to_seconds
 from erpnext.setup.doctype.employee.employee import get_holiday_list_for_employee
 
 # Flag codes. "red" = something is wrong and payroll will be affected.
@@ -148,28 +150,37 @@ def build_month_rows(employee, start_date, end_date, settings=None):
 	settings = settings or get_automation_settings()
 	emp = _employee_context(employee)
 
-	holiday_list = get_holiday_list_for_employee(employee)
-	holiday_dates = set(get_all_holiday_dates(holiday_list, start_date, end_date) or [])
+	# The list(s) in force DURING the period, not the one assigned today.
+	holiday_names = {
+		getdate(h.holiday_date): {"description": h.description, "weekly_off": bool(h.weekly_off)}
+		for h in get_employee_holiday_rows(employee, start_date, end_date)
+	}
+	holiday_dates = set(holiday_names)
 
 	# Employee.custom_ot -- looked up once for the whole period, not per day.
 	ot_eligible = is_ot_eligible(employee)
 
-	holiday_names = {}
-	if holiday_list:
-		for h in frappe.get_all(
-			"Holiday",
-			filters={"parent": holiday_list, "holiday_date": ["between", [start_date, end_date]]},
-			fields=["holiday_date", "description", "weekly_off"],
-		):
-			holiday_names[getdate(h.holiday_date)] = {
-				"description": h.description,
-				"weekly_off": bool(h.weekly_off),
-			}
-
 	by_date = _fetch_attendance(employee, start_date, end_date)
+
+	# Linked check-ins for the whole period in ONE query (was one per record).
+	record_names = [r.name for recs in by_date.values() for r in recs]
+	checkins_by_record = {}
+	if record_names:
+		for c in frappe.get_all(
+			"Employee Checkin",
+			filters={"attendance": ["in", record_names]},
+			fields=["attendance", "time", "log_type"],
+			order_by="time",
+		):
+			checkins_by_record.setdefault(c.attendance, []).append(c)
 
 	joining = getdate(emp.date_of_joining) if emp.date_of_joining else None
 	relieving = getdate(emp.relieving_date) if emp.relieving_date else None
+
+	# A month that has not finished has days that simply have not happened yet.
+	# Those must never read as "nobody marked attendance" -- they are not
+	# missing, they are upcoming.
+	today = getdate()
 
 	rows = []
 	for day in _daterange(start_date, end_date):
@@ -188,6 +199,7 @@ def build_month_rows(employee, start_date, end_date, settings=None):
 			"in_service": in_service,
 			"is_holiday": is_holiday,
 			"is_weekly_off": bool(holiday and holiday["weekly_off"]),
+			"is_future": day > today,
 			"holiday_description": (holiday or {}).get("description"),
 			"attendance": None,
 			"flags": [],
@@ -225,18 +237,21 @@ def build_month_rows(employee, start_date, end_date, settings=None):
 					or record.leave_type != settings.half_day_leave_type
 				),
 				"late_mark_band": record.custom_late_mark_band,
-				"overtime_hours": flt(record.custom_overtime_hours, 2),
+				"overtime_hours": round_half_up(flt(record.custom_overtime_hours), 2),
 				"overtime_manual": bool(record.custom_overtime_manual),
 				"late_mark_manual": bool(record.custom_late_mark_manual),
 				"status_manual": bool(record.custom_status_manual),
 				"attendance_type": record.custom_attendance_type,
 				"modified": str(record.modified),
 			}
-			_add_record_flags(row, record, day, is_holiday, holiday_dates, settings, emp, ot_eligible)
-		elif in_service:
+			_add_record_flags(row, record, day, is_holiday, holiday_dates, settings, emp, ot_eligible,
+							  checkins=checkins_by_record.get(record.name, []))
+		elif in_service and day <= today:
 			if cancelled_only:
 				_flag(row, FLAG_CANCELLED_ONLY, "Only a cancelled record exists for this day")
-			elif not is_holiday:
+			elif not is_holiday and not (day == today):
+				# Today is not over: no record YET is normal until the day's
+				# check-ins have been turned into attendance.
 				_flag(row, FLAG_NO_RECORD, "No attendance marked on a working day")
 
 		rows.append(row)
@@ -251,7 +266,8 @@ def _flag(row, code, message, extra=None):
 	row["flags"].append(entry)
 
 
-def _add_record_flags(row, record, day, is_holiday, holiday_dates, settings, emp, ot_eligible=True):
+def _add_record_flags(row, record, day, is_holiday, holiday_dates, settings, emp, ot_eligible=True,
+					  checkins=None):
 	att = row["attendance"]
 
 	# A genuine leave is one backed by a Leave Application, or carrying a leave
@@ -276,12 +292,13 @@ def _add_record_flags(row, record, day, is_holiday, holiday_dates, settings, emp
 	# diverge permanently. Overwriting the evidence to match would destroy the
 	# ability to see a correction was ever made -- so this is surfaced, never
 	# reconciled.
-	checkins = frappe.get_all(
-		"Employee Checkin",
-		filters={"attendance": record.name},
-		fields=["time", "log_type"],
-		order_by="time",
-	)
+	if checkins is None:
+		checkins = frappe.get_all(
+			"Employee Checkin",
+			filters={"attendance": record.name},
+			fields=["time", "log_type"],
+			order_by="time",
+		)
 	if checkins and record.in_time:
 		first = get_datetime(checkins[0].time)
 		if abs((get_datetime(record.in_time) - first).total_seconds()) > 60:
@@ -313,9 +330,10 @@ def _add_record_flags(row, record, day, is_holiday, holiday_dates, settings, emp
 		expected_half_day = past_all_bands or is_early_exit(record.out_time, day, settings)
 
 	expected_ot = None
+	expected_ot_exact = None
 	if not genuine_leave:
 		try:
-			expected_ot = flt(
+			expected_ot_exact = (
 				compute_day_ot(
 					in_time=record.in_time,
 					out_time=record.out_time,
@@ -326,16 +344,20 @@ def _add_record_flags(row, record, day, is_holiday, holiday_dates, settings, emp
 					settings=settings,
 					holiday_dates=holiday_dates,
 					ot_eligible=ot_eligible,
-				),
-				2,
+				)
 			)
+			# Rounded for DISPLAY only. The period total adds the exact
+			# figures and rounds once (see summarise()).
+			expected_ot = round_half_up(expected_ot_exact, 2)
 		except NightShiftNotSupported:
 			expected_ot = None
+			expected_ot_exact = None
 
 	att["expected_working_hours"] = expected_working_hours
 	att["expected_half_day"] = expected_half_day
 	att["expected_late_mark_band"] = expected_band
 	att["expected_overtime_hours"] = expected_ot
+	att["expected_overtime_exact"] = expected_ot_exact
 	att["expected_early_exit"] = (
 		1 if (not is_holiday and is_early_exit(record.out_time, day, settings)) else 0
 	)
@@ -363,9 +385,17 @@ def _add_record_flags(row, record, day, is_holiday, holiday_dates, settings, emp
 			  {"stored": att["late_mark_band"], "expected": expected_band})
 
 
-def summarise(rows, settings=None):
-	"""Period totals for one employee, from the day rows."""
+def summarise(rows, settings=None, today=None):
+	"""Period totals for one employee, from the day rows.
+
+	`present` is unchanged (a plain count of Present + Work From Home records,
+	which other pages rely on). The payroll-meaningful figure is `payable_days`:
+	days worked + weekly offs and holidays + half days at 0.5. Days that have
+	not happened yet are excluded everywhere, so a month in progress is
+	summarised through today only.
+	"""
 	settings = settings or get_automation_settings()
+	today = today or getdate()
 
 	summary = {
 		"present": 0, "half_day": 0, "absent": 0, "on_leave": 0,
@@ -385,7 +415,7 @@ def summarise(rows, settings=None):
 		if not att:
 			if row["is_holiday"]:
 				summary["holiday"] += 1
-			elif row["in_service"]:
+			elif row["in_service"] and not row.get("is_future") and str(row["date"]) != str(today):
 				summary["no_record"] += 1
 			continue
 
@@ -401,12 +431,26 @@ def summarise(rows, settings=None):
 		if status_key:
 			summary[status_key] += 1
 
-		summary["overtime_hours"] += flt(att["overtime_hours"])
+		# EXACT hours, the same figure RAPL Overtime Processing pays from
+		# (recomputed from punches; a pinned day uses its pinned value).
+		# Adding the 2-dp day figures instead built in a bias: 47 minutes is
+		# 0.7833 h, shown as 0.78, and 26 such days lost 0.09 h of pay.
+		exact = att.get("expected_overtime_exact")
+		if att.get("overtime_manual") or exact is None:
+			summary["overtime_hours"] += flt(att["overtime_hours"])
+		else:
+			summary["overtime_hours"] += max(flt(exact), 0)
 		band = att["late_mark_band"]
 		if band:
 			summary["band_counts"][band] = summary["band_counts"].get(band, 0) + 1
 
-	summary["overtime_hours"] = flt(summary["overtime_hours"], 2)
+	# Rounded ONCE, after adding. The day rows show 2-dp figures, so their
+	# column can differ from this total by a hundredth or two -- the total is
+	# the accurate one and is what gets paid.
+	summary["overtime_hours_exact"] = summary["overtime_hours"]
+	summary["overtime_hours"] = round_half_up(summary["overtime_hours"], 2)
+	summary.update(day_totals(rows, today))
+	summary["month_in_progress"] = bool(rows) and str(rows[-1]["date"]) > str(today)
 	return summary
 
 
@@ -417,7 +461,10 @@ def get_band_definitions(settings=None):
 	return [
 		{"label": b.label, "fraction": flt(b.fraction),
 		 "from_time": str(b.from_time), "to_time": str(b.to_time)}
-		for b in sorted(settings.late_mark_bands, key=lambda r: str(r.from_time))
+		# time_to_seconds, NOT str(): Time fields load as timedelta and
+		# str(timedelta) puts "9:46:00" after "10:01:00", which put the Console's
+		# band columns in a different order from the processing document's.
+		for b in sorted(settings.late_mark_bands, key=lambda r: time_to_seconds(r.from_time))
 	]
 
 

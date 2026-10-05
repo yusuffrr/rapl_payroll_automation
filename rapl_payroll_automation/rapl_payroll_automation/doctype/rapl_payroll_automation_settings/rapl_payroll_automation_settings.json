@@ -16,6 +16,7 @@
   "overtime_section",
   "ot_minimum_minutes",
   "ot_hours_divisor",
+  "unpaid_break_minutes",
   "column_break_ot",
   "ot_rate_base_fieldname",
   "overtime_salary_component",
@@ -28,6 +29,8 @@
   "late_mark_rules_section",
   "count_late_marks_only_when_present",
   "statutory_section",
+  "basic_salary_component",
+  "hra_salary_component",
   "pf_salary_component",
   "pt_salary_component",
   "esi_salary_component",
@@ -96,6 +99,13 @@
    "default": "45",
    "reqd": 1,
    "description": "On non-Sunday/non-holiday days, OT only counts if checkout is more than this many minutes past shift end."
+  },
+  {
+   "fieldname": "unpaid_break_minutes",
+   "fieldtype": "Int",
+   "label": "Unpaid Break (minutes) deducted from holiday OT",
+   "default": "0",
+   "description": "Shift is 8.5h but paid as 8h (divisor above), i.e. 30 min unpaid break. Holiday OT uses the raw in-to-out span, which includes that break. Set to 30 to deduct it from holiday/Sunday OT only. 0 = unchanged behaviour."
   },
   {
    "fieldname": "ot_hours_divisor",
@@ -181,6 +191,20 @@
    "fieldname": "statutory_section",
    "fieldtype": "Section Break",
    "label": "Statutory Deduction Components"
+  },
+  {
+   "fieldname": "basic_salary_component",
+   "fieldtype": "Link",
+   "options": "Salary Component",
+   "label": "Basic Salary Component",
+   "description": "Earning read as B in the PF / PT / ESI recomputation. Blank = a component named exactly 'Basic'."
+  },
+  {
+   "fieldname": "hra_salary_component",
+   "fieldtype": "Link",
+   "options": "Salary Component",
+   "label": "HRA Salary Component",
+   "description": "Earning read as HRA in the PT / ESI recomputation. Blank = a component named exactly 'HRA'."
   },
   {
    "fieldname": "pf_salary_component",

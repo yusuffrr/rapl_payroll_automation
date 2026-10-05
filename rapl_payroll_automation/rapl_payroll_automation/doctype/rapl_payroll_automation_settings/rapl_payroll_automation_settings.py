@@ -4,6 +4,7 @@
 import frappe
 from frappe import _
 from frappe.model.document import Document
+from frappe.utils import cint, flt
 
 from rapl_payroll_automation.api.payroll_automation_utils import time_to_seconds
 
@@ -13,6 +14,9 @@ class RAPLPayrollAutomationSettings(Document):
 		self.validate_half_day_leave_type()
 		self.validate_grade_rules_not_duplicated()
 		self.validate_band_ordering()
+		self.validate_band_labels_and_fractions()
+		self.validate_numbers()
+		self.validate_components()
 
 	def validate_half_day_leave_type(self):
 		"""
@@ -31,10 +35,12 @@ class RAPLPayrollAutomationSettings(Document):
 		if not self.half_day_leave_type:
 			return
 
-		is_lwp, is_ppl = frappe.db.get_value(
-			"Leave Type", self.half_day_leave_type, ["is_lwp", "is_ppl"]
+		lt = frappe.db.get_value(
+			"Leave Type", self.half_day_leave_type, ["is_lwp", "is_ppl"], as_dict=True
 		)
-		if is_lwp or is_ppl:
+		if not lt:
+			frappe.throw(_("Half Day Leave Type '{0}' does not exist.").format(self.half_day_leave_type))
+		if lt.is_lwp or lt.is_ppl:
 			frappe.throw(
 				_(
 					"Half Day Leave Type '{0}' has 'Is LWP' or 'Is Partially Paid Leave' "
@@ -98,3 +104,54 @@ class RAPLPayrollAutomationSettings(Document):
 							"at most one band -- adjust the From/To times so they don't overlap."
 						).format(prev.label, row.label)
 					)
+
+	def validate_band_labels_and_fractions(self):
+		"""Late Mark counts attendance PER LABEL, so two bands sharing a label
+		would both count the same records -- a double deduction."""
+		seen = set()
+		for row in self.late_mark_bands:
+			label = (row.label or "").strip()
+			if not label:
+				frappe.throw(_("Late Mark Band row {0}: Label is required.").format(row.idx))
+			if label in seen:
+				frappe.throw(_("Late Mark Band label '{0}' is used twice. Labels must be unique.").format(label))
+			seen.add(label)
+			if not 0 <= flt(row.fraction) <= 1:
+				frappe.throw(
+					_("Late Mark Band '{0}': fraction must be between 0 and 1 (of a day).").format(label)
+				)
+
+	def validate_numbers(self):
+		if self.meta.has_field("ot_hours_divisor") and flt(self.ot_hours_divisor) <= 0:
+			frappe.throw(_("OT Hours Divisor must be greater than 0."))
+		if cint(self.get("ot_minimum_minutes")) < 0:
+			frappe.throw(_("Minimum Overrun Minutes cannot be negative."))
+		if cint(self.get("unpaid_break_minutes")) < 0:
+			frappe.throw(_("Unpaid Break minutes cannot be negative."))
+		day = cint(self.get("advance_cutoff_day"))
+		if day and not 1 <= day <= 31:
+			frappe.throw(_("Advance cut-off day must be between 1 and 31."))
+
+	def validate_components(self):
+		"""Catch a wrong component type now, not on payroll day."""
+		expected = {
+			"overtime_salary_component": "Earning",
+			"basic_salary_component": "Earning",
+			"hra_salary_component": "Earning",
+			"late_mark_salary_component": "Deduction",
+			"advance_salary_component": "Deduction",
+			"pf_salary_component": "Deduction",
+			"pt_salary_component": "Deduction",
+			"esi_salary_component": "Deduction",
+		}
+		for field, kind in expected.items():
+			name = self.get(field)
+			if not name or not self.meta.has_field(field):
+				continue
+			actual = frappe.db.get_value("Salary Component", name, "type")
+			if actual and actual != kind:
+				frappe.throw(
+					_("{0}: '{1}' is a {2} component, expected {3}.").format(
+						self.meta.get_label(field), name, actual, kind
+					)
+				)

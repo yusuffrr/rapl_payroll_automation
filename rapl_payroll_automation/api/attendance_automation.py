@@ -64,11 +64,12 @@ import frappe
 from frappe.utils import cint, flt, get_datetime, getdate, time_diff_in_hours
 
 from rapl_payroll_automation.api.payroll_automation_utils import (
-	get_all_holiday_dates,
+	get_employee_holiday_dates,
 	get_automation_settings,
 	get_datetime_combine,
 	time_to_seconds,
 )
+from rapl_payroll_automation.api.payroll_math import round_half_up
 from rapl_payroll_automation.api.ot_engine import (
 	NightShiftNotSupported,
 	compute_day_ot,
@@ -140,7 +141,15 @@ def derive_attendance_fields(
 		"custom_late_mark_band": current_late_mark_band if cint(late_mark_manual) else None,
 		"early_exit": 0,
 		"status": status,
-		"half_day_status": half_day_status,
+		# A Half Day must carry half_day_status, or HRMS deducts nothing
+		# (get_half_absent_days counts only "Absent"). Set here, BEFORE the
+		# early guards, so a hand-chosen Half Day with no punches or on a
+		# holiday is covered too. A Half Day backed by a Leave Application is
+		# left to HRMS's own check_leave_record().
+		"half_day_status": (
+			(half_day_status or "Absent")
+			if status == "Half Day" and not leave_application else half_day_status
+		),
 		"leave_type": leave_type,
 		"cleared_half_day": False,
 	}
@@ -166,7 +175,7 @@ def derive_attendance_fields(
 		if not in_time or not out_time:
 			return 0.0
 		try:
-			return flt(
+			return round_half_up(
 				compute_day_ot(
 					in_time=in_time,
 					out_time=out_time,
@@ -250,7 +259,12 @@ def derive_attendance_fields(
 		# they are -- but the band and overtime above still recompute, because
 		# pinning "Present" says nothing about how late someone arrived.
 		derived["status"] = status
-		derived["half_day_status"] = half_day_status
+		# A Half Day chosen by hand must still cost half a day: HRMS
+		# get_half_absent_days() only counts half_day_status == "Absent".
+		# Keeping a blank value here made a manual Half Day free.
+		derived["half_day_status"] = (
+			(half_day_status or "Absent") if status == "Half Day" else half_day_status
+		)
 		derived["leave_type"] = leave_type
 	elif is_half_day:
 		derived["status"] = "Half Day"
@@ -297,10 +311,9 @@ def apply_attendance_deduction_logic(doc, method):
 		doc.out_time = get_datetime(doc.out_time)
 
 	settings = get_automation_settings()
-	holiday_list = get_holiday_list_for_employee(doc.employee)
-	holiday_dates = set(
-		get_all_holiday_dates(holiday_list, doc.attendance_date, doc.attendance_date) or []
-	)
+	# The list in force ON the attendance date (matters when an old record is
+	# edited after a new year's list has been assigned).
+	holiday_dates = get_employee_holiday_dates(doc.employee, doc.attendance_date, doc.attendance_date)
 
 	derived = derive_attendance_fields(
 		employee=doc.employee,
@@ -329,13 +342,18 @@ def apply_attendance_deduction_logic(doc, method):
 	doc.custom_overtime = derived["custom_overtime"]
 
 	if not derived["rules_applied"]:
+		if doc.status == "Half Day":
+			doc.half_day_status = derived["half_day_status"]
 		return
 
 	doc.custom_late_mark_band = derived["custom_late_mark_band"]
 	if doc.out_time:
 		doc.early_exit = derived["early_exit"]
 	if cint(doc.get("custom_status_manual")):
-		pass  # held by hand -- the band and OT above are still refreshed
+		# Held by hand -- the band and OT above are still refreshed. A manual
+		# Half Day still needs half_day_status for the deduction to apply.
+		if doc.status == "Half Day":
+			doc.half_day_status = derived["half_day_status"]
 	elif derived["status"] == "Half Day":
 		doc.status = "Half Day"
 		doc.half_day_status = derived["half_day_status"]

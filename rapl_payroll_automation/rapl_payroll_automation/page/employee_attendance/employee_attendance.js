@@ -253,7 +253,9 @@ frappe.pages["employee-attendance"].on_page_load = function (wrapper) {
 		const cls = worked_off_day ? "ea-worked-off" : "";
 		const status_label = worked_off_day
 			? __("Off &middot; worked")
-			: frappe.utils.escape_html(att.leave_type ? att.status + " &middot; " + att.leave_type : att.status);
+			: att.leave_type
+				? frappe.utils.escape_html(att.status) + " &middot; " + frappe.utils.escape_html(att.leave_type)
+				: frappe.utils.escape_html(att.status);
 
 		const cut = show
 			? att.late_deduction_amount

@@ -63,8 +63,9 @@
       "fieldname": "ot_rate",
       "fieldtype": "Currency",
       "label": "Rate/hr",
+      "precision": "6",
       "in_list_view": 1,
-      "description": "Editable. Changing this recalculates Amount = OT Hours \u00d7 Rate/hr automatically."
+      "description": "Exact hourly rate (monthly salary / OT days / OT divisor), to 6 decimals. Amount = OT time x this rate, rounded once to whole rupees. Editable; changing it recalculates Amount."
     },
     {
       "fieldname": "column_break_amt",

@@ -60,10 +60,10 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 	const $body = $(`
 		<div class="ac-wrap" style="padding:10px 0;">
 			<div class="ac-bulk" style="display:none;"></div>
-			<div class="ac-status text-muted" style="padding:24px 0; text-align:center;">
+			<div class="ac-msg text-muted" style="padding:24px 0; text-align:center;">
 				${__("Choose a period, then Load.")}
 			</div>
-			<div class="ac-out"></div>
+			<div class="ac-grid-out"></div>
 			<div class="ac-foot" style="display:none;"></div>
 		</div>
 	`).appendTo(page.main);
@@ -86,8 +86,16 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		return { start: iso(new Date(year, mi, 1)), end: iso(new Date(year, mi + 1, 0)) };
 	}
 
+	// The period the grid was LOADED for. Every action after a load uses this,
+	// never the dropdowns: switching the Month dropdown without pressing Load
+	// used to build next month's draft from this month's grid and overrides,
+	// and date advance recoveries in the wrong month.
+	function loaded_period() {
+		return state.range || period();
+	}
+
 	function status(msg) {
-		$body.find(".ac-status").text(msg || "").toggle(Boolean(msg));
+		$body.find(".ac-msg").text(msg || "").toggle(Boolean(msg));
 	}
 
 	// ---------------------------------------------------------------- load
@@ -109,7 +117,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 	function do_load(range) {
 		const employee = employee_field.get_value();
 		status(__("Loading..."));
-		$body.find(".ac-out").empty();
+		$body.find(".ac-grid-out").empty();
 
 		frappe.call({
 			method: "rapl_payroll_automation.api.attendance_console.get_console_data",
@@ -122,7 +130,18 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 			},
 			freeze: true,
 			freeze_message: __("Reading attendance..."),
+			error() {
+				status(__("Could not load. Check the Error Log, then try again."));
+			},
 			callback(r) {
+				// Summary overrides belong to one period and employee set. A
+				// reload of the SAME view (after Apply, Create...) keeps them;
+				// a different month or employee filter starts clean.
+				const view = `${range.start}|${employee || ""}`;
+				if (state.view !== view) state.overrides.clear();
+				state.view = view;
+				state.range = range;
+				state.loaded_employee = employee || null;
 				state.data = r.message;
 				state.selected.clear();
 				state.netpay.clear();
@@ -206,8 +225,11 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 			(c) => `<th style="width:${c.w}" class="${c.num ? "ac-num" : ""}"${c.title ? ` title="${c.title()}"` : ""}>${c.label ? c.label() : ""}</th>`
 		).join("");
 		const body = state.data.groups.map((g) => render_group(g, bands)).join("");
-		$body.find(".ac-out").html(
-			`<table class="ea-table ac-grid"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`
+		const banner = state.data.month_in_progress
+			? `<div class="ac-month-banner ea-late">&#9203; ${__("Month not finished - figures are up to {0}. Days after that are shown as Upcoming and earn nothing yet.", [frappe.datetime.str_to_user(state.data.today)])}</div>`
+			: "";
+		$body.find(".ac-grid-out").html(
+			`${banner}<table class="ea-table ac-grid"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`
 		);
 		render_bulk();
 		render_footer();
@@ -259,7 +281,8 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 							</div>
 						</div>
 						<div class="ac-emp-counts">
-							${__("Present")} <b>${s.present}</b>${s.wfh ? ` <span class="ea-dim">(${__("incl. {0} WFH", [s.wfh])})</span>` : ""}
+							<span title="${__("Worked days + weekly offs/holidays + half days at 0.5")}">${__("Present")} <b>${flt(s.payable_days, 1)}</b></span>
+							<span class="ea-dim">(${__("worked {0}", [s.worked_days || 0])} + ${__("off {0}", [s.off_days || 0])}${s.half_days_unpaid ? ` + ${__("half {0}", [flt(s.half_days_unpaid * 0.5, 1)])}` : ""}${s.wfh ? `, ${__("incl. {0} WFH", [s.wfh])}` : ""})</span>
 							&nbsp;&middot;&nbsp; ${__("Half day")} <b>${s.half_day}</b>
 							&nbsp;&middot;&nbsp; ${__("Leave")} <b>${s.on_leave}</b>
 							&nbsp;&middot;&nbsp; ${__("Absent")} <b>${s.absent}</b>
@@ -376,7 +399,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 			return `<div class="ac-netpay-bar ea-cut">${frappe.utils.escape_html(res.error)}</div>`;
 		}
 		const open = state.netopen.has(g.employee);
-		const rows = (list) => list.map((r) => `
+		const rows = (list) => (list || []).map((r) => `
 			<div class="ac-pay-row ${r.injected ? "ac-pay-injected" : ""}">
 				<span>${frappe.utils.escape_html(r.component)}</span>
 				<span>${format_currency(r.amount)}</span>
@@ -386,7 +409,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 			<div class="ac-netpay-bar" data-employee="${g.employee}">
 				<b>${__("Computed pay")}</b>
 				<span>${__("Net")} <b class="ac-net">${format_currency(res.net_pay)}</b></span>
-				<span class="ea-dim">${__("provisional")} &middot; ${flt(res.payment_days, 2)}/${flt(res.total_working_days, 2)} ${__("days")}</span>
+				<span class="ea-dim">${res.month_in_progress ? __("month-to-date, up to {0}", [frappe.datetime.str_to_user(res.through_date || "")]) : __("provisional")} &middot; ${flt(res.payment_days, 2)}/${flt(res.total_working_days, 2)} ${__("days")}</span>
 				<span class="ac-spacer"></span>
 				<span class="ac-pay-toggle">${__("breakdown")} ${open ? "&#9652;" : "&#9662;"}</span>
 			</div>
@@ -404,6 +427,12 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 						<div class="ac-pay-row ac-pay-total"><span>${__("Total")}</span><span>${format_currency(res.total_deduction)}</span></div>
 					</div>
 				</div>
+				${res.days ? `<div class="ea-dim ac-pay-note">${__("Days")}: ${__("period")} ${flt(res.days.period, 1)}
+					&minus; ${__("absent")} ${flt(res.days.absent, 1)} &minus; ${__("half-day shortfall")} ${flt(res.days.half_absent * res.days.half_fraction, 1)}
+					&minus; ${__("no record")} ${flt(res.days.missing, 1)} &minus; ${__("LWP")} ${flt(res.days.lwp, 1)}
+					${res.days.not_yet_earned ? `&minus; ${__("not yet earned")} ${flt(res.days.not_yet_earned, 1)}` : ""}
+					= <b>${flt(res.payment_days, 1)}</b></div>` : ""}
+				${res.already_submitted ? `<div class="ea-late ac-pay-note">${__("Overtime / Late Mark already submitted for this period - not added again.")}</div>` : ""}
 				<div class="ac-pay-net">
 					<div>
 						<div class="ac-zone-h">${__("NET")}</div>
@@ -465,6 +494,12 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 			? `<td class="ac-num ${flag.level === "red" ? "ea-cut" : flag.level === "amber" ? "ea-late" : "ea-dim"}" title="${frappe.utils.escape_html(flag.message)}">&#9679;</td>`
 			: '<td class="ac-num"></td>';
 		const dash = '<td class="ac-num ea-dim">&mdash;</td>';
+
+		if (!att && row.is_future && !row.is_holiday) {
+			return `<tr class="ac-day ea-off ac-future" data-date="${row.date}" data-employee="${g.employee}"><td></td>${flag_cell}
+				<td class="ea-dim ac-indent">${date_label}</td>
+				<td colspan="9" class="ea-dim">${__("Upcoming")}</td></tr>`;
+		}
 
 		if (!att) {
 			if (row.is_holiday) {
@@ -622,6 +657,8 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		}
 
 		const o = state.overrides.get(employee) || {};
+		// Same rule as the server: hours to 2dp, then amount half-up.
+		// Exact hours from the seconds; only the amount is rounded (as the server).
 		const hours = flt(ov(employee, "ot_hours_hhmm", g.entry.ot_hours_hhmm)) / 3600;
 		const rate = flt(ov(employee, "ot_rate", g.entry.ot_rate));
 
@@ -687,12 +724,12 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 						indicator: (res.failed || []).length ? "orange" : "green",
 						message:
 							(res.created || []).map((c) =>
-								`<div><a href="${c.route}" target="_blank">${c.name}</a> &mdash; ${frappe.datetime.str_to_user(c.from_date)} to ${frappe.datetime.str_to_user(c.to_date)} (${c.days})</div>`).join("") +
+								`<div><a href="${encodeURI(c.route)}" target="_blank">${frappe.utils.escape_html(c.name)}</a> &mdash; ${frappe.datetime.str_to_user(c.from_date)} to ${frappe.datetime.str_to_user(c.to_date)} (${c.days})</div>`).join("") +
 							(res.failed || []).map((f) =>
 								`<div class="text-muted">${f.from_date}: ${frappe.utils.escape_html(f.error)}</div>`).join(""),
 					});
 					state.leave.delete(emp);
-					do_load(period());
+					do_load(loaded_period());
 				},
 			})
 		);
@@ -722,7 +759,11 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		const emp = $(this).data("employee");
 		const g = state.data.groups.find((x) => x.employee === emp);
 		if (!g) return;
-		const range = period();
+		const range = loaded_period();
+		const token = state.data && state.data.loaded_at;
+		const $btn = $(this);
+		if ($btn.prop("disabled")) return;
+		$btn.prop("disabled", true).text(__("Computing..."));
 		frappe.call({
 			method: "rapl_payroll_automation.api.attendance_console.compute_net_pay",
 			args: {
@@ -735,12 +776,24 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 				late_mark: ov(emp, "late_amount", g.entry.late_amount) || 0,
 				advance: advance_total(g),
 			},
-			freeze: true,
-			freeze_message: __("Computing..."),
+			// No page freeze: one slow employee must not lock the whole
+			// console, and an error must release the button.
+			freeze: false,
 			callback(r) {
-				state.netpay.set(emp, r.message || {});
+				// The grid was reloaded (other month / filter) while this ran:
+				// the result belongs to a view that is gone.
+				if (!state.data || state.data.loaded_at !== token) return;
+				state.netpay.set(emp, r.message || { error: __("No result returned") });
 				state.netopen.add(emp);
 				render();
+			},
+			error() {
+				if (!state.data || state.data.loaded_at !== token) return;
+				state.netpay.set(emp, { error: __("Could not compute - see Error Log, or try again.") });
+				render();
+			},
+			always() {
+				$btn.prop("disabled", false);
 			},
 		});
 	});
@@ -774,6 +827,11 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		if ($(this).hasClass("ac-day-ot")) {
 			const v = String($(this).val() || "").trim();
 			// Blank resets this day to automatic; a value pins it.
+			if (v !== "" && seconds_from_hhmm(v) === null) {
+				frappe.show_alert({ message: __("Use H:MM, e.g. 2:30"), indicator: "orange" });
+				$(this).val("");
+				return;
+			}
 			entry.custom_overtime_hours = v === "" ? "" : seconds_from_hhmm(v) / 3600;
 		} else {
 			const v = $(this).val();
@@ -785,10 +843,13 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		render_footer();
 	});
 
+	// "H:MM" or whole hours only. Anything else is null -- the callers refuse
+	// it. ("abc" used to become 0, i.e. a hand-pinned zero; "2.30" became 2:18.)
 	function seconds_from_hhmm(v) {
-		const parts = String(v).split(":");
-		if (parts.length === 2) return (parseInt(parts[0], 10) || 0) * 3600 + (parseInt(parts[1], 10) || 0) * 60;
-		return Math.round((parseFloat(v) || 0) * 3600);
+		const t = String(v === undefined || v === null ? "" : v).trim();
+		const m = /^(\d{1,3})(?::([0-5]\d))?$/.exec(t);
+		if (!m) return null;
+		return parseInt(m[1], 10) * 3600 + (m[2] ? parseInt(m[2], 10) * 60 : 0);
 	}
 
 	$body.on("change", ".ac-in, .ac-out, .ac-status", function () {
@@ -890,11 +951,17 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 
 	$body.on("click", ".ac-recalc", function () {
 		const names = Array.from(state.selected);
+		// Recalculate stamps a new "modified"; a pending edit on the same row
+		// would then be rejected as "changed by someone else".
+		const clash = names.filter((n) => state.pending.has(n));
+		if (clash.length) {
+			return frappe.msgprint(__("Apply or discard the {0} unsaved row(s) in your selection first.", [clash.length]));
+		}
 		frappe.call({
 			method: "rapl_payroll_automation.api.attendance_console.recalculate",
 			args: { names: JSON.stringify(names) },
 			freeze: true,
-			callback(r) { report(r.message); do_load(period()); },
+			callback(r) { report(r.message); do_load(loaded_period()); },
 		});
 	});
 
@@ -954,7 +1021,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 						(res.failed || []).forEach((f) => frappe.msgprint({
 							title: __("Could not create"), indicator: "red", message: f.error,
 						}));
-						do_load(period());
+						do_load(loaded_period());
 					},
 				});
 			},
@@ -1015,12 +1082,12 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 						needs.map((f) => frappe.utils.escape_html(f.error)).join("<br><br>") +
 							"<br><br><b>" + __("Edit anyway?") + "</b>",
 						() => apply(1),
-						() => { report(res); do_load(period()); }
+						() => { report(res); do_load(loaded_period()); }
 					);
 					return;
 				}
 				report(res);
-				do_load(period());
+				do_load(loaded_period());
 			},
 		});
 	}
@@ -1042,16 +1109,27 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 	// ---------------------------------------------------------------- drafts
 
 	function make_draft(kind) {
+		if (state.data && state.data.month_in_progress && !state._draft_ok) {
+			return frappe.confirm(
+				__("This month is not finished. The draft will only include what has been recorded up to today. Continue?"),
+				() => { state._draft_ok = true; make_draft(kind); state._draft_ok = false; }
+			);
+		}
 		if (state.pending.size) {
 			return frappe.msgprint(
 				__("Apply your {0} unsaved change(s) first &mdash; the draft is built from what is saved.", [state.pending.size])
 			);
 		}
-		const range = period();
+		const range = loaded_period();
 
-		// Every employee currently on screen, not just the filter box. With no
-		// filter that is the whole loaded set, so one click covers everyone.
-		const loaded = (state.data ? state.data.groups : []).map((g) => g.employee);
+		// With an Employee filter: that employee. Without one: null, so the
+		// server takes the whole eligible workforce -- NOT just the rows on
+		// screen, which under the default "Needs attention" view would leave
+		// out everyone without a flag. Overridden employees are always added
+		// on top by the server.
+		// The employee the grid was LOADED for, not the live filter box.
+		const filtered = state.loaded_employee;
+		const loaded = filtered ? [filtered] : [];
 
 		// Manual overrides are keyed by employee; passing those employees
 		// explicitly is also what lets an OT figure entered by hand survive for
@@ -1078,7 +1156,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 					title: res.reused ? __("Draft refreshed") : __("Draft created"),
 					indicator: "blue",
 					message:
-						`<p><a href="${res.route}" target="_blank">${res.name}</a></p>` +
+						`<p><a href="${encodeURI(res.route)}" target="_blank">${frappe.utils.escape_html(res.name)}</a></p>` +
 						`<p class="text-muted">${__("Rows: {0} &rarr; {1}", [res.rows_before, res.rows_after])}` +
 						(res.filtered ? ` &middot; ${__("filtered")}` : "") +
 						(overridden.length ? ` &middot; ${__("{0} manual override(s) applied", [overridden.length])}` : "") +
@@ -1101,7 +1179,8 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 			__("Create {0} draft recovery record(s)?", [picked.length]),
 			() => frappe.call({
 				method: "rapl_payroll_automation.api.attendance_console.create_advance_drafts",
-				args: { advances: JSON.stringify(picked) },
+				// Dated on the period end so the recovery lands in THIS month's slip.
+				args: { advances: JSON.stringify(picked), payroll_date: loaded_period().end },
 				freeze: true,
 				callback(r) {
 					const res = r.message || {};
@@ -1111,11 +1190,11 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 						indicator: (res.failed || []).length ? "orange" : "green",
 						message:
 							(res.created || []).map((c) =>
-								`<div><a href="${c.route}" target="_blank">${c.name}</a> &mdash; ${c.advance} ${format_currency(c.amount)}</div>`).join("") +
+								`<div><a href="${encodeURI(c.route)}" target="_blank">${frappe.utils.escape_html(c.name)}</a> &mdash; ${frappe.utils.escape_html(c.advance)} ${format_currency(c.amount)}</div>`).join("") +
 							(res.failed || []).map((f) =>
 								`<div class="text-muted">${f.advance}: ${frappe.utils.escape_html(f.error)}</div>`).join(""),
 					});
-					do_load(period());
+					do_load(loaded_period());
 				},
 			})
 		);
@@ -1124,3 +1203,18 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 	$body.on("click", ".ac-draft-ot", () => make_draft("overtime"));
 	$body.on("click", ".ac-draft-lm", () => make_draft("late_mark"));
 };
+
+// Half-up to 2 decimals on the SHORTEST decimal form of the number -- the
+// same digits Python's repr() gives -- so it matches the server's
+// round_half_up (Decimal(repr(x))) exactly. The Number.EPSILON trick does not:
+// 7398 s / 3600 = 2.055 -> 2.05 with EPSILON, 2.06 on the server.
+function round2_half_up(x) {
+	x = Number(x) || 0;
+	const sign = x < 0 ? -1 : 1;
+	const str = String(Math.abs(x));
+	if (str.includes("e")) return Math.round(x * 100) / 100;
+	const [int_part, frac = ""] = str.split(".");
+	let cents = parseInt(int_part + (frac + "00").slice(0, 2), 10);
+	if ((frac[2] || "0") >= "5") cents += 1;
+	return (sign * cents) / 100;
+}

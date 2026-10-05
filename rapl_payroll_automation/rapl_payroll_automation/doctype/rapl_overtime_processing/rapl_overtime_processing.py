@@ -19,16 +19,23 @@ from frappe.model.naming import append_number_if_name_exists
 from rapl_payroll_automation.api.payroll_automation_utils import (
 	additional_salary_already_exists,
 	create_and_submit_additional_salary,
-	get_all_holiday_dates,
+	get_employee_holiday_dates,
 	get_automation_settings,
 	get_grade_ot_rule,
 	get_total_working_days,
-	get_weekly_off_dates,
+	get_employee_weekly_off_dates,
 )
 from rapl_payroll_automation.api.overtime_automation import get_attendance_for_employee
 from rapl_payroll_automation.api.ot_engine import compute_day_ot, resolve_shift
 from erpnext.setup.doctype.employee.employee import get_holiday_list_for_employee
-from frappe.utils import flt, getdate
+from frappe.utils import cint, flt, getdate
+
+from rapl_payroll_automation.api.processing_common import (
+	before_submit_processing_doc,
+	cancel_additional_salaries,
+	validate_processing_doc,
+)
+from rapl_payroll_automation.api.payroll_math import ot_amount, pay_rates, round_half_up
 
 
 class RAPLOvertimeProcessing(Document):
@@ -45,13 +52,22 @@ class RAPLOvertimeProcessing(Document):
 			frappe.throw(_("Set Start Date before saving (required to generate the name)."))
 		base_name = getdate(self.start_date).strftime("%B %Y") + " - Overtime"
 		self.name = append_number_if_name_exists("RAPL Overtime Processing", base_name, separator="-")
+	def validate(self):
+		validate_processing_doc(self)
+
+	def before_submit(self):
+		before_submit_processing_doc(self)
+
+	def on_cancel(self):
+		cancel_additional_salaries(self)
+
 	def on_submit(self):
 		settings = get_automation_settings()
 		errors = []
 		for row in self.entries:
 			if not row.amount or row.amount <= 0:
 				continue
-			if additional_salary_already_exists(row.employee, settings.overtime_salary_component, self.end_date):
+			if additional_salary_already_exists(row.employee, settings.overtime_salary_component, self.end_date, self.start_date):
 				errors.append(f"{row.employee}: already processed for this period, skipped")
 				continue
 			doc = create_and_submit_additional_salary(
@@ -78,6 +94,8 @@ def get_employee_ot_details(docname, employee):
 	had Employee set but nothing else auto-populated.
 	"""
 	doc = frappe.get_doc("RAPL Overtime Processing", docname)
+	# get_doc does not check permission; rates expose salary.
+	doc.check_permission("write")
 	settings = get_automation_settings()
 	errors = []
 	result = _compute_employee_overtime(employee, doc.start_date, doc.end_date, settings, errors)
@@ -107,6 +125,8 @@ def get_employees(docname, all_employees=False, employees=None):
 	     the actual OT-eligible workforce.
 	"""
 	doc = frappe.get_doc("RAPL Overtime Processing", docname)
+	# get_doc does not check permission; rates expose salary.
+	doc.check_permission("write")
 	settings = get_automation_settings()
 	start_date, end_date = doc.start_date, doc.end_date
 
@@ -146,7 +166,7 @@ def get_employees(docname, all_employees=False, employees=None):
 	for emp in employees:
 		if emp in existing_employees:
 			continue  # already in the table (manual or previous fetch) -- don't touch it
-		if additional_salary_already_exists(emp, settings.overtime_salary_component, end_date):
+		if additional_salary_already_exists(emp, settings.overtime_salary_component, end_date, start_date):
 			errors.append(f"{emp}: already processed for this period, excluded")
 			continue
 		result = _compute_employee_overtime(emp, start_date, end_date, settings, errors)
@@ -194,8 +214,9 @@ def _compute_employee_overtime(emp, start_date, end_date, settings, errors):
 	validate entirely. Computing from in_time/out_time on every run keeps
 	payroll correct against current punch data no matter how a record was
 	edited, which is how this doctype always behaved."""
-	grade = frappe.db.get_value("Employee", emp, "grade")
-	monthly_salary = frappe.db.get_value("Employee", emp, settings.ot_rate_base_fieldname)
+	grade, monthly_salary = frappe.db.get_value(
+		"Employee", emp, ["grade", settings.ot_rate_base_fieldname]
+	) or (None, None)
 
 	if not monthly_salary:
 		errors.append(f"{emp}: missing '{settings.ot_rate_base_fieldname}', added with 0 (edit manually)")
@@ -206,12 +227,17 @@ def _compute_employee_overtime(emp, start_date, end_date, settings, errors):
 		errors.append(f"{emp}: no OT rule configured for grade '{grade}', added with 0 (edit manually)")
 		return None
 
-	holiday_list = get_holiday_list_for_employee(emp)
-	all_holidays = get_all_holiday_dates(holiday_list, start_date, end_date)
-	sunday_dates = get_weekly_off_dates(holiday_list, start_date, end_date)
+	# Lists in force DURING the period (see payroll_automation_utils).
+	all_holidays = get_employee_holiday_dates(emp, start_date, end_date)
+	sunday_dates = get_employee_weekly_off_dates(emp, start_date, end_date)
 
 	base_working_days = get_total_working_days(start_date, end_date)
-	ot_working_days = base_working_days - len(sunday_dates) if rule else base_working_days
+	rates = pay_rates(
+		monthly_salary, base_working_days, len(sunday_dates),
+		bool(rule),
+		settings.ot_hours_divisor,
+	)
+	ot_working_days = rates["ot_days"]
 	if ot_working_days <= 0:
 		errors.append(f"{emp}: computed OT working days <= 0, added with 0 (edit manually)")
 		return None
@@ -222,8 +248,7 @@ def _compute_employee_overtime(emp, start_date, end_date, settings, errors):
 	# to 2 decimals for display/use (keeping the earlier fix's principle:
 	# whatever's shown in Rate/hr must be the exact value used in the
 	# Amount calculation, or the manual-vs-automatic mismatch bug returns).
-	per_day_amount = round(flt(monthly_salary) / ot_working_days)
-	hourly_rate = round(per_day_amount / flt(settings.ot_hours_divisor), 2)
+	hourly_rate = rates["hourly"]
 
 	# get_attendance_for_employee() already filters docstatus=1 AND
 	# status='Present', so every row here is a Present day.
@@ -235,27 +260,29 @@ def _compute_employee_overtime(emp, start_date, end_date, settings, errors):
 				out_time=day.out_time,
 				working_hours=day.working_hours,
 				attendance_date=day.attendance_date,
-				status="Present",
+				status="Present",  # pinned non-Present days are overridden above
 				shift=resolve_shift(day.shift, settings),
 				settings=settings,
 				holiday_dates=all_holidays,
 			)
-			total_ot_hours += max(ot_hours, 0)
+			if cint(day.get("custom_overtime_manual")):
+				# HR pinned this day in the Console -- pay the pinned figure.
+				ot_hours = flt(day.get("custom_overtime_hours"))
+			# Add EXACT hours; round once, below. Rounding each day first
+			# (2 dp) loses up to 18 seconds a day, and for a repeated duration
+			# always in the same direction: 26 days of 47 min paid 20.28 h
+			# instead of 20.37 h.
+			total_ot_hours += max(flt(ot_hours), 0)
 		except Exception as day_err:
 			errors.append(f"{emp} / {day.attendance_date}: {day_err} -- day skipped")
 
-	# REVERSED per updated instruction: total_ot_hours now rounds to 2
-	# decimals (previously deliberately left exact/unrounded). This is the
-	# actual value used in the Amount calculation below, not just a display
-	# rounding -- so it's a genuine, if small, precision change, not cosmetic.
-	# In practice this has negligible effect on the final Amount, since
-	# Amount is separately rounded to whole rupees at the very end anyway --
-	# that final rounding already absorbs far more precision loss than this
-	# 2-decimal-vs-exact difference on Hours ever could.
-	total_ot_hours = round(total_ot_hours, 2)
+	# Exact to the second. The Duration field (OT Hours HH:MM) holds these
+	# seconds, the Amount is priced from them with the exact hourly rate and
+	# rounded ONCE to whole rupees. ot_hours (2 dp) is for display only.
+	seconds = round_half_up(total_ot_hours * 3600)
 	return {
-		"ot_hours": total_ot_hours,
-		"ot_hours_seconds": round(total_ot_hours * 3600),  # for the Duration field (OT Hours HH:MM)
+		"ot_hours": round_half_up(seconds / 3600, 2),
+		"ot_hours_seconds": seconds,
 		"ot_rate": hourly_rate,
-		"ot_amount": round(total_ot_hours * hourly_rate),
+		"ot_amount": ot_amount(seconds, hourly_rate),
 	}

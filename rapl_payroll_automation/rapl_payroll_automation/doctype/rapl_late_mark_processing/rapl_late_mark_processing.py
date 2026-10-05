@@ -6,6 +6,12 @@ from frappe.model.document import Document
 from frappe.model.naming import append_number_if_name_exists
 from frappe.utils import cint, flt, getdate
 
+from rapl_payroll_automation.api.processing_common import (
+	before_submit_processing_doc,
+	cancel_additional_salaries,
+	validate_processing_doc,
+)
+from rapl_payroll_automation.api.payroll_math import RATE_DP, round_half_up
 from rapl_payroll_automation.api.payroll_automation_utils import (
 	additional_salary_already_exists,
 	create_and_submit_additional_salary,
@@ -33,13 +39,22 @@ class RAPLLateMarkProcessing(Document):
 		base_name = getdate(self.start_date).strftime("%B %Y") + " - Late Mark"
 		self.name = append_number_if_name_exists("RAPL Late Mark Processing", base_name, separator="-")
 
+	def validate(self):
+		validate_processing_doc(self)
+
+	def before_submit(self):
+		before_submit_processing_doc(self)
+
+	def on_cancel(self):
+		cancel_additional_salaries(self)
+
 	def on_submit(self):
 		settings = get_automation_settings()
 		errors = []
 		for row in self.entries:
 			if not row.amount or row.amount <= 0:
 				continue
-			if additional_salary_already_exists(row.employee, settings.late_mark_salary_component, self.end_date):
+			if additional_salary_already_exists(row.employee, settings.late_mark_salary_component, self.end_date, self.start_date):
 				errors.append(f"{row.employee}: already processed for this period, skipped")
 				continue
 			doc = create_and_submit_additional_salary(
@@ -56,13 +71,20 @@ class RAPLLateMarkProcessing(Document):
 
 
 @frappe.whitelist()
-def get_band_labels():
+def get_band_labels(with_fractions=0):
 	"""
 	Returns the configured band labels, in order, for the client script to
 	rename column 1..5's headers and hide any beyond the actual band count.
+
+	with_fractions=1 returns [{label, fraction}] instead, so the form gets the
+	fractions in the SAME call. It used to fetch them with a second, async
+	frappe.db.get_doc on Settings -- a count edited before that returned, or a
+	user who cannot read Settings, priced the row at 0.
 	"""
 	settings = get_automation_settings()
 	bands = sorted(settings.late_mark_bands, key=lambda r: time_to_seconds(r.from_time))
+	if cint(with_fractions):
+		return [{"label": b.label, "fraction": flt(b.fraction)} for b in bands]
 	return [b.label for b in bands]
 
 
@@ -79,6 +101,8 @@ def get_employees(docname, all_employees=False, employees=None):
 	     the only automatic criterion).
 	"""
 	doc = frappe.get_doc("RAPL Late Mark Processing", docname)
+	# get_doc does not check permission; rates expose salary.
+	doc.check_permission("write")
 	settings = get_automation_settings()
 	start_date, end_date = doc.start_date, doc.end_date
 
@@ -113,7 +137,7 @@ def get_employees(docname, all_employees=False, employees=None):
 	for emp in employees:
 		if emp in existing_employees:
 			continue  # already in the table (manual or previous fetch) -- don't touch it
-		if additional_salary_already_exists(emp, settings.late_mark_salary_component, end_date):
+		if additional_salary_already_exists(emp, settings.late_mark_salary_component, end_date, start_date):
 			errors.append(f"{emp}: already processed for this period, excluded")
 			continue
 
@@ -148,11 +172,12 @@ def _compute_employee_late_mark_details(employee, start_date, end_date, working_
 	custom_late_deduction_fraction field is no longer read here at all.
 	"""
 	settings = settings or get_automation_settings()
-	monthly_salary = frappe.db.get_value("Employee", employee, "custom_monthly_salary")
+	# Same base field the Console and Overtime use (Settings), not a literal.
+	monthly_salary = frappe.db.get_value("Employee", employee, settings.ot_rate_base_fieldname or "custom_monthly_salary")
 	if not monthly_salary:
 		return (
 			{"band_counts": [0] * MAX_BANDS, "per_day_rate": 0, "amount": 0},
-			f"{employee}: missing custom_monthly_salary, added with 0 (edit manually)",
+			f"{employee}: missing monthly salary, added with 0 (edit manually)",
 		)
 
 	# Round FIRST, then use the rounded rate consistently in the amount
@@ -164,28 +189,46 @@ def _compute_employee_late_mark_details(employee, start_date, end_date, working_
 	# Rounded to WHOLE RUPEES (0 decimals), not 2 -- per explicit design
 	# decision: per-day rate is a round-number reference point; only the
 	# final Amount carries paisa-level currency precision.
-	per_day_rate = round(flt(monthly_salary) / working_days)
+	if not working_days or working_days <= 0:
+		return (
+			{"band_counts": [0] * MAX_BANDS, "per_day_rate": 0, "amount": 0},
+			f"{employee}: period has no days, added with 0",
+		)
+	# Exact (RATE_DP decimals). Only the final amount is rounded, once.
+	per_day_rate = round_half_up(flt(monthly_salary) / working_days, RATE_DP)
+
+	# ONE grouped query for every band, instead of one COUNT per band.
+	#
+	# Status filter: a band sitting on an Absent / On Leave / Work From Home
+	# record would otherwise be counted, deducting a late mark for a day the
+	# employee was not at work. Half Day is deliberately still counted:
+	# arriving at 10:15 earns a band AND leaving before 17:00 makes it a Half
+	# Day, and both penalties legitimately apply to the same record.
+	labels = [b.label for b in bands[:MAX_BANDS]]
+	counts_by_label = {}
+	if labels:
+		status_clause = ""
+		if cint(settings.get("count_late_marks_only_when_present", 1)):
+			status_clause = "AND status IN ('Present', 'Half Day')"
+		rows = frappe.db.sql(
+			f"""
+			SELECT custom_late_mark_band, COUNT(*)
+			FROM `tabAttendance`
+			WHERE employee = %(employee)s
+				AND attendance_date BETWEEN %(start)s AND %(end)s
+				AND docstatus = 1
+				AND custom_late_mark_band IN %(labels)s
+				{status_clause}
+			GROUP BY custom_late_mark_band
+			""",
+			{"employee": employee, "start": start_date, "end": end_date, "labels": tuple(labels)},
+		)
+		counts_by_label = {label: cint(cnt) for label, cnt in rows}
 
 	band_counts = []
 	amount = 0.0
 	for band in bands[:MAX_BANDS]:
-		filters = {
-			"employee": employee,
-			"attendance_date": ["between", [start_date, end_date]],
-			"docstatus": 1,
-			"custom_late_mark_band": band.label,
-		}
-		# A band sitting on an Absent / On Leave / Work From Home record would
-		# otherwise be counted, deducting a late mark for a day the employee
-		# was not at work -- stacked on top of the absence itself. This filter
-		# used to be missing entirely (only docstatus and the band label were
-		# checked). Half Day is deliberately still counted: arriving at 10:15
-		# earns a band AND leaving before 17:00 makes it a Half Day, and both
-		# penalties legitimately apply to the same record.
-		if cint(settings.get("count_late_marks_only_when_present", 1)):
-			filters["status"] = ["in", ["Present", "Half Day"]]
-
-		count = frappe.db.count("Attendance", filters=filters)
+		count = counts_by_label.get(band.label, 0)
 		band_counts.append(count)
 		amount += count * flt(band.fraction) * per_day_rate
 
@@ -196,7 +239,7 @@ def _compute_employee_late_mark_details(employee, start_date, end_date, working_
 		{
 			"band_counts": band_counts,
 			"per_day_rate": per_day_rate,
-			"amount": round(amount),
+			"amount": round_half_up(amount),
 		},
 		None,
 	)
@@ -211,6 +254,8 @@ def get_employee_late_mark_details(docname, employee):
 	else auto-populated.
 	"""
 	doc = frappe.get_doc("RAPL Late Mark Processing", docname)
+	# get_doc does not check permission; rates expose salary.
+	doc.check_permission("write")
 	settings = get_automation_settings()
 	working_days = get_total_working_days(doc.start_date, doc.end_date)
 	bands = sorted(settings.late_mark_bands, key=lambda r: time_to_seconds(r.from_time))

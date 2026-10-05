@@ -52,10 +52,10 @@
 #     untested rollover semantics this raises so the caller can report it.
 
 import frappe
-from frappe.utils import flt, get_datetime
+from frappe.utils import flt, get_datetime, getdate
 
 from rapl_payroll_automation.api.payroll_automation_utils import (
-	get_all_holiday_dates,
+	get_employee_holiday_dates,
 	get_datetime_combine,
 )
 from erpnext.setup.doctype.employee.employee import get_holiday_list_for_employee
@@ -104,6 +104,11 @@ def compute_day_ot(
 	if not ot_eligible:
 		return 0.0
 
+	# Saved from the form / API / import, attendance_date is still a str at
+	# validate time; holiday_dates holds date objects, so the holiday test
+	# was always False and holiday OT came out as minutes past shift end.
+	attendance_date = getdate(attendance_date)
+
 	if not in_time or not out_time:
 		return 0.0
 
@@ -125,6 +130,10 @@ def compute_day_ot(
 			if working_hours
 			else (out_time - in_time).total_seconds() / 3600
 		)
+		# The raw in->out span includes the unpaid break (8.5h day, paid 8h).
+		# Deduct it here -- holiday OT only; regular-day OT is measured from
+		# shift end so the break never enters it. Default 0 = no change.
+		ot_hours -= flt(settings.get("unpaid_break_minutes")) / 60
 		return max(ot_hours, 0.0)
 
 	if shift.end_time is not None and shift.start_time is not None:
@@ -149,8 +158,7 @@ def compute_ot_for_attendance_doc(doc, settings):
 	accumulates custom_overtime_hours, so the field, the monthly statement and
 	what payroll actually pays cannot disagree.
 	"""
-	holiday_list = get_holiday_list_for_employee(doc.employee)
-	holiday_dates = get_all_holiday_dates(holiday_list, doc.attendance_date, doc.attendance_date)
+	holiday_dates = get_employee_holiday_dates(doc.employee, doc.attendance_date, doc.attendance_date)
 
 	shift = resolve_shift(doc.get("shift"), settings)
 

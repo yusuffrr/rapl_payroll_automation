@@ -168,3 +168,6 @@ select.ac-cell { padding-right: 2px; }
 .ac-leave-head { display: inline-flex; align-items: center; gap: 4px;
 	white-space: nowrap; font-size: 11px; }
 .ac-leave-pick { margin: 0; }
+
+.ac-month-banner { padding: 6px 10px; margin: 0 0 8px; border: 1px solid var(--border-color); border-radius: 6px; }
+.ac-future { opacity: .55; }

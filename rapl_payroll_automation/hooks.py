@@ -25,13 +25,13 @@ required_apps = ["erpnext", "hrms"]
 #     audit fields on the slip only.
 #   validate: runs AFTER Salary Slip's own calculate_net_pay() completes and
 #     overwrites PF/PT/ESI deduction amounts in plain Python.
-#     NOTE: this is currently INERT by design -- pf_salary_component /
-#     pt_salary_component / esi_salary_component are intentionally left blank
-#     in RAPL Payroll Automation Settings, so _set_deduction_amount() matches
-#     no row and returns False. PF/PT/ESI are computed by the Salary Component
-#     formulas instead. Do not populate those three Settings fields without
-#     first reviewing salary_slip_hooks.py -- switching this on changes live
-#     payroll figures.
+#     NOTE: this is LIVE whenever pf_salary_component / pt_salary_component /
+#     esi_salary_component are filled in RAPL Payroll Automation Settings --
+#     and the form marks all three required (defaults PF / Professional Tax /
+#     ESI), so any save of Settings fills them. A blank field makes that one
+#     component a no-op. Changing these fields changes live payroll figures;
+#     review salary_slip_hooks.py first. (An older comment here said the hook
+#     was inert; that stopped being true when the fields became required.)
 # Employee Advance + the four documents that move money against it: maintain
 #   the custom_outstanding_balance field (paid - claimed - returned).
 #   Migrated from frappe_attachment_plus; logic unchanged.

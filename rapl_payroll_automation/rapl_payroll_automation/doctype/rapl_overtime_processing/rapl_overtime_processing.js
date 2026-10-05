@@ -119,7 +119,8 @@ frappe.ui.form.on("RAPL Overtime Processing Entry", {
 		// read-only in the UI -- read_only only blocks user input, not
 		// frappe.model.set_value), then recalculate Amount as before.
 		const row = locals[cdt][cdn];
-		const decimal_hours = flt(flt(row.ot_hours_hhmm / 3600).toFixed(2));
+		// Half-up to 2dp, identical to the server (see round2_half_up).
+		const decimal_hours = round2_half_up(flt(row.ot_hours_hhmm) / 3600);
 		frappe.model.set_value(cdt, cdn, "ot_hours", decimal_hours);
 		recalculate_ot_amount(frm, cdt, cdn);
 	},
@@ -130,6 +131,23 @@ frappe.ui.form.on("RAPL Overtime Processing Entry", {
 
 function recalculate_ot_amount(frm, cdt, cdn) {
 	const row = locals[cdt][cdn];
-	row.amount = Math.round(flt(row.ot_hours) * flt(row.ot_rate));
+	// Priced from the exact OT time (Duration = seconds) and the exact rate,
+	// rounded once -- the same as the server. ot_hours (2 dp) is display only.
+	row.amount = Math.round(flt(row.ot_hours_hhmm) / 3600 * flt(row.ot_rate));
 	frm.refresh_field("entries");
+}
+
+// Half-up to 2 decimals on the SHORTEST decimal form of the number -- the
+// same digits Python's repr() gives -- so it matches the server's
+// round_half_up (Decimal(repr(x))) exactly. The Number.EPSILON trick does not:
+// 7398 s / 3600 = 2.055 -> 2.05 with EPSILON, 2.06 on the server.
+function round2_half_up(x) {
+	x = Number(x) || 0;
+	const sign = x < 0 ? -1 : 1;
+	const str = String(Math.abs(x));
+	if (str.includes("e")) return Math.round(x * 100) / 100;
+	const [int_part, frac = ""] = str.split(".");
+	let cents = parseInt(int_part + (frac + "00").slice(0, 2), 10);
+	if ((frac[2] || "0") >= "5") cents += 1;
+	return (sign * cents) / 100;
 }

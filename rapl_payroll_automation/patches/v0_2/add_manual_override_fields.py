@@ -99,4 +99,3 @@ def execute():
 		},
 		ignore_validate=True,
 	)
-	frappe.db.commit()

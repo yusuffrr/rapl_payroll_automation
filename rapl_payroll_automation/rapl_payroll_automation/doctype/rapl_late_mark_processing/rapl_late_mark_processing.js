@@ -89,10 +89,13 @@ function get_employees(frm, all_employees) {
 function setup_band_columns(frm) {
 	frappe.call({
 		method: "rapl_payroll_automation.rapl_payroll_automation.doctype.rapl_late_mark_processing.rapl_late_mark_processing.get_band_labels",
+		args: { with_fractions: 1 },
 		callback(r) {
-			const labels = r.message || [];
-			frm.__late_mark_band_labels = labels; // cached for recalculate_late_mark_amount's fraction lookup
-			fetch_band_fractions(frm, labels);
+			const bands = r.message || [];
+			const labels = bands.map((b) => b.label);
+			frm.__late_mark_band_labels = labels;
+			// Same call, same order as the server's band columns.
+			frm.__late_mark_band_fractions = bands.map((b) => flt(b.fraction));
 
 			const grid = frm.fields_dict["entries"].grid;
 			for (let i = 1; i <= MAX_BANDS; i++) {
@@ -106,18 +109,6 @@ function setup_band_columns(frm) {
 			}
 			frm.refresh_field("entries");
 		},
-	});
-}
-
-function fetch_band_fractions(frm, labels) {
-	// get_band_labels() only returns labels (cheap); fetch fractions
-	// separately via the Settings doctype directly for the recalculation
-	// trigger's own use.
-	frappe.db.get_doc("RAPL Payroll Automation Settings", "RAPL Payroll Automation Settings").then((settings) => {
-		const bands = (settings.late_mark_bands || []).sort(
-			(a, b) => time_str_to_seconds(a.from_time) - time_str_to_seconds(b.from_time)
-		);
-		frm.__late_mark_band_fractions = bands.map((b) => flt(b.fraction));
 	});
 }
 
@@ -174,7 +165,10 @@ frappe.ui.form.on("RAPL Late Mark Processing Entry", {
 
 function recalculate_late_mark_amount(frm, cdt, cdn) {
 	const row = locals[cdt][cdn];
-	const fractions = frm.__late_mark_band_fractions || [];
+	const fractions = frm.__late_mark_band_fractions;
+	// Fractions not loaded yet: leave the amount alone rather than price it
+	// at zero. The server value stands until they arrive.
+	if (!fractions) return;
 	let total_fraction = 0;
 	for (let i = 0; i < MAX_BANDS; i++) {
 		const count = flt(row[`band_${i + 1}_count`]);

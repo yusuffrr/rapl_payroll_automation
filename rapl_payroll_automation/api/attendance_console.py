@@ -28,7 +28,8 @@
 # than assuming success.
 
 import frappe
-from frappe.utils import cint, flt, get_datetime, getdate, now
+from frappe.rate_limiter import rate_limit
+from frappe.utils import add_days, cint, date_diff, flt, get_datetime, get_last_day, getdate, now
 
 from rapl_payroll_automation.api.attendance_automation import derive_attendance_fields
 from rapl_payroll_automation.api.attendance_data import (
@@ -37,10 +38,19 @@ from rapl_payroll_automation.api.attendance_data import (
 	summarise,
 )
 from rapl_payroll_automation.api.ot_engine import is_ot_eligible
+from rapl_payroll_automation.api.payroll_math import (
+	expected_payment_days,
+	month_cutoff,
+	ot_amount,
+	pay_rates,
+	round_half_up,
+)
 from rapl_payroll_automation.api.payroll_automation_utils import (
 	additional_salary_already_exists,
-	get_all_holiday_dates,
+	get_additional_salary_total,
 	get_automation_settings,
+	get_employee_holiday_dates,
+	get_employee_weekly_off_dates,
 	get_grade_ot_rule,
 	get_total_working_days,
 	get_weekly_off_dates,
@@ -61,8 +71,15 @@ OVERRIDE_FIELDS = {
 #: and throws on anything outside it, so "Site Visit" cannot be one.
 VISIT_TYPES = ("Site Visit", "Client Visit", "Vendor Visit")
 
+# What the Console may set by hand. "On Leave" is deliberately absent: leave is
+# created through a Leave Application (create_leave_applications), never by
+# rewriting the status, or the leave would not be booked against a balance.
+CONSOLE_STATUSES = ("Present", "Absent", "Half Day", "Work From Home")
+
 
 MAX_ROWS_PER_APPLY = 500
+MAX_PERIOD_DAYS = 62
+MAX_EMPLOYEES = 300
 
 
 def _json(value, default=None):
@@ -204,7 +221,8 @@ def _permitted_employees(employees=None, include_inactive=False):
 
 	SQL writes bypass User Permissions entirely, so an HR User restricted to
 	one Company would otherwise see and edit every company's attendance.
-	frappe.get_all applies the restriction; we then work only within that set.
+	frappe.get_list applies the restriction (frappe.get_all does NOT -- it is
+	get_list with ignore_permissions -- which is what this used before).
 
 	include_inactive: relieved employees still need their final period
 	corrected, so existing records stay reachable. Attendance.validate() calls
@@ -213,20 +231,46 @@ def _permitted_employees(employees=None, include_inactive=False):
 	"""
 	filters = {} if include_inactive else {"status": "Active"}
 	if employees:
-		filters["name"] = ["in", employees]
-	return frappe.get_all(
+		filters["name"] = ["in", list(employees)]
+	return frappe.get_list(
 		"Employee",
 		filters=filters,
 		fields=["name", "employee_name", "grade", "status",
 				"date_of_joining", "relieving_date", "company"],
 		order_by="name",
+		limit_page_length=0,
 	)
+
+
+def _permitted_names(employees):
+	"""Subset of `employees` the caller may act on (User Permissions applied)."""
+	employees = {e for e in employees if e}
+	if not employees:
+		return set()
+	return {e.name for e in _permitted_employees(sorted(employees), include_inactive=True)}
 
 
 def _period_bounds(start_date, end_date):
 	if not start_date or not end_date:
 		frappe.throw("Set a period first")
-	return getdate(start_date), getdate(end_date)
+	start, end = getdate(start_date), getdate(end_date)
+	if start > end:
+		frappe.throw("Start date is after end date.")
+	if date_diff(end, start) + 1 > MAX_PERIOD_DAYS:
+		frappe.throw(f"Choose a period of at most {MAX_PERIOD_DAYS} days.")
+	return start, end
+
+
+def _employee_list(employees):
+	employees = _json(employees)
+	if employees is None:
+		return None
+	if not isinstance(employees, list):
+		frappe.throw("employees must be a list")
+	employees = list(dict.fromkeys(str(e) for e in employees if e))
+	if len(employees) > MAX_EMPLOYEES:
+		frappe.throw(f"At most {MAX_EMPLOYEES} employees at a time.")
+	return employees
 
 
 # ---------------------------------------------------------------- read
@@ -239,8 +283,8 @@ def get_console_data(start_date=None, end_date=None, employees=None, only_flagge
 	_require_hr("read")
 	start_date, end_date = _period_bounds(start_date, end_date)
 
-	employees = _json(employees)
-	only_flagged = int(only_flagged or 0)
+	employees = _employee_list(employees)
+	only_flagged = cint(only_flagged)
 
 	settings = get_automation_settings()
 	bands = get_band_definitions(settings)
@@ -254,8 +298,11 @@ def get_console_data(start_date=None, end_date=None, employees=None, only_flagge
 		pluck="employee", distinct=True,
 	)
 	candidates = _permitted_employees(employees, include_inactive=True)
-	allowed = {e.name for e in _permitted_employees(employees)} | set(with_records)
+	allowed = {e.name for e in candidates if e.status == "Active"} | set(with_records)
 	candidates = [e for e in candidates if e.name in allowed]
+
+	# Bulk prefetch: these used to be 4-6 queries PER employee inside the loop.
+	pre = _prefetch([e.name for e in candidates], start_date, end_date, cutoff, settings)
 
 	groups = []
 	for emp in candidates:
@@ -275,17 +322,22 @@ def get_console_data(start_date=None, end_date=None, employees=None, only_flagge
 			"employee_status": emp.status,
 			"relieving_date": str(emp.relieving_date) if emp.relieving_date else None,
 			"can_create": emp.status == "Active",
-			"ot_eligible": is_ot_eligible(emp.name),
+			"ot_eligible": pre["ot_eligible"].get(emp.name, False),
 			"summary": summary,
-			"entry": _entry_preview(emp, start_date, end_date, summary, bands, settings),
-			"advances": get_recoverable_advances(emp.name, cutoff),
+			"entry": _entry_preview(emp, start_date, end_date, summary, bands, settings, pre),
+			"advances": pre["advances"].get(emp.name, []),
 			"leave": get_leave_context(emp.name, start_date, end_date, settings),
 			"rows": rows,
 		})
 
+	today = getdate()
 	return {
 		"start_date": str(start_date),
 		"end_date": str(end_date),
+		# A month that has not finished: the page says so, counts stop at today,
+		# and Compute Net Pay prices month-to-date instead of the whole month.
+		"today": str(today),
+		"month_in_progress": today <= end_date,
 		"bands": bands,
 		"advance_cutoff": str(cutoff),
 		"groups": groups,
@@ -293,59 +345,128 @@ def get_console_data(start_date=None, end_date=None, employees=None, only_flagge
 	}
 
 
-def _entry_preview(emp, start_date, end_date, summary, bands, settings):
+def _prefetch(names, start_date, end_date, cutoff, settings):
+	"""Everything get_console_data needs per employee, in a handful of queries."""
+	out = {"monthly": {}, "ot_eligible": {}, "processed": set(), "advances": {}}
+	if not names:
+		return out
+	base = settings.ot_rate_base_fieldname
+	for e in frappe.get_all(
+		"Employee", filters={"name": ["in", names]}, fields=["name", "custom_ot", base]
+	):
+		out["monthly"][e.name] = flt(e.get(base))
+		out["ot_eligible"][e.name] = bool(e.custom_ot)
+
+	components = [c for c in (settings.overtime_salary_component,
+							  settings.late_mark_salary_component) if c]
+	if components:
+		for a in frappe.get_all(
+			"Additional Salary",
+			filters={"employee": ["in", names], "salary_component": ["in", components],
+					 "docstatus": 1, "payroll_date": ["between", [start_date, end_date]]},
+			fields=["employee", "salary_component"],
+		):
+			out["processed"].add((a.employee, a.salary_component))
+
+	for r in frappe.get_all(
+		"Employee Advance",
+		filters={"docstatus": 1, "employee": ["in", names],
+				 "repay_unclaimed_amount_from_salary": 1,
+				 "posting_date": ["<=", getdate(cutoff)]},
+		fields=["name", "employee", "posting_date", "purpose", "paid_amount",
+				"claimed_amount", "return_amount", "status", "company", "currency"],
+		order_by="posting_date, name",
+	):
+		outstanding = flt(r.paid_amount) - flt(r.claimed_amount) - flt(r.return_amount)
+		if outstanding <= 0.005:
+			continue
+		out["advances"].setdefault(r.employee, []).append({
+			"name": r.name, "posting_date": str(r.posting_date), "purpose": r.purpose,
+			"outstanding": flt(outstanding, 2), "status": r.status,
+			"company": r.company, "currency": r.currency,
+		})
+	return out
+
+
+def _entry_preview(emp, start_date, end_date, summary, bands, settings, pre=None):
 	"""What the RAPL Overtime / Late Mark Processing Entry rows WOULD hold.
 
-	Rate derivation is copied in shape from rapl_overtime_processing so the
-	preview and the created draft cannot disagree: per-day amount rounded to
-	whole rupees FIRST, then the hourly rate from that.
+	Rates come from payroll_math.pay_rates(), the single derivation shared with
+	the processing documents and the statement. Two rates, not one:
+
+	  per_day_rate   LATE MARK per-day = monthly / ALL calendar days. This is
+	                 what RAPL Late Mark Processing divides by for every grade.
+	  ot_rate        OVERTIME per-hour, from the grade's own denominator.
+
+	This function used to feed the OT denominator (monthly / (days - Sundays)
+	for Floor grades) into the late-mark figures too, so the Console showed -- and
+	the net-pay preview deducted -- more late mark than the draft would pay.
 	"""
-	monthly = flt(frappe.db.get_value("Employee", emp.name, settings.ot_rate_base_fieldname))
+	if pre is not None:
+		monthly = pre["monthly"].get(emp.name, 0)
+	else:
+		monthly = flt(frappe.db.get_value("Employee", emp.name, settings.ot_rate_base_fieldname))
 	rule = get_grade_ot_rule(settings, emp.grade)
 
 	total_days = get_total_working_days(start_date, end_date)
+	sundays = 0
 	if rule:
-		holiday_list = get_holiday_list_for_employee(emp.name)
-		sundays = get_weekly_off_dates(holiday_list, start_date, end_date) or []
-		ot_days = total_days - len(sundays)
-	else:
-		ot_days = total_days
+		sundays = len(get_employee_weekly_off_dates(emp.name, start_date, end_date))
 
-	per_day = round(monthly / ot_days) if (monthly and ot_days > 0) else 0
-	hourly = round(per_day / flt(settings.ot_hours_divisor), 2) if per_day else 0
+	rates = pay_rates(monthly, total_days, sundays, bool(rule), settings.ot_hours_divisor)
+	# Processing adds an employee whose grade has no OT rule with 0 hours/rate
+	# and asks for a manual edit. Mirror that, or the Console promises an OT
+	# figure the draft will not contain.
+	ot_rule_missing = rule is None
+	hourly = 0 if ot_rule_missing else rates["hourly"]
 
-	ot_hours = flt(summary["overtime_hours"], 2)
+	exact_hours = flt(summary.get("overtime_hours_exact", summary["overtime_hours"]))
+	seconds = round_half_up(exact_hours * 3600)
+	ot_hours = round_half_up(seconds / 3600, 2)
 	band_counts = {b["label"]: summary["band_counts"].get(b["label"], 0) for b in bands}
 	late_fraction = sum(flt(b["fraction"]) * band_counts[b["label"]] for b in bands)
 
 	return {
-		"ot_working_days": ot_days,
-		"per_day_rate": per_day,
+		"ot_working_days": rates["ot_days"],
+		"per_day_rate": rates["late_per_day"],
+		"ot_per_day_rate": rates["ot_per_day"],
 		"ot_rate": hourly,
+		"ot_rule_missing": ot_rule_missing,
 		"ot_hours": ot_hours,
 		# Duration fields store SECONDS. rapl_overtime_processing_entry's
 		# ot_hours_hhmm is the editable one and ot_hours (Float) is derived
 		# from it, so the console must offer the same pair.
-		"ot_hours_hhmm": int(round(ot_hours * 3600)),
-		"ot_amount": round(ot_hours * hourly),
+		"ot_hours_hhmm": int(seconds),
+		"ot_amount": ot_amount(seconds, hourly),
 		"band_counts": band_counts,
-		"late_amount": round(late_fraction * per_day),
-		"ot_already_processed": additional_salary_already_exists(
-			emp.name, settings.overtime_salary_component, end_date
-		),
-		"late_already_processed": additional_salary_already_exists(
-			emp.name, settings.late_mark_salary_component, end_date
-		),
+		"late_amount": round_half_up(late_fraction * rates["late_per_day"]),
+		# Any submitted record dated inside the period, not only one dated
+		# exactly end_date -- a processing run for a shorter period dates its
+		# Additional Salary on that period's own end.
+		"ot_already_processed": _is_processed(
+			pre, emp.name, settings.overtime_salary_component, start_date, end_date),
+		"late_already_processed": _is_processed(
+			pre, emp.name, settings.late_mark_salary_component, start_date, end_date),
 	}
+
+
+def _is_processed(pre, employee, component, start_date, end_date):
+	if not component:
+		return False
+	if pre is not None:
+		return (employee, component) in pre["processed"]
+	return bool(frappe.db.exists("Additional Salary", {
+		"employee": employee, "salary_component": component, "docstatus": 1,
+		"payroll_date": ["between", [start_date, end_date]],
+	}))
 
 
 # ---------------------------------------------------------------- edit
 
 
 def _recompute(record, settings):
-	holiday_list = get_holiday_list_for_employee(record["employee"])
-	holiday_dates = set(
-		get_all_holiday_dates(holiday_list, record["attendance_date"], record["attendance_date"]) or []
+	holiday_dates = get_employee_holiday_dates(
+		record["employee"], record["attendance_date"], record["attendance_date"]
 	)
 	return derive_attendance_fields(
 		employee=record["employee"],
@@ -392,14 +513,35 @@ def apply_edits(changes, confirm_processed=0):
 			f"{MAX_ROWS_PER_APPLY} at a time."
 		)
 
+	if not isinstance(changes, list):
+		frappe.throw("changes must be a list")
 	settings = get_automation_settings()
 	applied, failed = [], []
-	confirmed = _json(confirm_processed, 0)
+	confirmed = cint(_json(confirm_processed, 0))
+
+	# Writes below go through SQL, which never checks User Permissions, so the
+	# caller's employee scope is enforced here, once for the whole batch.
+	owners = {
+		r.name: r.employee
+		for r in frappe.get_all(
+			"Attendance",
+			filters={"name": ["in", [c.get("name") for c in changes
+									 if isinstance(c, dict) and c.get("name")] or [""]]},
+			fields=["name", "employee"],
+		)
+	}
+	in_scope = _permitted_names(owners.values())
 
 	for change in changes:
+		if not isinstance(change, dict):
+			failed.append({"name": None, "error": "Malformed row"})
+			continue
 		name = change.get("name")
 		if not name:
 			failed.append({"name": None, "error": "No attendance record on that row"})
+			continue
+		if name in owners and owners[name] not in in_scope:
+			failed.append({"name": name, "error": "Not permitted for this employee"})
 			continue
 
 		current = frappe.db.get_value(
@@ -426,6 +568,28 @@ def apply_edits(changes, confirm_processed=0):
 		if current.docstatus == 2:
 			failed.append({"name": name, "error": "Record is cancelled"})
 			continue
+
+		# The JS dropdown limits the choice; the server must too -- this
+		# writes by SQL, so nothing else would stop "Foo" reaching the table.
+		new_status = change.get("status")
+		if new_status and new_status not in CONSOLE_STATUSES:
+			failed.append({"name": name, "error": f"Status '{new_status}' cannot be set here"})
+			continue
+		# A day backed by a real Leave Application is decided by that
+		# application. Overwriting it to Absent would deduct the day AND keep
+		# the leave consumed.
+		if new_status and new_status != current.status and current.leave_application:
+			failed.append({
+				"name": name,
+				"error": f"Backed by Leave Application {current.leave_application}. "
+						 "Cancel that application instead of changing the status.",
+			})
+			continue
+		if "custom_attendance_type" in change:
+			visit = change["custom_attendance_type"] or None
+			if visit and visit not in VISIT_TYPES:
+				failed.append({"name": name, "error": f"Unknown visit type '{visit}'"})
+				continue
 
 		# Already paid? additional_salary_already_exists() makes
 		# get_employees() SKIP an employee whose OT or Late Mark is already
@@ -454,6 +618,8 @@ def apply_edits(changes, confirm_processed=0):
 			# leave_type / leave_application / half_day_status correctly. SQL is
 			# only used where the ORM refuses -- submitted records, which have
 			# no allow_on_submit fields on Attendance.
+			savepoint = f"rapl_edit_{len(applied) + len(failed)}"
+			frappe.db.savepoint(savepoint)
 			try:
 				doc = frappe.get_doc("Attendance", name)
 				for field in EDITABLE_FIELDS:
@@ -462,6 +628,38 @@ def apply_edits(changes, confirm_processed=0):
 						if field in ("in_time", "out_time"):
 							value = _combine(doc.attendance_date, value)
 						setattr(doc, field, value)
+				# Same pins and overrides as the submitted path below --
+				# previously only punches and status were copied here, so a
+				# visit type / OT / band typed on a draft row was reported as
+				# applied and silently dropped, and a hand-chosen status was
+				# overwritten by the rules on this very save.
+				if new_status and new_status != current.status:
+					doc.custom_status_manual = 1
+				elif change.get("reset_status"):
+					doc.custom_status_manual = 0
+				if "custom_attendance_type" in change:
+					doc.custom_attendance_type = change["custom_attendance_type"] or None
+				for field, flag in OVERRIDE_FIELDS.items():
+					if field not in change:
+						continue
+					value = change[field]
+					if value in (None, ""):
+						doc.set(flag, 0)
+						doc.set(field, None)
+					elif value == "__none__":
+						doc.set(flag, 1)
+						doc.set(field, None)
+					else:
+						doc.set(flag, 1)
+						doc.set(field, flt(value) if field.endswith("_hours") else value)
+				if doc.in_time and doc.out_time and get_datetime(doc.out_time) <= get_datetime(doc.in_time):
+					raise frappe.ValidationError("Check-out is not after check-in")
+				if (doc.status == "Present" and not doc.in_time and not doc.out_time
+						and not doc.get("custom_attendance_type")):
+					raise frappe.ValidationError(
+						"Present with no check-in or check-out needs a visit type "
+						"(Site / Client / Vendor Visit)."
+					)
 				doc.working_hours = 0
 				doc.save()
 				applied.append({
@@ -471,6 +669,9 @@ def apply_edits(changes, confirm_processed=0):
 							   "working_hours": flt(doc.working_hours, 2)},
 				})
 			except Exception as e:
+				frappe.db.rollback(save_point=savepoint)
+				# Reported in `failed`; don't also pop the raw error dialog.
+				frappe.clear_messages()
 				failed.append({"name": name,
 							   "error": frappe.utils.strip_html(str(e))[:500]})
 			continue
@@ -486,18 +687,21 @@ def apply_edits(changes, confirm_processed=0):
 			record["custom_status_manual"] = 0
 
 		if "custom_attendance_type" in change:
-			value = change["custom_attendance_type"] or None
-			if value and value not in VISIT_TYPES:
-				failed.append({"name": name, "error": f"Unknown visit type '{value}'"})
-				continue
-			record["custom_attendance_type"] = value
+			record["custom_attendance_type"] = change["custom_attendance_type"] or None
 
-		for field in EDITABLE_FIELDS:
-			if field in change:
-				value = change[field] or None
-				if field in ("in_time", "out_time"):
-					value = _combine(current.attendance_date, value)
-				record[field] = value
+		# A bad time on one row must fail THAT row, not the whole batch:
+		# _combine() throws, and this used to sit outside any try.
+		try:
+			for field in EDITABLE_FIELDS:
+				if field in change:
+					value = change[field] or None
+					if field in ("in_time", "out_time"):
+						value = _combine(current.attendance_date, value)
+					record[field] = value
+		except Exception as e:
+			frappe.clear_messages()
+			failed.append({"name": name, "error": frappe.utils.strip_html(str(e))[:300]})
+			continue
 
 		if record["in_time"] and record["out_time"]:
 			if get_datetime(record["out_time"]) <= get_datetime(record["in_time"]):
@@ -571,6 +775,10 @@ def apply_edits(changes, confirm_processed=0):
 				update["leave_type"] = None
 		else:
 			update["status"] = record["status"]
+			# A Half Day that reached an early guard (no punches, holiday)
+			# still needs half_day_status, or it costs nothing on the slip.
+			if record["status"] == "Half Day" and derived.get("half_day_status") != current.half_day_status:
+				update["half_day_status"] = derived.get("half_day_status")
 
 		try:
 			frappe.db.set_value("Attendance", name, update, update_modified=False)
@@ -594,15 +802,17 @@ def apply_edits(changes, confirm_processed=0):
 
 def _processed_components(employee, attendance_date, settings):
 	"""Which components are already submitted for the month containing this date."""
-	from frappe.utils import get_last_day
+	from frappe.utils import get_first_day
 
-	period_end = get_last_day(attendance_date)
+	# Whole month, not just its last day: Processing dates Additional Salary on
+	# its own end_date, which is not always the month end.
+	month_start, month_end = get_first_day(attendance_date), get_last_day(attendance_date)
 	found = []
 	for label, component in (
 		("Overtime", settings.overtime_salary_component),
 		("Late Mark", settings.late_mark_salary_component),
 	):
-		if component and additional_salary_already_exists(employee, component, period_end):
+		if _is_processed(None, employee, component, month_start, month_end):
 			found.append(label)
 	return found
 
@@ -643,7 +853,9 @@ def recalculate(names):
 	corrected outside the app."""
 	_require_hr("write")
 	names = _json(names, [])
-	return apply_edits([{"name": n} for n in (names or [])])
+	if not isinstance(names, list):
+		frappe.throw("names must be a list")
+	return apply_edits([{"name": n} for n in names if n])
 
 
 # ---------------------------------------------------------------- create
@@ -662,9 +874,21 @@ def create_attendance(rows):
 	"""
 	_require_hr("create")
 	rows = _json(rows, [])
+	if not isinstance(rows, list):
+		frappe.throw("rows must be a list")
+	if len(rows) > MAX_ROWS_PER_APPLY:
+		frappe.throw(f"Create at most {MAX_ROWS_PER_APPLY} records at a time.")
+	in_scope = _permitted_names(r.get("employee") for r in rows if isinstance(r, dict))
 
 	created, failed = [], []
-	for index, row in enumerate(rows or []):
+	for index, row in enumerate(rows):
+		if not isinstance(row, dict) or row.get("employee") not in in_scope:
+			failed.append({
+				"employee": row.get("employee") if isinstance(row, dict) else None,
+				"attendance_date": str(row.get("attendance_date")) if isinstance(row, dict) else None,
+				"error": "Not permitted for this employee" if isinstance(row, dict) else "Malformed row",
+			})
+			continue
 		# A SAVEPOINT per row. Attendance.validate() can reject a row for six
 		# separate reasons (status, inactive employee, joining date, duplicate,
 		# overlapping shift, leave record), and rows are independent -- one bad
@@ -740,6 +964,41 @@ def _existing_draft(doctype, start_date, end_date):
 	)
 
 
+_OVERRIDE_KEYS = {"ot_hours_hhmm", "ot_rate", "amount", "late_amount", "per_day_rate"} | {
+	f"band_{i}_count" for i in range(1, 6)
+}
+
+
+def _clean_overrides(overrides):
+	"""Reject a malformed override payload up front.
+
+	It used to be used as-is: int("abc") raised an unhandled ValueError (a 500
+	with a traceback) AFTER the draft had already been inserted, and negative
+	or non-numeric amounts were accepted.
+	"""
+	if not overrides:
+		return {}
+	if not isinstance(overrides, dict):
+		frappe.throw("overrides must be an object keyed by employee")
+	clean = {}
+	for employee, values in overrides.items():
+		if not isinstance(values, dict):
+			frappe.throw(f"Overrides for {employee} are malformed")
+		row = {}
+		for key, value in values.items():
+			if key not in _OVERRIDE_KEYS or value in (None, ""):
+				continue
+			try:
+				number = float(value)
+			except (TypeError, ValueError):
+				frappe.throw(f"{employee}: '{key}' must be a number, got '{value}'")
+			if number < 0:
+				frappe.throw(f"{employee}: '{key}' cannot be negative")
+			row[key] = number
+		clean[str(employee)] = row
+	return clean
+
+
 def _apply_overrides(doc, kind, overrides, bands):
 	"""Write the Console's edited summary values onto the draft's entry rows.
 
@@ -759,19 +1018,20 @@ def _apply_overrides(doc, kind, overrides, bands):
 
 		if kind == "overtime":
 			if values.get("ot_hours_hhmm") is not None:
-				row.ot_hours_hhmm = int(values["ot_hours_hhmm"])
-				row.ot_hours = flt(row.ot_hours_hhmm / 3600.0, 2)
+				row.ot_hours_hhmm = int(round_half_up(values["ot_hours_hhmm"]))
+				row.ot_hours = round_half_up(row.ot_hours_hhmm / 3600.0, 2)  # display
 			if values.get("ot_rate") is not None:
 				row.ot_rate = flt(values["ot_rate"])
 			row.amount = (
 				flt(values["amount"]) if values.get("amount") is not None
-				else round(flt(row.ot_hours) * flt(row.ot_rate))
+				# Priced from the exact seconds, not the 2-dp display hours.
+				else ot_amount(row.ot_hours_hhmm, row.ot_rate)
 			)
 		else:
 			for index, band in enumerate(bands, start=1):
 				key = f"band_{index}_count"
 				if key in values:
-					setattr(row, key, int(values[key] or 0))
+					setattr(row, key, int(round_half_up(values[key] or 0)))
 			if values.get("per_day_rate") is not None:
 				row.per_day_rate = flt(values["per_day_rate"])
 			# The Console keys the late-mark total as "late_amount", not
@@ -789,7 +1049,7 @@ def _apply_overrides(doc, kind, overrides, bands):
 					flt(b["fraction"]) * int(getattr(row, f"band_{i}_count", 0) or 0)
 					for i, b in enumerate(bands, start=1)
 				)
-				row.amount = round(fraction * flt(row.per_day_rate))
+				row.amount = round_half_up(fraction * flt(row.per_day_rate))
 		touched.append(employee)
 
 	if touched:
@@ -822,18 +1082,38 @@ def create_processing_draft(
 	}.get(kind)
 	if not doctype:
 		frappe.throw("Unknown processing type")
+	# This endpoint inserts and saves documents; say so up front rather than
+	# failing half-way through at the ORM's own check.
+	if not frappe.has_permission(doctype, "create") or not frappe.has_permission(doctype, "write"):
+		frappe.throw(f"You need create and write permission on {doctype}.", frappe.PermissionError)
 
-	employees = _json(employees)
-	overrides = _json(overrides, {})
-	overrides = overrides or {}
+	employees = _employee_list(employees)
+	overrides = _clean_overrides(_json(overrides, {}))
+	# Decided from what the caller ASKED for, before any filtering: a list
+	# that filters down to nothing must never become "the whole workforce".
+	whole_workforce = not employees
+	if employees:
+		scope = _permitted_names(employees)
+		employees = [e for e in employees if e in scope]
+		if not employees:
+			frappe.throw("None of the selected employees are available to you.", frappe.PermissionError)
+	if overrides:
+		scope = _permitted_names(overrides.keys())
+		overrides = {k: v for k, v in overrides.items() if k in scope}
 
 	# An employee with Employee.custom_ot = 0 is skipped by get_employees()'s
 	# default mode, so a manually entered OT figure for them would be dropped.
 	# Naming them explicitly switches get_employees() to its first mode --
 	# "exactly those employees", which bypasses the custom_ot filter by design
 	# -- so a manual override always survives.
-	if overrides:
-		employees = sorted(set(employees or []) | set(overrides.keys()))
+	#
+	# With NO employee list the draft covers the normal eligible workforce
+	# (get_employees' default mode) AND the overridden employees on top --
+	# merging them into one explicit list used to shrink a whole-month draft
+	# down to just the employees someone had typed an override for.
+	extra = sorted(set(overrides.keys())) if overrides else []
+	if overrides and not whole_workforce:
+		employees = sorted(set(employees) | set(extra))
 
 	name = _existing_draft(doctype, start_date, end_date)
 	if name:
@@ -858,20 +1138,39 @@ def create_processing_draft(
 		f"{frappe.scrub(doctype)}.{frappe.scrub(doctype)}"
 	)
 	get_employees = frappe.get_attr(f"{module}.get_employees")
-	result = get_employees(doc.name, all_employees=False, employees=employees or None)
+	already_there = {row.employee for row in doc.entries}
+	if whole_workforce:
+		result = get_employees(doc.name, all_employees=False, employees=None)
+		if extra:
+			# Appends only employees not already in the table.
+			get_employees(doc.name, all_employees=False, employees=extra)
+	else:
+		result = get_employees(doc.name, all_employees=False, employees=employees)
 
 	doc.reload()
+	if whole_workforce:
+		# get_employees' default mode lists the workforce with frappe.get_all,
+		# which ignores User Permissions. Drop the rows THIS call added for
+		# employees outside the caller's scope. Rows that were already in a
+		# shared draft are left alone -- they are someone else's work.
+		added = {row.employee for row in doc.entries} - already_there
+		out_of_scope = added - _permitted_names(added)
+		if out_of_scope:
+			doc.entries = [r for r in doc.entries if r.employee not in out_of_scope]
+			doc.save()
+			doc.reload()
 	overridden = _apply_overrides(doc, kind, overrides, get_band_definitions(get_automation_settings()))
 	doc.reload()
 
 	return {
+		"month_in_progress": getdate() <= end_date,
 		"overridden": overridden,
 		"doctype": doctype,
 		"name": doc.name,
 		"reused": reused,
 		"rows_before": rows_before,
 		"rows_after": len(doc.entries),
-		"filtered": bool(employees),
+		"filtered": not whole_workforce,
 		"result": result,
 		"route": f"/app/{frappe.scrub(doctype).replace('_', '-')}/{doc.name}",
 	}
@@ -896,8 +1195,21 @@ def create_advance_drafts(advances, payroll_date=None):
 	"""
 	_require_hr("create")
 	advances = _json(advances, [])
+	if not isinstance(advances, list):
+		frappe.throw("advances must be a list")
+	advances = list(dict.fromkeys(str(a) for a in advances if a))
 	if not advances:
 		return {"created": [], "failed": []}
+	if len(advances) > MAX_ROWS_PER_APPLY:
+		frappe.throw(f"At most {MAX_ROWS_PER_APPLY} advances at a time.")
+	# REQUIRED. It used to default to the advance's own posting date -- often
+	# months earlier -- and HRMS only picks up Additional Salary dated inside
+	# the slip's period, so the recovery was never deducted.
+	if not payroll_date:
+		frappe.throw("Payroll date is required: the recovery is deducted in the month it is dated.")
+	payroll_date = getdate(payroll_date)
+	if not frappe.has_permission("Additional Salary", "create"):
+		frappe.throw("You need create permission on Additional Salary.", frappe.PermissionError)
 
 	settings = get_automation_settings()
 	component = settings.get("advance_salary_component")
@@ -912,6 +1224,10 @@ def create_advance_drafts(advances, payroll_date=None):
 		frappe.db.savepoint(savepoint)
 		try:
 			adv = frappe.get_doc("Employee Advance", advance_name)
+			if adv.employee not in _permitted_names([adv.employee]):
+				raise frappe.PermissionError(f"{advance_name}: not permitted for {adv.employee}")
+			if adv.docstatus != 1:
+				raise frappe.ValidationError(f"{advance_name} is not submitted")
 			if not cint(adv.repay_unclaimed_amount_from_salary):
 				raise frappe.ValidationError(
 					f"{advance_name} is not marked 'Repay Unclaimed Amount from Salary'"
@@ -939,7 +1255,7 @@ def create_advance_drafts(advances, payroll_date=None):
 			# MUST be 0. The field defaults to 1, which would REPLACE the
 			# structure amount for this component instead of adding to it.
 			ads.overwrite_salary_structure_amount = 0
-			ads.payroll_date = getdate(payroll_date) if payroll_date else getdate(adv.posting_date)
+			ads.payroll_date = payroll_date
 			ads.ref_doctype = "Employee Advance"
 			ads.ref_docname = advance_name
 			ads.insert()
@@ -959,6 +1275,7 @@ def create_advance_drafts(advances, payroll_date=None):
 
 
 @frappe.whitelist()
+@rate_limit(limit=60, seconds=60)
 def compute_net_pay(employee, start_date=None, end_date=None, overtime=0,
 					late_mark=0, advance=0):
 	"""Net pay from the LIVE Salary Structure, with the Console's pending
@@ -969,89 +1286,270 @@ def compute_net_pay(employee, start_date=None, end_date=None, overtime=0,
 	salary_slip.get_additional_salaries() filters docstatus == 1, so a preview
 	slip cannot see the Overtime / Late Mark / Advance the Console is about to
 	create -- they are still drafts. Writing our own pay engine to work around
-	that would mean a second implementation of every structure formula, payment
-	day rule and tax slab, drifting from HRMS on every upgrade. That is exactly
-	the failure this app spent a month unwinding on overtime.
+	that would mean a second implementation of every structure formula and tax
+	slab, drifting from HRMS on every upgrade. Instead the rows are appended to
+	earnings/deductions BEFORE calculate_net_pay() runs (verified in
+	salary_slip.py: it does not clear those tables and update_component_row()
+	updates a matching row rather than duplicating it).
 
-	Instead the rows are appended to earnings/deductions BEFORE
-	calculate_net_pay() runs. Verified in salary_slip.py: calculate_net_pay()
-	does NOT clear those tables, and update_component_row() updates a matching
-	row rather than duplicating it. Because the injected earnings are present
-	before set_gross_pay_and_base_gross_pay(), gross_pay includes the overtime
-	and every formula that references gross_pay computes on the correct base.
+	A component that is ALREADY submitted for the month is NOT injected again:
+	the slip picks submitted Additional Salary up on its own, so injecting would
+	count it twice.
+
+	WHICH DAYS ARE PAID
+	-------------------
+	Payment days are rebuilt here from attendance (payroll_math.
+	expected_payment_days) instead of trusting HRMS's figure, because HRMS's
+	treatment of a day nobody marked depends on Payroll Settings ('Consider
+	Unmarked Attendance As') and its treatment of Absent depends on
+	'Payroll Based On'. HR wants absent days, unpaid half days AND days with no
+	attendance record all to cost money. The HRMS figure is returned alongside
+	(native_payment_days) so a difference is visible, not silent.
+
+	A month that has not finished is priced MONTH-TO-DATE: only days up to
+	today (or yesterday, if today has no attendance yet) are earned. Salary
+	still divides by the full month's days, so five elapsed days is five
+	thirty-firsts of pay, not a full month.
 
 	The whole call runs inside a savepoint that is ALWAYS rolled back: this is
 	a preview, and it must be provably incapable of writing even if some path
 	inside HRMS does.
 	"""
 	_require_hr("read")
+	if not _permitted_employees([employee], include_inactive=True):
+		frappe.throw(f"Employee {employee} is not available to you.", frappe.PermissionError)
+
 	start_date, end_date = _period_bounds(start_date, end_date)
+
+	# A Monthly slip always snaps to one calendar month, so a period that is
+	# not exactly one month would be priced for a different range than the
+	# overtime and late-mark figures being injected.
+	if start_date.day != 1 or end_date != get_last_day(start_date):
+		return {"error": "Net pay is previewed one whole calendar month at a time."}
+
+	today = getdate()
+	if start_date > today:
+		return {"error": "That month has not started yet, so there is nothing to compute."}
+
 	settings = get_automation_settings()
 
 	savepoint = "rapl_net_pay_preview"
 	frappe.db.savepoint(savepoint)
 	try:
-		slip = frappe.new_doc("Salary Slip")
-		slip.employee = employee
-		slip.start_date = start_date
-		slip.end_date = end_date
-		slip.payroll_frequency = "Monthly"
-		slip.get_emp_and_working_day_details()
-
-		pending = [
-			("earnings", settings.get("overtime_salary_component"), flt(overtime)),
-			("deductions", settings.get("late_mark_salary_component"), flt(late_mark)),
-			("deductions", settings.get("advance_salary_component"), flt(advance)),
-		]
-		injected = []
-		for table, component, amount in pending:
-			if not component or not amount:
-				continue
-			slip.append(table, {
-				"salary_component": component,
-				"abbr": frappe.db.get_value("Salary Component", component,
-											"salary_component_abbr") or component[:3],
-				"amount": amount,
-				"default_amount": amount,
-				"additional_amount": amount,
-				"is_additional_component": 1,
-				# Not prorated by payment days: an overtime or recovery figure
-				# is an absolute amount, not a monthly rate.
-				"depends_on_payment_days": 0,
-			})
-			injected.append({"table": table, "component": component, "amount": amount})
-
-		slip.calculate_net_pay()
-
-		result = {
-			"employee": employee,
-			"payment_days": flt(slip.payment_days, 2),
-			"total_working_days": flt(slip.total_working_days, 2),
-			"gross_pay": flt(slip.gross_pay, 2),
-			"total_deduction": flt(slip.total_deduction, 2),
-			"net_pay": flt(slip.net_pay, 2),
-			"earnings": [
-				{"component": r.salary_component, "amount": flt(r.amount, 2),
-				 "injected": any(i["component"] == r.salary_component and i["table"] == "earnings"
-								 for i in injected)}
-				for r in slip.earnings if flt(r.amount)
-			],
-			"deductions": [
-				{"component": r.salary_component, "amount": flt(r.amount, 2),
-				 "injected": any(i["component"] == r.salary_component and i["table"] == "deductions"
-								 for i in injected)}
-				for r in slip.deductions if flt(r.amount)
-			],
-			"injected": injected,
-		}
+		result = _build_net_pay_preview(
+			employee, start_date, end_date, today, settings,
+			flt(overtime), flt(late_mark), flt(advance),
+		)
 	except Exception as e:
-		frappe.db.rollback(save_point=savepoint)
-		frappe.log_error(frappe.get_traceback(), "RAPL: net pay preview failed")
-		return {"error": frappe.utils.strip_html(str(e))[:500]}
-
-	# ALWAYS roll back -- nothing here is ever meant to persist.
-	frappe.db.rollback(save_point=savepoint)
+		# Do NOT log_error here: it inserts an Error Log row INSIDE the
+		# savepoint, and the rollback below would erase it -- the user is told
+		# to "see Error Log" and finds nothing. Keep the traceback, log after.
+		failure = (frappe.get_traceback(), str(e))
+		result = {"error": frappe.utils.strip_html(failure[1])[:500]}
+	else:
+		failure = None
+	finally:
+		# ALWAYS roll back -- nothing here is ever meant to persist.
+		try:
+			frappe.db.rollback(save_point=savepoint)
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), "RAPL: net pay preview rollback failed")
+	if failure:
+		frappe.log_error(failure[0], f"RAPL: net pay preview failed for {employee}")
 	return result
+
+
+def _build_net_pay_preview(employee, start_date, end_date, today, settings,
+						   overtime, late_mark, advance):
+	slip = frappe.new_doc("Salary Slip")
+	slip.employee = employee
+	slip.start_date = start_date
+	slip.end_date = end_date
+	slip.payroll_frequency = "Monthly"
+	slip.get_emp_and_working_day_details()
+
+	if not slip.get("salary_structure"):
+		# HRMS only msgprints here and carries on with an empty slip, which
+		# would come back as a calm-looking zero.
+		return {"error": f"{employee} has no active Salary Structure Assignment for this month."}
+
+	ps = frappe.get_cached_value(
+		"Payroll Settings", None,
+		["include_holidays_in_total_working_days", "daily_wages_fraction_for_half_day",
+		 "consider_marked_attendance_on_holidays", "disable_rounded_total"],
+		as_dict=1,
+	) or {}
+	include_holidays = cint(ps.get("include_holidays_in_total_working_days"))
+	half_fraction = flt(ps.get("daily_wages_fraction_for_half_day")) or 0.5
+	count_on_holidays = include_holidays and cint(ps.get("consider_marked_attendance_on_holidays"))
+
+	first, last = getdate(slip.actual_start_date), getdate(slip.actual_end_date)
+	holidays = {getdate(d) for d in (slip.get_holidays_for_employee(first, last) or [])}
+
+	marked = frappe.get_all(
+		"Attendance",
+		filters={"employee": employee, "docstatus": 1,
+				 "attendance_date": ["between", [first, last]]},
+		fields=["attendance_date", "status", "half_day_status"],
+	)
+	marked_dates = {getdate(a.attendance_date) for a in marked}
+
+	cutoff, in_progress = month_cutoff(
+		start_date, end_date, today,
+		today_has_attendance=(today in marked_dates) or (today in holidays),
+	)
+	if cutoff is None or cutoff < first:
+		return {"error": "No completed working day in this month yet, so nothing has been earned."}
+
+	def counts_as_payable(day):
+		return bool(include_holidays) or day not in holidays
+
+	base_days = sum(
+		1 for i in range(date_diff(last, first) + 1)
+		if counts_as_payable(getdate(add_days(first, i)))
+	)
+	future_days = sum(
+		1 for i in range(date_diff(last, cutoff))
+		if counts_as_payable(getdate(add_days(cutoff, i + 1)))
+	)
+
+	# Never count past the employee's last day of service (relieving date).
+	upto = min(cutoff, last)
+
+	def deductible(day):
+		return day <= upto and (day not in holidays or count_on_holidays)
+
+	absent = sum(1 for a in marked
+				 if a.status == "Absent" and deductible(getdate(a.attendance_date)))
+	half_absent = sum(1 for a in marked
+					  if a.status == "Half Day" and (a.half_day_status or "Absent") == "Absent"
+					  and deductible(getdate(a.attendance_date)))
+	missing = sum(
+		1 for i in range(date_diff(upto, first) + 1)
+		if getdate(add_days(first, i)) not in holidays
+		and getdate(add_days(first, i)) not in marked_dates
+	)
+
+	# HRMS's leave_without_pay covers the WHOLE month, including approved LWP
+	# dated after the cut-off -- but every day after the cut-off is already
+	# removed as future_days. Take the future part out so it is not subtracted
+	# twice in a month that is still running.
+	lwp = max(flt(slip.leave_without_pay) - _lwp_days_after(employee, upto, last), 0)
+
+	native_payment_days = flt(slip.payment_days)
+	slip.payment_days = expected_payment_days(
+		base_days, lwp, absent, half_absent, half_fraction,
+		missing, future_days,
+	)
+	slip.absent_days = absent + half_absent * half_fraction + missing
+
+	# Inject what the Console is about to create -- unless it is already there.
+	pending = [
+		("earnings", "overtime", settings.get("overtime_salary_component"), overtime),
+		("deductions", "late_mark", settings.get("late_mark_salary_component"), late_mark),
+		("deductions", "advance", settings.get("advance_salary_component"), advance),
+	]
+	injected, already_submitted = [], []
+	for table, key, component, amount in pending:
+		if not component or not amount:
+			continue
+		if get_additional_salary_total(employee, component, start_date, end_date) > 0:
+			already_submitted.append({"component": component, "kind": key})
+			continue
+		slip.append(table, {
+			"salary_component": component,
+			"abbr": frappe.db.get_value("Salary Component", component,
+										"salary_component_abbr") or component[:3],
+			"amount": amount,
+			"default_amount": amount,
+			"additional_amount": amount,
+			"is_additional_component": 1,
+			# Not prorated by payment days: an overtime or recovery figure is an
+			# absolute amount, not a monthly rate.
+			"depends_on_payment_days": 0,
+		})
+		injected.append({"table": table, "component": component, "amount": amount, "kind": key})
+
+	# skip_tax_breakup_computation: the year-to-date / tax-breakup figures are
+	# display-only on the real slip and are the slowest part of the calculation.
+	slip.calculate_net_pay(skip_tax_breakup_computation=True)
+
+	# The real Salary Slip re-derives PF / PT / ESI in a validate hook after
+	# calculate_net_pay(). Without running the same hook here the preview and
+	# the slip HR actually saves disagree on those three lines.
+	statutory_applied = False
+	try:
+		from rapl_payroll_automation.api.salary_slip_hooks import (
+			correct_statutory_deductions,
+			set_precomputed_fields,
+		)
+		set_precomputed_fields(slip, "before_validate")
+		injected_ot = sum(i["amount"] for i in injected if i["kind"] == "overtime")
+		if injected_ot:
+			slip.custom_overtime_for_pt = flt(slip.get("custom_overtime_for_pt")) + injected_ot
+		correct_statutory_deductions(slip, "validate")
+		statutory_applied = True
+	except Exception:
+		# Not logged inside the savepoint (it would be rolled back); the
+		# preview simply reports statutory_applied = False.
+		pass
+
+	def listing(rows, table):
+		return [
+			{"component": r.salary_component, "amount": flt(r.amount, 2),
+			 "injected": any(i["component"] == r.salary_component and i["table"] == table
+							 for i in injected)}
+			for r in rows if flt(r.amount)
+		]
+
+	return {
+		"employee": employee,
+		"month_in_progress": in_progress,
+		"through_date": str(cutoff),
+		"payment_days": flt(slip.payment_days, 2),
+		"native_payment_days": flt(native_payment_days, 2),
+		"total_working_days": flt(slip.total_working_days, 2),
+		"days": {
+			"period": base_days, "absent": absent, "half_absent": half_absent,
+			"half_fraction": half_fraction, "missing": missing,
+			"lwp": flt(lwp, 2), "not_yet_earned": future_days,
+		},
+		"gross_pay": flt(slip.gross_pay, 2),
+		"total_deduction": flt(slip.total_deduction, 2),
+		"net_pay": flt(slip.net_pay, 2),
+		"rounded_total": flt(slip.rounded_total, 2),
+		"rounding_disabled": bool(cint(ps.get("disable_rounded_total"))),
+		"earnings": listing(slip.earnings, "earnings"),
+		"deductions": listing(slip.deductions, "deductions"),
+		"injected": injected,
+		"already_submitted": already_submitted,
+		"statutory_applied": statutory_applied,
+	}
+
+
+def _lwp_days_after(employee, after, last):
+	"""Approved leave-without-pay days strictly after `after`, up to `last`."""
+	if after >= last:
+		return 0.0
+	lwp_types = frappe.get_all("Leave Type", filters={"is_lwp": 1}, pluck="name")
+	if not lwp_types:
+		return 0.0
+	total = 0.0
+	for la in frappe.get_all(
+		"Leave Application",
+		filters={"employee": employee, "leave_type": ["in", lwp_types], "docstatus": 1,
+				 "status": "Approved", "to_date": [">", after], "from_date": ["<=", last]},
+		fields=["from_date", "to_date", "half_day", "half_day_date"],
+	):
+		start = max(getdate(la.from_date), getdate(add_days(after, 1)))
+		end = min(getdate(la.to_date), getdate(last))
+		for i in range(date_diff(end, start) + 1):
+			day = getdate(add_days(start, i))
+			if cint(la.half_day) and la.half_day_date and getdate(la.half_day_date) == day:
+				total += 0.5
+			else:
+				total += 1
+	return total
 
 
 def _contiguous_blocks(dates):
@@ -1087,10 +1585,37 @@ def create_leave_applications(employee, dates):
 
 	Contiguous dates are grouped into one application per run.
 	"""
-	_require_hr("create")
+	_require_hr("read")
+	# Approved leave turns an unpaid Absent into a paid day, so this needs the
+	# caller's own Leave Application rights -- not just Attendance create --
+	# and goes through the normal permission layer (no ignore_permissions).
+	for ptype in ("create", "submit"):
+		if not frappe.has_permission("Leave Application", ptype):
+			frappe.throw(f"You need {ptype} permission on Leave Application.", frappe.PermissionError)
+	if employee not in _permitted_names([employee]):
+		frappe.throw(f"Employee {employee} is not available to you.", frappe.PermissionError)
+
 	dates = _json(dates, [])
+	if not isinstance(dates, list):
+		frappe.throw("dates must be a list")
+	dates = sorted({getdate(d) for d in dates if d})
 	if not dates:
 		return {"created": [], "failed": []}
+	if len(dates) > 31:
+		frappe.throw("At most 31 days at a time.")
+
+	# Only days that really are Absent can become leave -- the Console only
+	# offers those, and the server now insists on it too.
+	absent = {
+		getdate(d) for d in frappe.get_all(
+			"Attendance",
+			filters={"employee": employee, "docstatus": 1, "status": "Absent",
+					 "attendance_date": ["in", dates]},
+			pluck="attendance_date",
+		)
+	}
+	not_absent = [d for d in dates if d not in absent]
+	dates = [d for d in dates if d in absent]
 
 	settings = get_automation_settings()
 	leave_type = settings.get("absent_leave_type")
@@ -1098,7 +1623,10 @@ def create_leave_applications(employee, dates):
 		frappe.throw("Set 'Leave Type for Absent Days' in RAPL Payroll Automation Settings first.")
 
 	company = frappe.db.get_value("Employee", employee, "company")
-	created, failed = [], []
+	created = []
+	failed = [{"from_date": str(d), "to_date": str(d),
+			   "error": "Not an Absent day -- only Absent days can become leave"}
+			  for d in not_absent]
 
 	for index, block in enumerate(_contiguous_blocks(dates)):
 		savepoint = f"rapl_leave_{index}"
@@ -1114,7 +1642,7 @@ def create_leave_applications(employee, dates):
 			la.status = "Approved"
 			la.follow_via_email = 0
 			la.description = "Created from the Attendance Console"
-			la.insert(ignore_permissions=True)
+			la.insert()
 			la.submit()
 			created.append({
 				"name": la.name, "from_date": str(block[0]), "to_date": str(block[-1]),

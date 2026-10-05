@@ -79,9 +79,9 @@
       "fieldname": "per_day_rate",
       "fieldtype": "Currency",
       "label": "Per-Day Rate",
-      "precision": "0",
+      "precision": "6",
       "in_list_view": 1,
-      "description": "Editable. Whole rupees (no decimals) -- only the final Amount carries paisa-level precision. Changing this recalculates Amount."
+      "description": "Exact per-day rate (monthly salary / calendar days), to 6 decimals. Amount = sum(count x band fraction) x this rate, rounded once to whole rupees. Editable; changing it recalculates Amount."
     },
     {
       "fieldname": "amount",

@@ -96,7 +96,7 @@ frappe.pages["rapl-attendance-export"].on_page_load = function (wrapper) {
             doctype: "Employee",
             fields: ["name", "employee_name"],
             filters: [["status", "=", "Active"]],
-            limit_page_length: 500,
+            limit_page_length: 0,
             order_by: "employee_name asc"
         },
         callback: function(r) {
@@ -104,10 +104,10 @@ frappe.pages["rapl-attendance-export"].on_page_load = function (wrapper) {
             let emp_html = r.message.map(e => `
                 <div class="emp-row" style="padding:3px 2px;">
                     <label style="font-weight:normal; cursor:pointer; margin:0;">
-                        <input type="checkbox" class="emp-checkbox" value="${e.name}"
-                            data-name="${e.employee_name}">
-                        &nbsp;${e.employee_name}
-                        <span class="text-muted">(${e.name})</span>
+                        <input type="checkbox" class="emp-checkbox" value="${esc(e.name)}"
+                            data-name="${esc(e.employee_name)}">
+                        &nbsp;${esc(e.employee_name)}
+                        <span class="text-muted">(${esc(e.name)})</span>
                     </label>
                 </div>
             `).join("");
@@ -177,7 +177,11 @@ function load_report(state, page, month_field, year_field, employee_field) {
         employees.push({ id: emp, name: emp });
     }
 
-    state.employees = employees;
+    // The report on screen belongs to THIS month/year; exports use it, not
+    // whatever the dropdowns say later. A request id drops a slower, older
+    // response that arrives after a newer Load.
+    const request_id = (state.request_id || 0) + 1;
+    state.request_id = request_id;
 
     // Show loading indicator in report area
     $("#attendance-report-area").html(`
@@ -193,8 +197,21 @@ function load_report(state, page, month_field, year_field, employee_field) {
             month: month,
             year: String(year)
         },
+        error: function() {
+            if (state.request_id !== request_id) return;
+            // Nothing exportable until a load succeeds -- otherwise Export
+            // would quietly re-export the PREVIOUS report.
+            state.data = {};
+            $("#attendance-report-area").html(`
+                <div style="text-align:center; padding:40px; color:#c0392b;">
+                    ${esc(__("Could not load the report. You may not have access to some of the selected employees."))}
+                </div>
+            `);
+        },
         callback: function(r) {
+            if (state.request_id !== request_id) return;
             if (!r.message) {
+                state.data = {};
                 $("#attendance-report-area").html(`
                     <div style="text-align:center; padding:40px; color:#888;">
                         No data returned.
@@ -204,6 +221,9 @@ function load_report(state, page, month_field, year_field, employee_field) {
             }
 
             state.data = r.message;
+            state.employees = employees;
+            state.month = month;
+            state.year = year;
 
             employees.forEach(e => {
                 if (r.message[e.id]) {
@@ -229,24 +249,24 @@ function render_report(state, month, year) {
             let row_bg = is_holiday ? "#fff9e6" : is_leave ? "#e8f4e8" : "";
 
             return `<tr style="background:${row_bg}">
-                <td>${r.attendance_date || ""}</td>
-                <td>${r.day_label || ""}</td>
-                <td>${r.in_time || "-"}</td>
-                <td>${r.out_time || "-"}</td>
-                <td>${r.working_hours || 0}</td>
-                <td>${r.ot || 0}</td>
-                <td>${r.status || ""}</td>
-                <td>${r.remarks || ""}</td>
+                <td>${esc(r.attendance_date || "")}</td>
+                <td>${esc(r.day_label || "")}</td>
+                <td>${esc(r.in_time || "-")}</td>
+                <td>${esc(r.out_time || "-")}</td>
+                <td>${esc(r.working_hours || 0)}</td>
+                <td>${esc(r.ot || 0)}</td>
+                <td>${esc(r.status || "")}</td>
+                <td>${esc(r.remarks || "")}</td>
             </tr>`;
         }).join("");
 
         return `
-            <div class="emp-section" data-emp="${e.id}"
+            <div class="emp-section" data-emp="${esc(e.id)}"
                 style="margin-bottom:32px; border:1px solid #d1d8dd;
                 border-radius:6px; overflow:hidden;">
                 <div style="background:#4a5568; color:#fff; padding:10px 16px;
                     font-size:14px; font-weight:600;">
-                    ${emp_data.employee_name}
+                    ${esc(emp_data.employee_name)}
                     <span style="font-weight:normal; font-size:12px; opacity:0.8;">
                         &nbsp;— ${month} ${year}
                     </span>
@@ -291,8 +311,9 @@ function export_pdf(state, month_field, year_field) {
         return;
     }
 
-    let month = month_field.get_value();
-    let year = year_field.get_value();
+    // The period that was LOADED, not the current dropdowns.
+    let month = state.month;
+    let year = state.year;
     let employees = state.employees.map(e => e.id);
 
     if (!employees.length) {
@@ -313,8 +334,8 @@ function export_excel(state, month_field, year_field) {
         return;
     }
 
-    let month = month_field.get_value();
-    let year = year_field.get_value();
+    let month = state.month;
+    let year = state.year;
 
     load_sheetjs(function() {
         let wb = XLSX.utils.book_new();
@@ -348,8 +369,12 @@ function export_excel(state, month_field, year_field) {
                 {wch:12},{wch:6},{wch:10},{wch:16}
             ];
 
-            // Sheet name max 31 chars
-            let sheet_name = emp_data.employee_name.substring(0, 28);
+            // Sheet names: max 31 chars, unique, none of []:*?/\ -- SheetJS
+            // throws on any of these, and on a blank employee_name.
+            let base = String(emp_data.employee_name || e.id)
+                .replace(/[\[\]:*?\/\\]/g, "").substring(0, 26) || String(e.id).substring(0, 26);
+            let sheet_name = base, k = 1;
+            while (wb.SheetNames.includes(sheet_name)) sheet_name = `${base}~${k++}`;
             XLSX.utils.book_append_sheet(wb, ws, sheet_name);
         });
 
@@ -375,4 +400,11 @@ function load_sheetjs(callback) {
     script.src = "https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js";
     script.onload = callback;
     document.head.appendChild(script);
+}
+
+
+// Everything rendered with .html() goes through this -- employee names and
+// remarks come from the database and must never be treated as markup.
+function esc(v) {
+    return frappe.utils.escape_html(String(v === undefined || v === null ? "" : v));
 }

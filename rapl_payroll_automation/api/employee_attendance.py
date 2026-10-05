@@ -29,7 +29,7 @@
 # would leave them readable in the JSON response.
 
 import frappe
-from frappe.utils import flt
+from frappe.utils import date_diff, flt, getdate
 
 from rapl_payroll_automation.api.attendance_data import (
 	build_month_rows,
@@ -37,11 +37,12 @@ from rapl_payroll_automation.api.attendance_data import (
 	summarise,
 )
 from rapl_payroll_automation.api.ot_engine import is_ot_eligible
+from rapl_payroll_automation.api.payroll_math import pay_rates, round_half_up
 from rapl_payroll_automation.api.payroll_automation_utils import (
 	get_automation_settings,
 	get_grade_ot_rule,
 	get_total_working_days,
-	get_weekly_off_dates,
+	get_employee_weekly_off_dates,
 )
 from erpnext.setup.doctype.employee.employee import get_holiday_list_for_employee
 
@@ -68,8 +69,27 @@ def _own_employee():
 def _resolve_access(employee):
 	"""Return (employee, show_money). Never trust the caller's employee arg."""
 	if _is_hr():
-		return (employee or _own_employee()), True
+		employee = employee or _own_employee()
+		# HR is still subject to its own User Permissions (e.g. one Company).
+		if not frappe.has_permission("Employee", "read", doc=employee):
+			frappe.throw(f"Not permitted to view {employee}", frappe.PermissionError)
+		return employee, True
 	return _own_employee(), False
+
+
+MAX_PERIOD_DAYS = 62
+MAX_BULK = 300
+
+
+def _check_period(start_date, end_date):
+	if not start_date or not end_date:
+		frappe.throw("Set a period first")
+	start, end = getdate(start_date), getdate(end_date)
+	if start > end:
+		frappe.throw("Start date is after end date.")
+	if date_diff(end, start) + 1 > MAX_PERIOD_DAYS:
+		frappe.throw(f"Choose a period of at most {MAX_PERIOD_DAYS} days.")
+	return start, end
 
 
 def _pay_context(employee, start_date, end_date, settings):
@@ -80,23 +100,20 @@ def _pay_context(employee, start_date, end_date, settings):
 	rule = get_grade_ot_rule(settings, grade)
 
 	total_days = get_total_working_days(start_date, end_date)
-	if rule:
-		holiday_list = get_holiday_list_for_employee(employee)
-		sundays = get_weekly_off_dates(holiday_list, start_date, end_date) or []
-		ot_days = total_days - len(sundays)
-	else:
-		ot_days = total_days
+	sundays = []
+	exclude = bool(rule)
+	if exclude:
+		sundays = get_employee_weekly_off_dates(employee, start_date, end_date)
+	r = pay_rates(monthly, total_days, len(sundays), exclude, settings.ot_hours_divisor)
 
-	if not monthly or ot_days <= 0:
-		return {"monthly_salary": monthly, "ot_working_days": ot_days,
-				"per_day_rate": 0, "hourly_rate": 0, "grade": grade}
-
-	per_day = round(monthly / ot_days)
+	# per_day_rate = calendar-day rate (late mark / half day, as Late Mark
+	# Processing pays); ot_per_day_rate = the overtime denominator.
 	return {
 		"monthly_salary": monthly,
-		"ot_working_days": ot_days,
-		"per_day_rate": per_day,
-		"hourly_rate": round(per_day / flt(settings.ot_hours_divisor), 2),
+		"ot_working_days": r["ot_days"],
+		"per_day_rate": r["late_per_day"],
+		"ot_per_day_rate": r["ot_per_day"],
+		"hourly_rate": r["hourly"],
 		"grade": grade,
 	}
 
@@ -139,13 +156,13 @@ def _build_statement(employee, start_date, end_date, show_money, settings):
 		att = row.get("attendance")
 		if not att:
 			continue
-		amount = round(flt(att["overtime_hours"]) * flt(pay["hourly_rate"]))
+		amount = round_half_up(flt(att["overtime_hours"]) * flt(pay["hourly_rate"]))
 		att["overtime_amount"] = amount
 		ot_total += amount
 
 		band = att.get("late_mark_band")
 		att["late_deduction_amount"] = (
-			round(flt(bands.get(band, 0)) * flt(pay["per_day_rate"])) if band else 0
+			round_half_up(flt(bands.get(band, 0)) * flt(pay["per_day_rate"])) if band else 0
 		)
 
 	# Period totals are recomputed from the period hours, NOT summed from the
@@ -153,22 +170,23 @@ def _build_statement(employee, start_date, end_date, show_money, settings):
 	# the two must agree.
 	statement["totals"] = {
 		"overtime_hours": summary["overtime_hours"],
-		"overtime_amount": round(flt(summary["overtime_hours"]) * flt(pay["hourly_rate"])),
-		"overtime_amount_daily_sum": round(ot_total),
-		"late_deduction_amount": round(
+		"overtime_amount": round_half_up(
+			flt(summary.get("overtime_hours_exact", summary["overtime_hours"])) * flt(pay["hourly_rate"])
+		),
+		"overtime_amount_daily_sum": round_half_up(ot_total),
+		"late_deduction_amount": round_half_up(
 			sum(flt(bands.get(label, 0)) * count
 				for label, count in summary["band_counts"].items())
 			* flt(pay["per_day_rate"])
 		),
-		"half_day_amount": round(summary["half_day"] * 0.5 * flt(pay["per_day_rate"])),
+		"half_day_amount": round_half_up(summary["half_day"] * 0.5 * flt(pay["per_day_rate"])),
 	}
 	return statement
 
 
 @frappe.whitelist()
 def get_statement(employee=None, start_date=None, end_date=None):
-	if not start_date or not end_date:
-		frappe.throw("Set a period first")
+	start_date, end_date = _check_period(start_date, end_date)
 
 	employee, show_money = _resolve_access(employee)
 	settings = get_automation_settings()
@@ -180,10 +198,19 @@ def get_bulk_statements(employees, start_date=None, end_date=None):
 	"""HR only. One statement per employee, each rendered on its own page."""
 	if not _is_hr():
 		frappe.throw("Only HR can view multiple employees", frappe.PermissionError)
-	if not start_date or not end_date:
-		frappe.throw("Set a period first")
+	start_date, end_date = _check_period(start_date, end_date)
 
 	employees = frappe.parse_json(employees) if employees not in (None, "") else []
+	if not isinstance(employees, list):
+		frappe.throw("employees must be a list")
+	employees = list(dict.fromkeys(employees))
+	if len(employees) > MAX_BULK:
+		frappe.throw(f"At most {MAX_BULK} employees at a time.")
+	allowed = set(frappe.get_list("Employee", filters={"name": ["in", employees or [""]]},
+								  pluck="name", limit_page_length=0))
+	denied = [e for e in employees if e not in allowed]
+	if denied:
+		frappe.throw(f"Not permitted: {', '.join(denied[:10])}", frappe.PermissionError)
 	settings = get_automation_settings()
 	return [
 		_build_statement(emp, start_date, end_date, True, settings)
@@ -195,11 +222,12 @@ def get_bulk_statements(employees, start_date=None, end_date=None):
 def get_selectable_employees():
 	"""HR sees everyone active; an employee sees only themselves."""
 	if _is_hr():
-		return frappe.get_all(
+		return frappe.get_list(
 			"Employee",
 			filters={"status": "Active"},
 			fields=["name", "employee_name", "grade"],
 			order_by="name",
+			limit_page_length=0,
 		)
 	own = _own_employee()
 	return frappe.get_all(

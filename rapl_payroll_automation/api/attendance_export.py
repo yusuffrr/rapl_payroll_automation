@@ -20,7 +20,56 @@
 #   hours shown on this report will not reconcile against the OT actually paid
 #   via Additional Salary. Unifying these is tracked separately.
 
+import calendar
+
 import frappe
+from frappe.utils import cint, escape_html
+
+MAX_EMPLOYEES = 300
+
+
+def _clean_request(employees, month, year):
+	"""Permission + payload checks shared by both endpoints.
+
+	These were whitelisted with no check at all: any logged-in user could pull
+	any colleague's punches and OT by posting their Employee IDs.
+	HR (HR Manager / HR User with Attendance read) may export anyone they can
+	see; everyone else only their own record.
+	"""
+	from rapl_payroll_automation.api.employee_attendance import _is_hr, _own_employee
+
+	employees = frappe.parse_json(employees) if employees not in (None, "") else []
+	if not isinstance(employees, list):
+		frappe.throw("employees must be a list")
+	employees = list(dict.fromkeys(str(e) for e in employees if e))
+	if len(employees) > MAX_EMPLOYEES:
+		frappe.throw(f"Export at most {MAX_EMPLOYEES} employees at a time.")
+
+	if month not in calendar.month_name[1:]:
+		frappe.throw("Month must be a full English month name, e.g. 'August'.")
+	year = cint(year)
+	if not 2000 <= year <= 2100:
+		frappe.throw("Year is out of range.")
+
+	if _is_hr() and frappe.has_permission("Attendance", "read"):
+		allowed = set(frappe.get_list(
+			"Employee", filters={"name": ["in", employees or [""]]}, pluck="name", limit_page_length=0
+		))
+		denied = [e for e in employees if e not in allowed]
+	else:
+		own = _own_employee()
+		denied = [e for e in employees if e != own]
+	if denied:
+		frappe.throw(f"Not permitted to export: {', '.join(denied[:10])}", frappe.PermissionError)
+	return employees, month, year
+
+
+def _employee_names(employees):
+	return {
+		e.name: e.employee_name
+		for e in frappe.get_all("Employee", filters={"name": ["in", employees]},
+								fields=["name", "employee_name"])
+	} if employees else {}
 
 # Holiday resolution here is intentionally left as-is from the original app:
 # it COALESCEs Employee.holiday_list -> latest submitted Shift Assignment's
@@ -123,15 +172,15 @@ def _serialize(rows):
 
 @frappe.whitelist()
 def get_bulk_attendance_data(employees, month, year):
-	employees = frappe.parse_json(employees) if employees not in (None, "") else []
+	employees, month, year = _clean_request(employees, month, year)
+	names = _employee_names(employees)
 	results = {}
 
 	for emp in employees:
-		emp_details = frappe.db.get_value("Employee", emp, ["employee_name"], as_dict=True)
 		rows = _get_attendance_rows(emp, month, year)
 
 		results[emp] = {
-			"employee_name": emp_details.employee_name if emp_details else emp,
+			"employee_name": names.get(emp) or emp,
 			"rows": _serialize(rows),
 		}
 
@@ -140,29 +189,30 @@ def get_bulk_attendance_data(employees, month, year):
 
 @frappe.whitelist()
 def get_bulk_attendance_pdf(employees, month, year):
-	employees = frappe.parse_json(employees) if employees not in (None, "") else []
+	employees, month, year = _clean_request(employees, month, year)
 	from frappe.utils.pdf import get_pdf
 
+	names = _employee_names(employees)
 	html_parts = []
+	e = lambda v: escape_html(str(v)) if v not in (None, "") else ""
 
 	for i, emp in enumerate(employees):
-		emp_details = frappe.db.get_value("Employee", emp, ["employee_name"], as_dict=True)
 		rows = _get_attendance_rows(emp, month, year)
-		emp_name = emp_details.employee_name if emp_details else emp
+		emp_name = e(names.get(emp) or emp)
 
 		table_rows = ""
 		for row in rows:
 			attendance_date = str(row.attendance_date) if row.attendance_date else ""
 			table_rows += f"""
 				<tr>
-					<td>{attendance_date}</td>
-					<td>{row.day_label or ""}</td>
-					<td>{row.in_time or "-"}</td>
-					<td>{row.out_time or "-"}</td>
-					<td>{row.working_hours or 0}</td>
-					<td>{row.ot or 0}</td>
-					<td>{row.status or ""}</td>
-					<td>{row.remarks or ""}</td>
+					<td>{e(attendance_date)}</td>
+					<td>{e(row.day_label)}</td>
+					<td>{e(row.in_time) or "-"}</td>
+					<td>{e(row.out_time) or "-"}</td>
+					<td>{e(row.working_hours) or 0}</td>
+					<td>{e(row.ot) or 0}</td>
+					<td>{e(row.status)}</td>
+					<td>{e(row.remarks)}</td>
 				</tr>
 			"""
 
