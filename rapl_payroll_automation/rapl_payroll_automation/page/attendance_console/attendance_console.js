@@ -115,8 +115,9 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		do_load(range);
 	}
 
-	function do_load(range) {
-		const employee = employee_field.get_value();
+	// A follow-up reload (after Apply, Create, ...) passes the employee that
+	// was LOADED; only the Load button reads the live Employee box.
+	function do_load(range, employee = employee_field.get_value()) {
 		status(__("Loading..."));
 		$body.find(".ac-grid-out").empty();
 
@@ -147,7 +148,8 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 				// reload of the SAME view (after Apply, Create...) keeps them;
 				// a different month or employee filter starts clean.
 				const view = `${range.start}|${employee || ""}`;
-				if (state.view !== view) state.overrides.clear();
+				const same_view = state.view === view;
+				if (!same_view) state.overrides.clear();
 				state.view = view;
 				state.range = range;
 				state.loaded_employee = employee || null;
@@ -155,12 +157,39 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 				state.selected.clear();
 				state.netpay.clear();
 				// Every recoverable advance starts ticked -- HR usually recovers
-				// everything and unticks the exceptions.
-				state.adv.clear();
-				state.leave.clear();
+				// everything and unticks the exceptions. A reload of the SAME
+				// view keeps what HR unticked: re-ticking it silently after an
+				// Apply would recover an advance someone had deliberately left.
+				const prev_adv = state.adv;
+				state.adv = new Map();
 				(state.data.groups || []).forEach((g) => {
-					state.adv.set(g.employee, new Set((g.advances || []).map((a) => a.name)));
+					const names = (g.advances || []).map((a) => a.name);
+					const kept = same_view && prev_adv.has(g.employee)
+						? names.filter((n) => prev_adv.get(g.employee).has(n)
+							|| !(state.adv_seen && state.adv_seen.has(n)))
+						: names;
+					state.adv.set(g.employee, new Set(kept));
 				});
+				state.adv_seen = new Set((state.data.groups || []).flatMap((g) => (g.advances || []).map((a) => a.name)));
+				if (!same_view) {
+					state.leave.clear();
+				} else {
+					// Keep only picks that are still Absent with no leave yet:
+					// a picked day fixed to Present would otherwise still be
+					// sent to Create leave and refused.
+					(state.data.groups || []).forEach((g) => {
+						const picked = state.leave.get(g.employee);
+						if (!picked) return;
+						const still = new Set();
+						(g.rows || []).forEach((row) => {
+							const att = row.attendance;
+							if (picked.has(row.date) && att && att.status === "Absent" && !att.leave_application) {
+								still.add(row.date);
+							}
+						});
+						state.leave.set(g.employee, still);
+					});
+				}
 				const typed_cutoff = cutoff_field.get_value() && cutoff_field.get_value() !== state.auto_cutoff;
 				if (state.data.advance_cutoff && !typed_cutoff) {
 					state.auto_cutoff = state.data.advance_cutoff;
@@ -221,6 +250,11 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 	// (22:43:40 reads 22:43), so Out minus shift end matches the OT shown.
 	// Rounding the minutes used to show 4:44 for 4h 43m 48s, and could even
 	// produce "4:60".
+	// IDs go into HTML attributes: escape them, so an Employee ID typed with a
+	// quote cannot break out of data-employee="..." (attr() reads it back
+	// unescaped).
+	const esc_attr = (v) => frappe.utils.escape_html(String(v === undefined || v === null ? "" : v));
+
 	function hhmm_from_seconds(seconds) {
 		const s = Math.max(0, Math.round(flt(seconds)));
 		if (!s) return "";
@@ -267,7 +301,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 			.map((b, i) => {
 				const v = ov(emp, `band_${i + 1}_count`, e.band_counts[b.label] || 0);
 				return `<span class="ac-field"><label>${frappe.utils.escape_html(b.label)}</label>` +
-					`<input class="ac-cell ac-sum ac-band" data-employee="${emp}" data-field="band_${i + 1}_count" value="${v || ""}" placeholder="0"></span>`;
+					`<input class="ac-cell ac-sum ac-band" data-employee="${esc_attr(emp)}" data-field="band_${i + 1}_count" value="${v || ""}" placeholder="0"></span>`;
 			})
 			.join("");
 
@@ -280,7 +314,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		// band rather than one label -- forcing it into the day columns made it
 		// cramped and made the whole page read as misaligned.
 		const rows = [`
-			<tr class="ac-emp-row ${open ? "ac-open" : ""} ${dirty ? "ac-ov" : ""}" data-employee="${emp}">
+			<tr class="ac-emp-row ${open ? "ac-open" : ""} ${dirty ? "ac-ov" : ""}" data-employee="${esc_attr(emp)}">
 				<td colspan="${COLS.length}" class="ac-emp-cell">
 					<div class="ac-emp-top">
 						<span class="ac-caret fa fa-chevron-${open ? "down" : "right"}"></span>
@@ -318,11 +352,11 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 							<div class="ac-zone-body">
 								${band_inputs}
 								<span class="ac-field"><label>&#8377;/${__("day")}</label>
-									<input class="ac-cell ac-sum" data-employee="${emp}" data-field="per_day_rate"
+									<input class="ac-cell ac-sum" data-employee="${esc_attr(emp)}" data-field="per_day_rate"
 										value="${per_day || ""}" placeholder="0"
 										title="${__("Monthly salary divided by calendar days in the period")}"></span>
 								<span class="ac-spacer"></span>
-								<input class="ac-cell ac-sum ea-cut" data-employee="${emp}" data-field="late_amount"
+								<input class="ac-cell ac-sum ea-cut" data-employee="${esc_attr(emp)}" data-field="late_amount"
 									value="${late_amount || ""}" placeholder="0" title="${__("Total late mark deduction")}">
 							</div>
 						</div>
@@ -330,14 +364,14 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 							<div class="ac-zone-h">${__("OVERTIME")}</div>
 							<div class="ac-zone-body">
 								<span class="ac-field"><label>h:mm</label>
-									<input class="ac-cell ac-sum" data-employee="${emp}" data-field="ot_hours_hhmm"
+									<input class="ac-cell ac-sum" data-employee="${esc_attr(emp)}" data-field="ot_hours_hhmm"
 										value="${ot_secs ? hhmm_from_seconds(ot_secs) : ""}" placeholder="0:00"></span>
 								<span class="ac-field"><label>&#8377;/${__("hr")}</label>
-									<input class="ac-cell ac-sum" data-employee="${emp}" data-field="ot_rate"
+									<input class="ac-cell ac-sum" data-employee="${esc_attr(emp)}" data-field="ot_rate"
 										value="${ot_rate || ""}" placeholder="0"
 										title="${__("Per-day rate divided by the overtime divisor. The denominator depends on grade.")}"></span>
 								<span class="ac-spacer"></span>
-								<input class="ac-cell ac-sum ea-ot" data-employee="${emp}" data-field="amount"
+								<input class="ac-cell ac-sum ea-ot" data-employee="${esc_attr(emp)}" data-field="amount"
 									value="${ot_amount || ""}" placeholder="0" title="${__("Overtime earned")}">
 							</div>
 						</div>
@@ -349,7 +383,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 						<span class="ea-cut">${__("Cut")} &minus;${format_currency(late_amount || 0)}</span>
 						<span class="ea-cut">${__("Advance")} &minus;${format_currency(advance_total(g))}</span>
 						<span class="ac-spacer"></span>
-						<button class="btn btn-xs ac-netpay" data-employee="${emp}" ${state.netpay_busy.has(emp) ? "disabled" : ""}>${
+						<button class="btn btn-xs ac-netpay" data-employee="${esc_attr(emp)}" ${state.netpay_busy.has(emp) ? "disabled" : ""}>${
 							state.netpay_busy.has(emp) ? __("Computing...")
 								: state.netpay.has(emp) ? __("Recompute") : __("Compute net pay")}</button>
 					</div>
@@ -386,8 +420,8 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 
 		const lines = list.map((a) => `
 			<div class="ac-adv-line">
-				<input type="checkbox" class="ac-adv-pick" data-employee="${g.employee}"
-					data-advance="${a.name}" ${picked.has(a.name) ? "checked" : ""}>
+				<input type="checkbox" class="ac-adv-pick" data-employee="${esc_attr(g.employee)}"
+					data-advance="${esc_attr(a.name)}" ${picked.has(a.name) ? "checked" : ""}>
 				<span class="ac-adv-name">${a.name}</span>
 				<span class="ea-dim">${frappe.datetime.str_to_user(a.posting_date)}</span>
 				<span class="ea-dim ac-adv-purpose">${frappe.utils.escape_html(a.purpose || "")}</span>
@@ -397,7 +431,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 
 		return `<div class="ac-zone">
 			<div class="ac-zone-h">${__("ADVANCE")}</div>
-			<div class="ac-zone-body ac-adv-head" data-employee="${g.employee}">
+			<div class="ac-zone-body ac-adv-head" data-employee="${esc_attr(g.employee)}">
 				<span class="ea-dim">${__("outstanding")} <b>${format_currency(outstanding)}</b></span>
 				<span class="ac-spacer"></span>
 				<span class="ea-cut"><b>${format_currency(advance_total(g))}</b></span>
@@ -423,7 +457,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 			</div>`).join("");
 
 		return `
-			<div class="ac-netpay-bar" data-employee="${g.employee}">
+			<div class="ac-netpay-bar" data-employee="${esc_attr(g.employee)}">
 				<b>${__("Computed pay")}</b>
 				<span>${__("Net")} <b class="ac-net">${format_currency(res.net_pay)}</b></span>
 				<span class="ea-dim">${res.month_in_progress ? __("month-to-date, up to {0}", [frappe.datetime.str_to_user(res.through_date || "")]) : __("provisional")} &middot; ${flt(res.payment_days, 2)}/${flt(res.total_working_days, 2)} ${__("days")}</span>
@@ -449,6 +483,9 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 					&minus; ${__("no record")} ${flt(res.days.missing, 1)} &minus; ${__("LWP")} ${flt(res.days.lwp, 1)}
 					${res.days.not_yet_earned ? `&minus; ${__("not yet earned")} ${flt(res.days.not_yet_earned, 1)}` : ""}
 					= <b>${flt(res.payment_days, 1)}</b></div>` : ""}
+				${res.native_payment_days !== undefined && Math.abs(flt(res.native_payment_days) - flt(res.payment_days)) > 0.001
+					? `<div class="ea-late ac-pay-note">${__("Note: the real Salary Slip would pay {0} days, not {1}. It follows Payroll Settings (Payroll Based On / Consider Unmarked Attendance As), which count absent or missing days differently from this preview. Check those settings before payroll.", [flt(res.native_payment_days, 1), flt(res.payment_days, 1)])}</div>`
+					: ""}
 				${res.already_submitted ? `<div class="ea-late ac-pay-note">${__("Overtime / Late Mark already submitted for this period - not added again.")}</div>` : ""}
 				<div class="ac-pay-net">
 					<div>
@@ -484,7 +521,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		return `<span class="ac-leave-head">
 				<span class="ea-dim">${__("Leave Balance")}</span> <b>${flt(lv.balance, 1)}</b>
 				${lv.taken ? `<span class="ea-dim" style="margin-left:7px">${__("Leave Taken")}</span> <b>${lv.taken}</b>` : ""}
-				${picked.size ? `<button class="btn btn-xs ac-leave-create" data-employee="${g.employee}" style="margin-left:7px">${__("Create leave")} (${picked.size})</button>` : ""}
+				${picked.size ? `<button class="btn btn-xs ac-leave-create" data-employee="${esc_attr(g.employee)}" style="margin-left:7px">${__("Create leave")} (${picked.size})</button>` : ""}
 			</span>`;
 	}
 
@@ -499,8 +536,8 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 			return `<span class="ea-dim" title="${__("No leave allocation")}">&#9633;</span>`;
 		}
 		const picked = leave_picked(g.employee);
-		return `<input type="checkbox" class="ac-leave-pick" data-employee="${g.employee}"
-			data-date="${row.date}" ${picked.has(row.date) ? "checked" : ""}>`;
+		return `<input type="checkbox" class="ac-leave-pick" data-employee="${esc_attr(g.employee)}"
+			data-date="${esc_attr(row.date)}" ${picked.has(row.date) ? "checked" : ""}>`;
 	}
 
 	function render_day(g, row, bands) {
@@ -513,14 +550,14 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		const dash = '<td class="ac-num ea-dim">&mdash;</td>';
 
 		if (!att && row.is_future && !row.is_holiday) {
-			return `<tr class="ac-day ea-off ac-future" data-date="${row.date}" data-employee="${g.employee}"><td></td>${flag_cell}
+			return `<tr class="ac-day ea-off ac-future" data-date="${esc_attr(row.date)}" data-employee="${esc_attr(g.employee)}"><td></td>${flag_cell}
 				<td class="ea-dim ac-indent">${date_label}</td>
 				<td colspan="9" class="ea-dim">${__("Upcoming")}</td></tr>`;
 		}
 
 		if (!att) {
 			if (row.is_holiday) {
-				return `<tr class="ac-day ea-off" data-date="${row.date}" data-employee="${g.employee}"><td></td>${flag_cell}
+				return `<tr class="ac-day ea-off" data-date="${esc_attr(row.date)}" data-employee="${esc_attr(g.employee)}"><td></td>${flag_cell}
 					<td class="ea-dim ac-indent">${date_label}</td>
 					<td colspan="9" class="ea-dim">${row.is_weekly_off ? __("Weekly off") : frappe.utils.escape_html(row.holiday_description || __("Holiday"))}
 						${g.can_create ? `<button class="btn btn-xs ac-create ac-create-inline">${__("Create")}</button>` : ""}</td>
@@ -531,7 +568,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 			const action = g.can_create
 				? `<button class="btn btn-xs ac-create ac-create-inline">${__("Create")}</button>`
 				: `<span class="ea-dim">${__("Left")}</span>`;
-			return `<tr class="ac-day ea-missing" data-date="${row.date}" data-employee="${g.employee}">
+			return `<tr class="ac-day ea-missing" data-date="${esc_attr(row.date)}" data-employee="${esc_attr(g.employee)}">
 					<td></td>${flag_cell}
 					<td class="ac-indent">${date_label}</td>
 					<td colspan="9">${cancelled ? __("Only a cancelled record exists") : __("No attendance record")} ${action}</td>
@@ -554,7 +591,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		const band = bands.find((b) => b.label === att.late_mark_band);
 		const cut = band ? flt(band.fraction) * flt(ov(g.employee, "per_day_rate", e.per_day_rate)) : 0;
 
-		return `<tr class="ac-day ${pending ? "ac-dirty" : ""} ${row.is_holiday ? "ea-worked-off" : ""}" data-name="${att.name}">
+		return `<tr class="ac-day ${pending ? "ac-dirty" : ""} ${row.is_holiday ? "ea-worked-off" : ""}" data-name="${esc_attr(att.name)}">
 				<td><input type="checkbox" class="ac-pick" ${state.selected.has(att.name) ? "checked" : ""}></td>
 				${flag_cell}
 				<td class="ac-indent">${date_label}</td>
@@ -809,7 +846,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 								`<div class="text-muted">${f.from_date}: ${frappe.utils.escape_html(f.error)}</div>`).join(""),
 					});
 					state.leave.delete(emp);
-					do_load(loaded_period());
+					do_load(loaded_period(), state.loaded_employee);
 				},
 			})
 		);
@@ -903,9 +940,16 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		const att = find_attendance(name);
 		if (!att) return;
 		const entry = state.pending.get(name) || { name, modified: att.modified };
-		entry.custom_attendance_type = $(this).val() || "";
-		state.pending.set(name, entry);
-		$tr.addClass("ac-dirty");
+		const visit = $(this).val() || "";
+		if (visit === (att.attendance_type || "")) delete entry.custom_attendance_type;
+		else entry.custom_attendance_type = visit;
+		if (Object.keys(entry).filter((k) => k !== "name" && k !== "modified").length === 0) {
+			state.pending.delete(name);
+			$tr.removeClass("ac-dirty");
+		} else {
+			state.pending.set(name, entry);
+			$tr.addClass("ac-dirty");
+		}
 		render_footer();
 	});
 
@@ -1052,8 +1096,11 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 			const att = find_attendance(name);
 			if (!att) return;
 			const entry = state.pending.get(name) || { name, modified: att.modified };
-			if (out) entry.out_time = String(out).trim();
-			if (st) entry.status = st;
+			// Only real changes (an unchanged out time would lose its seconds),
+			// and never a status change on a day decided by leave.
+			if (out && String(out).trim() !== (hhmm(att.out_time) || "")) entry.out_time = String(out).trim();
+			if (st && st !== att.status && !att.genuine_leave) entry.status = st;
+			if (Object.keys(entry).filter((k) => k !== "name" && k !== "modified").length === 0) return;
 			state.pending.set(name, entry);
 		});
 		render();
@@ -1076,12 +1123,26 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		if (clash.length) {
 			return frappe.msgprint(__("Apply or discard the {0} unsaved row(s) in your selection first.", [clash.length]));
 		}
-		frappe.call({
+		const run = (confirm_processed) => frappe.call({
 			method: "rapl_payroll_automation.api.attendance_console.recalculate",
-			args: { names: JSON.stringify(names) },
+			args: { names: JSON.stringify(names), confirm_processed },
 			freeze: true,
-			callback(r) { report(r.message); do_load(loaded_period()); },
+			callback(r) {
+				const res = r.message || {};
+				const needs = (res.failed || []).filter((f) => f.needs_confirmation);
+				if (needs.length && !confirm_processed) {
+					return frappe.confirm(
+						needs.map((f) => frappe.utils.escape_html(f.error)).join("<br><br>") +
+							"<br><br><b>" + __("Recalculate anyway?") + "</b>",
+						() => run(1),
+						() => { report(res); do_load(loaded_period(), state.loaded_employee); }
+					);
+				}
+				report(res);
+				do_load(loaded_period(), state.loaded_employee);
+			},
 		});
+		run(0);
 	});
 
 	// ---------------------------------------------------------------- create
@@ -1140,7 +1201,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 						(res.failed || []).forEach((f) => frappe.msgprint({
 							title: __("Could not create"), indicator: "red", message: frappe.utils.escape_html(f.error || ""),
 						}));
-						do_load(loaded_period());
+						do_load(loaded_period(), state.loaded_employee);
 					},
 				});
 			},
@@ -1201,12 +1262,12 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 						needs.map((f) => frappe.utils.escape_html(f.error)).join("<br><br>") +
 							"<br><br><b>" + __("Edit anyway?") + "</b>",
 						() => apply(1),
-						() => { report(res); do_load(loaded_period()); }
+						() => { report(res); do_load(loaded_period(), state.loaded_employee); }
 					);
 					return;
 				}
 				report(res);
-				do_load(loaded_period());
+				do_load(loaded_period(), state.loaded_employee);
 			},
 		});
 	}
@@ -1221,7 +1282,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		frappe.msgprint({
 			title: __("{0} applied, {1} failed", [applied, failed.length]),
 			indicator: "orange",
-			message: failed.map((f) => `<div><b>${f.name || ""}</b> &mdash; ${frappe.utils.escape_html(f.error)}</div>`).join(""),
+			message: failed.map((f) => `<div><b>${frappe.utils.escape_html(f.name || "")}</b> &mdash; ${frappe.utils.escape_html(f.error || "")}</div>`).join(""),
 		});
 	}
 
@@ -1253,8 +1314,18 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		// Manual overrides are keyed by employee; passing those employees
 		// explicitly is also what lets an OT figure entered by hand survive for
 		// someone whose Employee.custom_ot is off.
+		// Amounts the Console DERIVED (from typed hours/rate or counts) are not
+		// sent: the server recomputes them from those same inputs, so a stale
+		// derived figure can never reach the draft. Typed amounts are sent.
 		const overrides = {};
-		state.overrides.forEach((v, k) => { overrides[k] = v; });
+		state.overrides.forEach((v, k) => {
+			const c = Object.assign({}, v);
+			if (c._amount_auto) delete c.amount;
+			if (c._late_auto) delete c.late_amount;
+			delete c._amount_auto;
+			delete c._late_auto;
+			overrides[k] = c;
+		});
 
 		frappe.call({
 			method: "rapl_payroll_automation.api.attendance_console.create_processing_draft",
@@ -1318,7 +1389,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 							(res.failed || []).map((f) =>
 								`<div class="text-muted">${frappe.utils.escape_html(f.advance || "")}: ${frappe.utils.escape_html(f.error || "")}</div>`).join(""),
 					});
-					do_load(loaded_period());
+					do_load(loaded_period(), state.loaded_employee);
 				},
 			})
 		);

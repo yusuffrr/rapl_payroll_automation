@@ -59,6 +59,22 @@ def cancel_additional_salaries(doc):
 	for row in doc.entries:
 		if not row.additional_salary:
 			continue
+		# A duplicated document can carry another document's links (the field
+		# was copyable before no_copy was set). Never cancel a record that a
+		# different submitted processing document created.
+		others = frappe.get_all(
+			row.doctype,
+			filters={"additional_salary": row.additional_salary, "docstatus": 1,
+					 "parent": ["!=", doc.name]},
+			pluck="parent",
+		)
+		# The creator is the OLDEST document holding the link; a copy is newer.
+		owner = others and frappe.db.exists(
+			doc.doctype, {"name": ["in", others], "creation": ["<", doc.creation]}
+		)
+		if owner:
+			row.db_set("additional_salary", None, update_modified=False)
+			continue
 		if frappe.db.get_value("Additional Salary", row.additional_salary, "docstatus") != 1:
 			row.db_set("additional_salary", None, update_modified=False)
 			continue

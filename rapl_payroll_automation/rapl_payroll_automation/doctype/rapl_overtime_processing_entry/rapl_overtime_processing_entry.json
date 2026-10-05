@@ -83,6 +83,7 @@
       "fieldname": "additional_salary",
       "fieldtype": "Link",
       "label": "Additional Salary (after processing)",
+      "no_copy": 1,
       "options": "Additional Salary",
       "read_only": 1
     }

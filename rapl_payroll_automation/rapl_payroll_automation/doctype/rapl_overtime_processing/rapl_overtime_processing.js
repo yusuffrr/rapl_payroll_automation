@@ -37,6 +37,11 @@ frappe.ui.form.on("RAPL Overtime Processing", {
 				},
 				action(selections) {
 					if (!selections || !selections.length) return;
+					this.dialog.hide();
+					if (!frm.is_new() && frm.is_dirty()) {
+						// Save first: the server reads the saved document.
+						return frm.save().then(() => { if (!frm.is_dirty()) this.action(selections); });
+					}
 					if (!frm.doc.start_date || !frm.doc.end_date) {
 						frappe.msgprint(__("Set From Date and To Date first, then save, before selecting employees."));
 						return;
@@ -59,6 +64,13 @@ frappe.ui.form.on("RAPL Overtime Processing", {
 });
 
 function get_employees(frm, all_employees) {
+	// The server works on the SAVED document and the form is reloaded after,
+	// so unsaved grid edits (and unsaved dates) would be silently lost.
+	if (!frm.is_new() && frm.is_dirty()) {
+		// Re-enter only if the save worked: frm.save() resolves even when the
+		// server refuses it, and the form would still be dirty -> endless loop.
+		return frm.save().then(() => { if (!frm.is_dirty()) get_employees(frm, all_employees); });
+	}
 	if (frm.is_new()) {
 		frappe.msgprint(__("Save the document once (with dates set) before fetching employees."));
 		return;

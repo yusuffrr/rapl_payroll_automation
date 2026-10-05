@@ -381,7 +381,11 @@ def match_late_band(in_time, settings):
 	if not in_time:
 		return None, False
 
-	check_in_seconds = time_to_seconds(get_datetime(in_time).time())
+	# Whole minutes, seconds dropped -- the way every screen shows the punch.
+	# Bands are configured in minutes (09:46-10:00, 10:01-10:15), so with
+	# seconds a 10:00:40 check-in fell in the gap between them and earned no
+	# late mark at all; 10:15:30 (shown as 10:15) became a Half Day.
+	check_in_seconds = time_to_seconds(get_datetime(in_time).time()) // 60 * 60
 	bands = sorted(settings.late_mark_bands, key=lambda r: time_to_seconds(r.from_time))
 
 	for band in bands:

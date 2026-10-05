@@ -447,3 +447,24 @@ class SalaryMonth(unittest.TestCase):
 		with self.assertRaises(frappe.ValidationError):
 			processing_common.validate_processing_doc(doc)
 		processing_common.validate_processing_doc(ns(start_date="2026-10-01", end_date="2026-10-15", entries=[]))
+
+
+class AuditRound3(unittest.TestCase):
+	def test_band_gap_seconds_no_longer_free(self):
+		# Bands 09:46-10:00 and 10:01-10:15: 10:00:40 used to fall between them.
+		band, past = attendance_automation.match_late_band(dt.datetime(2026, 10, 5, 10, 0, 40), settings())
+		self.assertEqual((band, past), ("L1", False))
+		band, past = attendance_automation.match_late_band(dt.datetime(2026, 10, 5, 10, 15, 30), settings())
+		self.assertEqual((band, past), ("L2", False))     # shown as 10:15 -> band, not Half Day
+		band, past = attendance_automation.match_late_band(dt.datetime(2026, 10, 5, 10, 16, 0), settings())
+		self.assertEqual((band, past), (None, True))
+
+	def test_pin_limits(self):
+		bands = [{"label": "L1"}, {"label": "L2"}]
+		self.assertIsNone(ac._check_pin("custom_overtime_hours", 2.5, bands))
+		self.assertIsNone(ac._check_pin("custom_overtime_hours", "", bands))
+		self.assertIsNotNone(ac._check_pin("custom_overtime_hours", -2, bands))
+		self.assertIsNotNone(ac._check_pin("custom_overtime_hours", 9999, bands))
+		self.assertIsNotNone(ac._check_pin("custom_overtime_hours", "abc", bands))
+		self.assertIsNone(ac._check_pin("custom_late_mark_band", "__none__", bands))
+		self.assertIsNotNone(ac._check_pin("custom_late_mark_band", "L9", bands))

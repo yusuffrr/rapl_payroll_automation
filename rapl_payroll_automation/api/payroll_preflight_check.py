@@ -18,6 +18,8 @@ def run_preflight_check(start_date, end_date):
 		frappe.throw("Payroll pre-flight check is restricted to HR.", frappe.PermissionError)
 	if not start_date or not end_date or getdate(start_date) > getdate(end_date):
 		frappe.throw("Set a valid period first")
+	if (getdate(end_date) - getdate(start_date)).days + 1 > 62:
+		frappe.throw("Choose a period of at most 62 days.")
 
 	issues = []
 
@@ -27,6 +29,15 @@ def run_preflight_check(start_date, end_date):
 	issues += _check_bad_timestamps(start_date, end_date)
 	issues += _check_duplicate_attendance(start_date, end_date)
 	issues += _check_missing_salary_structure_assignment(start_date, end_date)
+
+	# Only employees the caller may see (User Permissions): the checks above
+	# read through frappe.get_all, which ignores them.
+	involved = sorted({i["employee"] for i in issues if i.get("employee")})
+	if involved:
+		visible = set(frappe.get_list(
+			"Employee", filters={"name": ["in", involved]}, pluck="name", limit_page_length=0
+		))
+		issues = [i for i in issues if i.get("employee") in visible]
 
 	flagged_employees = sorted({i["employee"] for i in issues})
 	return {"issues": issues, "flagged_employees": flagged_employees}

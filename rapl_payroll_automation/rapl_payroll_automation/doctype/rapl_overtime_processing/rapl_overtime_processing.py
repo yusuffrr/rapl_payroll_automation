@@ -73,6 +73,10 @@ class RAPLOvertimeProcessing(Document):
 				continue
 			if additional_salary_already_exists(row.employee, settings.overtime_salary_component, self.end_date, self.start_date):
 				errors.append(f"{row.employee}: already processed for this period, skipped")
+				# Never keep a link to a record this document did not create
+				# (e.g. copied from the document that did).
+				if row.additional_salary:
+					row.db_set("additional_salary", None, update_modified=False)
 				continue
 			doc = create_and_submit_additional_salary(
 				row.employee, settings.overtime_salary_component, row.amount, self.start_date, self.end_date

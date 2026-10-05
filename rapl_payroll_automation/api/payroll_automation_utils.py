@@ -245,8 +245,15 @@ def create_and_submit_additional_salary(employee, salary_component, amount, star
 	overwrite; the record simply appends as a new row when the Salary Slip is
 	later created (verified in update_component_row()).
 	"""
-	if not company:
-		company = frappe.db.get_value("Employee", employee, "company")
+	emp = frappe.db.get_value("Employee", employee, ["company", "relieving_date"], as_dict=True) or {}
+	company = company or emp.get("company")
+
+	# HRMS refuses an Additional Salary dated after the relieving date, which
+	# rolled back the WHOLE month's submit for one leaver. Date it on their
+	# last day instead -- still inside their final payroll period.
+	payroll_date = getdate(end_date)
+	if emp.get("relieving_date") and getdate(emp["relieving_date"]) < payroll_date:
+		payroll_date = getdate(emp["relieving_date"])
 
 	doc = frappe.get_doc(
 		{
@@ -255,7 +262,7 @@ def create_and_submit_additional_salary(employee, salary_component, amount, star
 			"company": company,
 			"salary_component": salary_component,
 			"amount": amount,
-			"payroll_date": end_date,
+			"payroll_date": payroll_date,
 			"overwrite_salary_structure_amount": 0,
 		}
 	)

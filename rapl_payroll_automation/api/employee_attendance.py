@@ -37,7 +37,7 @@ from rapl_payroll_automation.api.attendance_data import (
 	summarise,
 )
 from rapl_payroll_automation.api.ot_engine import is_ot_eligible
-from rapl_payroll_automation.api.payroll_math import pay_rates, round_half_up
+from rapl_payroll_automation.api.payroll_math import ot_amount, pay_rates, round_half_up
 from rapl_payroll_automation.api.payroll_automation_utils import (
 	get_automation_settings,
 	get_grade_ot_rule,
@@ -117,7 +117,10 @@ def _pay_context(employee, start_date, end_date, settings):
 		"ot_working_days": r["ot_days"],
 		"per_day_rate": r["late_per_day"],
 		"ot_per_day_rate": r["ot_per_day"],
-		"hourly_rate": r["hourly"],
+		# No OT rule for the grade: Processing adds such employees with 0 and
+		# asks for a manual edit, so the statement must not promise OT money.
+		"hourly_rate": 0 if rule is None else r["hourly"],
+		"ot_rule_missing": rule is None,
 		"ot_hours_divisor": flt(settings.ot_hours_divisor),
 		"grade": grade,
 	}
@@ -175,8 +178,11 @@ def _build_statement(employee, start_date, end_date, show_money, settings):
 	# the two must agree.
 	statement["totals"] = {
 		"overtime_hours": summary["overtime_hours"],
-		"overtime_amount": round_half_up(
-			flt(summary.get("overtime_hours_exact", summary["overtime_hours"])) * flt(pay["hourly_rate"])
+		# Exactly as RAPL Overtime Processing prices it: whole seconds x rate,
+		# rounded once.
+		"overtime_amount": ot_amount(
+			round_half_up(flt(summary.get("overtime_hours_exact", summary["overtime_hours"])) * 3600),
+			pay["hourly_rate"],
 		),
 		"overtime_amount_daily_sum": round_half_up(ot_total),
 		"late_deduction_amount": round_half_up(

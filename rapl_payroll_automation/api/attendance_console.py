@@ -517,6 +517,7 @@ def apply_edits(changes, confirm_processed=0):
 	if not isinstance(changes, list):
 		frappe.throw("changes must be a list")
 	settings = get_automation_settings()
+	bands = get_band_definitions(settings)
 	applied, failed = [], []
 	confirmed = cint(_json(confirm_processed, 0))
 
@@ -579,11 +580,19 @@ def apply_edits(changes, confirm_processed=0):
 		# A day backed by a real Leave Application is decided by that
 		# application. Overwriting it to Absent would deduct the day AND keep
 		# the leave consumed.
-		if new_status and new_status != current.status and current.leave_application:
+		# Same lock as the screen: a day decided by leave -- a Leave
+		# Application, or a leave type that is not the automation's own
+		# Half Day marker -- keeps its status. Bulk Apply used to get past it.
+		genuine_leave = bool(current.leave_type) and (
+			bool(current.leave_application) or current.leave_type != settings.half_day_leave_type
+		)
+		if new_status and new_status != current.status and genuine_leave:
 			failed.append({
 				"name": name,
-				"error": f"Backed by Leave Application {current.leave_application}. "
-						 "Cancel that application instead of changing the status.",
+				"error": (f"Backed by Leave Application {current.leave_application}. "
+						  "Cancel that application instead of changing the status.")
+						 if current.leave_application else
+						 f"Marked as {current.leave_type}. Change it through a Leave Application.",
 			})
 			continue
 		if "custom_attendance_type" in change:
@@ -591,6 +600,14 @@ def apply_edits(changes, confirm_processed=0):
 			if visit and visit not in VISIT_TYPES:
 				failed.append({"name": name, "error": f"Unknown visit type '{visit}'"})
 				continue
+		pin_error = next(
+			(err for f in OVERRIDE_FIELDS if f in change
+			 for err in [_check_pin(f, change[f], bands)] if err),
+			None,
+		)
+		if pin_error:
+			failed.append({"name": name, "error": pin_error})
+			continue
 
 		# Already paid? additional_salary_already_exists() makes
 		# get_employees() SKIP an employee whose OT or Late Mark is already
@@ -801,6 +818,29 @@ def apply_edits(changes, confirm_processed=0):
 	return {"applied": applied, "failed": failed}
 
 
+
+def _check_pin(field, value, bands=None):
+	"""Validate a day-level pin. Returns an error message or None.
+
+	Overtime: 0-24 hours (a negative pin made the Console show less OT than
+	Processing pays -- it clamps at 0 -- and an absurd one was paid as typed).
+	Band: an existing band label, or "__none__" for a waived late mark.
+	"""
+	if value in (None, "", "__none__"):
+		return None
+	if field.endswith("_hours"):
+		try:
+			hours = float(value)
+		except (TypeError, ValueError):
+			return f"Overtime '{value}' is not a number"
+		if not 0 <= hours <= 24:
+			return "Overtime must be between 0:00 and 24:00"
+		return None
+	labels = {b["label"] for b in (bands or [])}
+	if labels and value not in labels:
+		return f"Unknown late mark band '{value}'"
+	return None
+
 def _processed_components(employee, attendance_date, settings):
 	"""Which components are already submitted for the month containing this date."""
 	from frappe.utils import get_first_day
@@ -849,14 +889,14 @@ def _audit(name, before, after):
 
 
 @frappe.whitelist()
-def recalculate(names):
+def recalculate(names, confirm_processed=0):
 	"""Re-apply the rules without changing punches -- clears drift on records
 	corrected outside the app."""
 	_require_hr("write")
 	names = _json(names, [])
 	if not isinstance(names, list):
 		frappe.throw("names must be a list")
-	return apply_edits([{"name": n} for n in names if n])
+	return apply_edits([{"name": n} for n in names if n], confirm_processed=confirm_processed)
 
 
 # ---------------------------------------------------------------- create
@@ -1486,18 +1526,32 @@ def _build_net_pay_preview(employee, start_date, end_date, today, settings,
 		if get_additional_salary_total(employee, component, start_date, end_date) > 0:
 			already_submitted.append({"component": component, "kind": key})
 			continue
-		slip.append(table, {
+		comp = frappe.db.get_value(
+			"Salary Component", component,
+			["salary_component_abbr", "depends_on_payment_days", "variable_based_on_taxable_salary"],
+			as_dict=True,
+		) or {}
+		if cint(comp.get("variable_based_on_taxable_salary")):
+			continue   # a tax component is never injected (HRMS looks it up by name)
+		# Shaped EXACTLY like the row HRMS update_component_row() builds for a
+		# submitted, non-overwrite Additional Salary: default_amount 0, the
+		# money in additional_amount, the component's own "Depends on Payment
+		# Days", then HRMS's own proration applied to row.amount. The preview
+		# used to hard-code "not prorated", so with that box ticked it promised
+		# more overtime -- and a bigger deduction -- than the slip pays.
+		# additional_salary must be non-empty for HRMS to treat the row as one;
+		# the placeholder is never saved (the whole preview is rolled back).
+		row = slip.append(table, {
 			"salary_component": component,
-			"abbr": frappe.db.get_value("Salary Component", component,
-										"salary_component_abbr") or component[:3],
+			"abbr": comp.get("salary_component_abbr") or component[:3],
 			"amount": amount,
-			"default_amount": amount,
+			"default_amount": 0,
 			"additional_amount": amount,
+			"additional_salary": "Console preview (not saved)",
 			"is_additional_component": 1,
-			# Not prorated by payment days: an overtime or recovery figure is an
-			# absolute amount, not a monthly rate.
-			"depends_on_payment_days": 0,
+			"depends_on_payment_days": cint(comp.get("depends_on_payment_days")),
 		})
+		slip.update_component_amount_based_on_payment_days(row)
 		injected.append({"table": table, "component": component, "amount": amount, "kind": key})
 
 	# skip_tax_breakup_computation: the year-to-date / tax-breakup figures are

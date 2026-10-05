@@ -337,7 +337,10 @@ def _add_record_flags(row, record, day, is_holiday, holiday_dates, settings, emp
 				compute_day_ot(
 					in_time=record.in_time,
 					out_time=record.out_time,
-					working_hours=expected_working_hours,
+					# EXACT hours (the stored Float keeps full precision), as
+					# Processing passes them -- the 2-dp display figure lost up
+					# to 18 s on every holiday worked.
+					working_hours=flt(record.working_hours) or None,
 					attendance_date=day,
 					status=record.status,
 					shift=resolve_shift(record.shift, settings),
