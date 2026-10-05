@@ -11,8 +11,15 @@ from frappe.utils import flt, getdate
 
 def validate_processing_doc(doc):
 	"""Server-side checks the form's JavaScript used to be the only guard for."""
-	if doc.start_date and doc.end_date and getdate(doc.start_date) > getdate(doc.end_date):
-		frappe.throw(_("Start Date cannot be after End Date."))
+	if doc.start_date and doc.end_date:
+		start, end = getdate(doc.start_date), getdate(doc.end_date)
+		if start > end:
+			frappe.throw(_("Start Date cannot be after End Date."))
+		# Rates are a month's salary over that month's days, and the
+		# Additional Salary lands in one payroll month: a period must not
+		# straddle two months.
+		if (start.year, start.month) != (end.year, end.month):
+			frappe.throw(_("Start and End Date must be in the same month."))
 
 	seen = set()
 	for row in doc.entries:

@@ -61,11 +61,16 @@ frappe.pages["employee-attendance"].on_page_load = function (wrapper) {
 		method: "rapl_payroll_automation.api.employee_attendance.get_selectable_employees",
 		callback(r) {
 			state.employees = r.message || [];
-			const options = state.employees.map((e) => `${e.name} :: ${e.employee_name}`);
-			if (state.employees.length > 1) options.unshift(__("All employees"));
+			// {value, label} with the label ESCAPED: a Select renders option
+			// labels as HTML, so a name like <img onerror=...> would run.
+			const options = state.employees.map((e) => ({
+				value: e.name,
+				label: frappe.utils.escape_html(`${e.name} :: ${e.employee_name || ""}`),
+			}));
+			if (state.employees.length > 1) options.unshift({ value: "__all__", label: __("All employees") });
 			employee_field.df.options = options;
 			employee_field.refresh();
-			if (options.length) employee_field.set_value(options[0]);
+			if (options.length) employee_field.set_value(options[0].value);
 		},
 	});
 
@@ -123,7 +128,7 @@ frappe.pages["employee-attendance"].on_page_load = function (wrapper) {
 		$body.find(".ea-out").empty();
 		status(__("Loading..."));
 
-		const all = selected === __("All employees");
+		const all = selected === "__all__";
 		if (all) {
 			frappe.call({
 				method: "rapl_payroll_automation.api.employee_attendance.get_bulk_statements",
@@ -134,6 +139,7 @@ frappe.pages["employee-attendance"].on_page_load = function (wrapper) {
 				},
 				freeze: true,
 				freeze_message: __("Building statements..."),
+				error() { status(__("Could not load. Check the Error Log, then try again.")); },
 				callback(r) {
 					state.statements = r.message || [];
 					render(state.statements);
@@ -143,11 +149,12 @@ frappe.pages["employee-attendance"].on_page_load = function (wrapper) {
 			frappe.call({
 				method: "rapl_payroll_automation.api.employee_attendance.get_statement",
 				args: {
-					employee: selected.split(" :: ")[0],
+					employee: selected,
 					start_date: range.start,
 					end_date: range.end,
 				},
 				freeze: true,
+				error() { status(__("Could not load. Check the Error Log, then try again.")); },
 				callback(r) {
 					state.statements = r.message ? [r.message] : [];
 					render(state.statements);
@@ -183,8 +190,9 @@ frappe.pages["employee-attendance"].on_page_load = function (wrapper) {
 		const rate_block = show
 			? `<div class="ea-rates">
 					<div><span>${__("Monthly salary")}</span><b>${money(pay.monthly_salary)}</b></div>
-					<div><span>${__("Per day")} &middot; ${pay.ot_working_days} ${__("days")}</span><b>${money(pay.per_day_rate)}</b></div>
-					<div><span>${__("Per hour")} &middot; &divide;${pay.ot_working_days ? "" : ""}8</span><b>${money(pay.hourly_rate)}</b></div>
+					<div><span>${__("Per day (late mark)")} &middot; ${__("all days")}</span><b>${money(pay.per_day_rate)}</b></div>
+					<div><span>${__("OT per day")} &middot; ${pay.ot_working_days} ${__("days")}</span><b>${money(pay.ot_per_day_rate)}</b></div>
+					<div><span>${__("OT per hour")} &middot; &divide;${pay.ot_hours_divisor || 8}</span><b>${money(pay.hourly_rate)}</b></div>
 				</div>`
 			: "";
 

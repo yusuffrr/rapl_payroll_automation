@@ -22,6 +22,8 @@ from rapl_payroll_automation.api.payroll_automation_utils import (
 	get_employee_holiday_dates,
 	get_automation_settings,
 	get_grade_ot_rule,
+	get_employee_holiday_rows,
+	get_salary_month,
 	get_total_working_days,
 	get_employee_weekly_off_dates,
 )
@@ -51,7 +53,9 @@ class RAPLOvertimeProcessing(Document):
 		if not self.start_date:
 			frappe.throw(_("Set Start Date before saving (required to generate the name)."))
 		base_name = getdate(self.start_date).strftime("%B %Y") + " - Overtime"
-		self.name = append_number_if_name_exists("RAPL Overtime Processing", base_name, separator="-")
+		# " #" not "-": Frappe names an amendment "<name>-1", which collided
+		# with a second same-month document named "<name>-1".
+		self.name = append_number_if_name_exists("RAPL Overtime Processing", base_name, separator=" #")
 	def validate(self):
 		validate_processing_doc(self)
 
@@ -96,6 +100,8 @@ def get_employee_ot_details(docname, employee):
 	doc = frappe.get_doc("RAPL Overtime Processing", docname)
 	# get_doc does not check permission; rates expose salary.
 	doc.check_permission("write")
+	if not frappe.has_permission("Employee", "read", doc=employee):
+		frappe.throw(_("Not permitted for employee {0}").format(employee), frappe.PermissionError)
 	settings = get_automation_settings()
 	errors = []
 	result = _compute_employee_overtime(employee, doc.start_date, doc.end_date, settings, errors)
@@ -161,6 +167,14 @@ def get_employees(docname, all_employees=False, employees=None):
 	# present. Previously this did `doc.entries = []` unconditionally,
 	# which silently destroyed manual entries every time any "Get
 	# Employees" button was clicked again. Fixed.
+	# Only employees the caller may see (User Permissions). get_all above and a
+	# client-sent list both ignore them, and each row exposes pay rates.
+	if employees:
+		allowed = set(frappe.get_list(
+			"Employee", filters={"name": ["in", list(employees)]}, pluck="name", limit_page_length=0
+		))
+		employees = [e for e in employees if e in allowed]
+
 	existing_employees = {row.employee for row in doc.entries}
 	errors = []
 	for emp in employees:
@@ -227,13 +241,18 @@ def _compute_employee_overtime(emp, start_date, end_date, settings, errors):
 		errors.append(f"{emp}: no OT rule configured for grade '{grade}', added with 0 (edit manually)")
 		return None
 
-	# Lists in force DURING the period (see payroll_automation_utils).
-	all_holidays = get_employee_holiday_dates(emp, start_date, end_date)
-	sunday_dates = get_employee_weekly_off_dates(emp, start_date, end_date)
+	# Rates: the salary MONTH's days and weekly offs (not the period's).
+	# Holidays used to price each day: the lists in force DURING the period.
+	month_first, month_last, month_days = get_salary_month(start_date)
+	holiday_rows = get_employee_holiday_rows(emp, month_first, month_last)  # one lookup
+	all_holidays = {
+		getdate(r.holiday_date) for r in holiday_rows
+		if getdate(start_date) <= getdate(r.holiday_date) <= getdate(end_date)
+	}
+	sunday_dates = {getdate(r.holiday_date) for r in holiday_rows if r.weekly_off}
 
-	base_working_days = get_total_working_days(start_date, end_date)
 	rates = pay_rates(
-		monthly_salary, base_working_days, len(sunday_dates),
+		monthly_salary, month_days, len(sunday_dates),
 		bool(rule),
 		settings.ot_hours_divisor,
 	)
@@ -254,6 +273,11 @@ def _compute_employee_overtime(emp, start_date, end_date, settings, errors):
 	# status='Present', so every row here is a Present day.
 	total_ot_hours = 0.0
 	for day in get_attendance_for_employee(emp, start_date, end_date):
+		if cint(day.get("custom_overtime_manual")):
+			# HR pinned this day in the Console -- pay the pinned figure, and
+			# do it BEFORE computing, so a compute error cannot drop it.
+			total_ot_hours += max(flt(day.get("custom_overtime_hours")), 0)
+			continue
 		try:
 			ot_hours = compute_day_ot(
 				in_time=day.in_time,
@@ -265,9 +289,6 @@ def _compute_employee_overtime(emp, start_date, end_date, settings, errors):
 				settings=settings,
 				holiday_dates=all_holidays,
 			)
-			if cint(day.get("custom_overtime_manual")):
-				# HR pinned this day in the Console -- pay the pinned figure.
-				ot_hours = flt(day.get("custom_overtime_hours"))
 			# Add EXACT hours; round once, below. Rounding each day first
 			# (2 dp) loses up to 18 seconds a day, and for a repeated duration
 			# always in the same direction: 26 days of 47 min paid 20.28 h

@@ -106,7 +106,7 @@ frappe.ui.form.on("RAPL Overtime Processing Entry", {
 				frappe.model.set_value(cdt, cdn, "ot_rate", r.message.ot_rate);
 				frappe.model.set_value(cdt, cdn, "amount", r.message.ot_amount);
 				if (r.message.errors && r.message.errors.length) {
-					frappe.msgprint(r.message.errors.join("<br>"));
+					frappe.msgprint(r.message.errors.map((e) => frappe.utils.escape_html(String(e))).join("<br>"));
 				}
 			},
 		});

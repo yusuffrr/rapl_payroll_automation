@@ -16,6 +16,7 @@ from rapl_payroll_automation.api.payroll_automation_utils import (
 	additional_salary_already_exists,
 	create_and_submit_additional_salary,
 	get_automation_settings,
+	get_salary_month,
 	get_total_working_days,
 	time_to_seconds,
 )
@@ -37,7 +38,8 @@ class RAPLLateMarkProcessing(Document):
 		if not self.start_date:
 			frappe.throw(_("Set Start Date before saving (required to generate the name)."))
 		base_name = getdate(self.start_date).strftime("%B %Y") + " - Late Mark"
-		self.name = append_number_if_name_exists("RAPL Late Mark Processing", base_name, separator="-")
+		# " #" not "-": see RAPL Overtime Processing.autoname.
+		self.name = append_number_if_name_exists("RAPL Late Mark Processing", base_name, separator=" #")
 
 	def validate(self):
 		validate_processing_doc(self)
@@ -81,6 +83,7 @@ def get_band_labels(with_fractions=0):
 	frappe.db.get_doc on Settings -- a count edited before that returned, or a
 	user who cannot read Settings, priced the row at 0.
 	"""
+	frappe.has_permission("RAPL Late Mark Processing", "read", throw=True)
 	settings = get_automation_settings()
 	bands = sorted(settings.late_mark_bands, key=lambda r: time_to_seconds(r.from_time))
 	if cint(with_fractions):
@@ -129,9 +132,17 @@ def get_employees(docname, all_employees=False, employees=None):
 	# Preserve any existing rows (manual additions/edits, or a previous
 	# "Get Employees" run) -- only append rows for employees NOT already
 	# present.
+	# Only employees the caller may see (User Permissions). get_all above and a
+	# client-sent list both ignore them, and each row exposes pay rates.
+	if employees:
+		allowed = set(frappe.get_list(
+			"Employee", filters={"name": ["in", list(employees)]}, pluck="name", limit_page_length=0
+		))
+		employees = [e for e in employees if e in allowed]
+
 	existing_employees = {row.employee for row in doc.entries}
 	errors = []
-	working_days = get_total_working_days(start_date, end_date)
+	working_days = get_salary_month(start_date)[2]   # the MONTH's days, not the period's
 	bands = sorted(settings.late_mark_bands, key=lambda r: time_to_seconds(r.from_time))
 
 	for emp in employees:
@@ -256,8 +267,10 @@ def get_employee_late_mark_details(docname, employee):
 	doc = frappe.get_doc("RAPL Late Mark Processing", docname)
 	# get_doc does not check permission; rates expose salary.
 	doc.check_permission("write")
+	if not frappe.has_permission("Employee", "read", doc=employee):
+		frappe.throw(_("Not permitted for employee {0}").format(employee), frappe.PermissionError)
 	settings = get_automation_settings()
-	working_days = get_total_working_days(doc.start_date, doc.end_date)
+	working_days = get_salary_month(doc.start_date)[2]
 	bands = sorted(settings.late_mark_bands, key=lambda r: time_to_seconds(r.from_time))
 	result, err = _compute_employee_late_mark_details(employee, doc.start_date, doc.end_date, working_days, bands)
 	return {

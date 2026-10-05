@@ -41,6 +41,7 @@ from rapl_payroll_automation.api.payroll_math import pay_rates, round_half_up
 from rapl_payroll_automation.api.payroll_automation_utils import (
 	get_automation_settings,
 	get_grade_ot_rule,
+	get_salary_month,
 	get_total_working_days,
 	get_employee_weekly_off_dates,
 )
@@ -50,7 +51,9 @@ HR_ROLES = {"HR Manager", "HR User"}
 
 
 def _is_hr():
-	return bool(HR_ROLES & set(frappe.get_roles()))
+	"""HR role AND Attendance read -- the one test every entry point uses, so
+	the picker never offers what the statement call would then refuse."""
+	return bool(HR_ROLES & set(frappe.get_roles())) and bool(frappe.has_permission("Attendance", "read"))
 
 
 def _own_employee():
@@ -99,11 +102,12 @@ def _pay_context(employee, start_date, end_date, settings):
 	grade = frappe.db.get_value("Employee", employee, "grade")
 	rule = get_grade_ot_rule(settings, grade)
 
-	total_days = get_total_working_days(start_date, end_date)
+	# Rates use the salary MONTH (see payroll_automation_utils.get_salary_month).
+	month_first, month_last, total_days = get_salary_month(start_date)
 	sundays = []
 	exclude = bool(rule)
 	if exclude:
-		sundays = get_employee_weekly_off_dates(employee, start_date, end_date)
+		sundays = get_employee_weekly_off_dates(employee, month_first, month_last)
 	r = pay_rates(monthly, total_days, len(sundays), exclude, settings.ot_hours_divisor)
 
 	# per_day_rate = calendar-day rate (late mark / half day, as Late Mark
@@ -114,6 +118,7 @@ def _pay_context(employee, start_date, end_date, settings):
 		"per_day_rate": r["late_per_day"],
 		"ot_per_day_rate": r["ot_per_day"],
 		"hourly_rate": r["hourly"],
+		"ot_hours_divisor": flt(settings.ot_hours_divisor),
 		"grade": grade,
 	}
 

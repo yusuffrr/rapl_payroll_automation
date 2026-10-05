@@ -47,8 +47,11 @@
 .ea-foot > div > div { display: flex; justify-content: space-between; gap: 12px; }
 .ea-total { border-top: 1px solid var(--border-color); margin-top: 4px; padding-top: 4px; font-weight: 600; }
 
+/* Only on the statement page -- this file loads on every desk page. Scoped by
+   the route Frappe sets on <body>: a :has() test kept matching after leaving
+   the page, because Desk hides pages it has left rather than removing them. */
 @media print {
-	.page-head, .navbar, .page-actions, .layout-side-section { display: none !important; }
+	body[data-route="employee-attendance"] :is(.page-head, .navbar, .page-actions, .layout-side-section) { display: none !important; }
 	.ea-statement { margin-bottom: 0; }
 }
 

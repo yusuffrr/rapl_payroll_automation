@@ -150,7 +150,7 @@ frappe.ui.form.on("RAPL Late Mark Processing Entry", {
 				frappe.model.set_value(cdt, cdn, "per_day_rate", r.message.per_day_rate);
 				frappe.model.set_value(cdt, cdn, "amount", r.message.amount);
 				if (r.message.errors && r.message.errors.length) {
-					frappe.msgprint(r.message.errors.join("<br>"));
+					frappe.msgprint(r.message.errors.map((e) => frappe.utils.escape_html(String(e))).join("<br>"));
 				}
 			},
 		});

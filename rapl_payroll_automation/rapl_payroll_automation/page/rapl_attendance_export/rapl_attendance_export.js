@@ -134,6 +134,9 @@ frappe.pages["rapl-attendance-export"].on_page_load = function (wrapper) {
 // ─── Toggle Bulk Mode ─────────────────────────────────────────────────────────
 
 function toggle_bulk_mode(state, page, employee_field, bulk_btn) {
+    // The report on screen is cleared, so nothing from it may be exported.
+    state.data = {};
+    state.employees = [];
     if (state.is_bulk) {
         $(employee_field.wrapper).hide();
         $("#bulk-emp-selector").show();
@@ -162,7 +165,7 @@ function load_report(state, page, month_field, year_field, employee_field) {
 
     if (state.is_bulk) {
         $(".emp-checkbox:checked").each(function() {
-            employees.push({ id: $(this).val(), name: $(this).data("name") });
+            employees.push({ id: $(this).val(), name: String($(this).attr("data-name") || "") });
         });
         if (!employees.length) {
             frappe.msgprint(__("Please select at least one employee."));
@@ -396,9 +399,18 @@ function load_html2pdf(callback) {
 
 function load_sheetjs(callback) {
     if (window.XLSX) { callback(); return; }
+    // One download at a time: a second click while loading used to add a
+    // second script tag and save the file twice.
+    if (window._rapl_sheetjs_loading) return;
+    window._rapl_sheetjs_loading = true;
     let script = document.createElement("script");
     script.src = "https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js";
-    script.onload = callback;
+    script.onload = function () { window._rapl_sheetjs_loading = false; callback(); };
+    script.onerror = function () {
+        window._rapl_sheetjs_loading = false;
+        script.remove();
+        frappe.msgprint(__("Could not load the Excel library. Check the internet connection and try again."));
+    };
     document.head.appendChild(script);
 }
 

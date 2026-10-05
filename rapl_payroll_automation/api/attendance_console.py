@@ -52,6 +52,7 @@ from rapl_payroll_automation.api.payroll_automation_utils import (
 	get_employee_holiday_dates,
 	get_employee_weekly_off_dates,
 	get_grade_ot_rule,
+	get_salary_month,
 	get_total_working_days,
 	get_weekly_off_dates,
 )
@@ -408,10 +409,10 @@ def _entry_preview(emp, start_date, end_date, summary, bands, settings, pre=None
 		monthly = flt(frappe.db.get_value("Employee", emp.name, settings.ot_rate_base_fieldname))
 	rule = get_grade_ot_rule(settings, emp.grade)
 
-	total_days = get_total_working_days(start_date, end_date)
+	month_first, month_last, total_days = get_salary_month(start_date)
 	sundays = 0
 	if rule:
-		sundays = len(get_employee_weekly_off_dates(emp.name, start_date, end_date))
+		sundays = len(get_employee_weekly_off_dates(emp.name, month_first, month_last))
 
 	rates = pay_rates(monthly, total_days, sundays, bool(rule), settings.ot_hours_divisor)
 	# Processing adds an employee whose grade has no OT rule with 0 hours/rate
@@ -904,6 +905,11 @@ def create_attendance(rows):
 			doc.employee = row["employee"]
 			doc.attendance_date = getdate(row["attendance_date"])
 			doc.status = row.get("status") or "Present"
+			# Same list as apply_edits. "On Leave" with no Leave Application
+			# passes Attendance's own validation and becomes a paid day that
+			# uses no leave balance -- leave is created via Create leave.
+			if doc.status not in CONSOLE_STATUSES:
+				raise frappe.ValidationError(f"Status '{doc.status}' cannot be set here")
 			# Times are combined with the date HERE, not in the browser. The
 			# dialog sends a bare "HH:MM"; concatenating it client-side was
 			# fragile and silently produced nulls, creating records with no
@@ -964,9 +970,12 @@ def _existing_draft(doctype, start_date, end_date):
 	)
 
 
-_OVERRIDE_KEYS = {"ot_hours_hhmm", "ot_rate", "amount", "late_amount", "per_day_rate"} | {
-	f"band_{i}_count" for i in range(1, 6)
-}
+# Which Console override keys belong to which draft. The overtime amount is
+# keyed "amount" and the late-mark amount "late_amount" -- one employee can
+# carry both, so they must never be read across.
+OT_OVERRIDE_KEYS = {"ot_hours_hhmm", "ot_rate", "amount"}
+LATE_OVERRIDE_KEYS = {"late_amount", "per_day_rate"} | {f"band_{i}_count" for i in range(1, 6)}
+_OVERRIDE_KEYS = OT_OVERRIDE_KEYS | LATE_OVERRIDE_KEYS
 
 
 def _clean_overrides(overrides):
@@ -1011,9 +1020,10 @@ def _apply_overrides(doc, kind, overrides, bands):
 	touched = []
 	by_employee = {row.employee: row for row in doc.entries}
 
+	kind_keys = OT_OVERRIDE_KEYS if kind == "overtime" else LATE_OVERRIDE_KEYS
 	for employee, values in overrides.items():
 		row = by_employee.get(employee)
-		if not row:
+		if not row or not (kind_keys & set(values)):
 			continue
 
 		if kind == "overtime":
@@ -1034,14 +1044,10 @@ def _apply_overrides(doc, kind, overrides, bands):
 					setattr(row, key, int(round_half_up(values[key] or 0)))
 			if values.get("per_day_rate") is not None:
 				row.per_day_rate = flt(values["per_day_rate"])
-			# The Console keys the late-mark total as "late_amount", not
-			# "amount": one employee has BOTH an overtime amount and a late-mark
-			# amount, and the override dict is keyed per employee, so a single
-			# "amount" key would collide. "amount" is still accepted as a
-			# fallback for any older payload.
+			# "late_amount" ONLY. "amount" is the OVERTIME amount; the old
+			# fallback to it wrote an employee's overtime pay into their
+			# late-mark deduction when only their OT had been edited.
 			late_amount = values.get("late_amount")
-			if late_amount is None:
-				late_amount = values.get("amount")
 			if late_amount is not None:
 				row.amount = flt(late_amount)
 			else:
@@ -1111,8 +1117,24 @@ def create_processing_draft(
 	# (get_employees' default mode) AND the overridden employees on top --
 	# merging them into one explicit list used to shrink a whole-month draft
 	# down to just the employees someone had typed an override for.
-	extra = sorted(set(overrides.keys())) if overrides else []
-	if overrides and not whole_workforce:
+	#
+	# Only overrides that belong to THIS draft count: an OT edit must not pull
+	# an employee into the late-mark draft, or the other way round.
+	kind_keys = OT_OVERRIDE_KEYS if kind == "overtime" else LATE_OVERRIDE_KEYS
+	overrides = {k: v for k, v in overrides.items() if kind_keys & set(v)}
+	extra = sorted(overrides)
+	if not whole_workforce:
+		if kind == "overtime":
+			# Naming an employee switches get_employees() to "exactly these",
+			# which skips the custom_ot check. Keep that bypass for someone
+			# whose OT was typed by hand; anyone else must be OT-eligible, or
+			# an employee the Console showed with 0 OT got full punch OT.
+			eligible = set(frappe.get_all(
+				"Employee", filters={"name": ["in", employees], "custom_ot": 1}, pluck="name"
+			))
+			employees = [e for e in employees if e in eligible or e in overrides]
+			if not employees and not extra:
+				frappe.throw("None of the selected employees is eligible for overtime (Employee: OT unticked).")
 		employees = sorted(set(employees) | set(extra))
 
 	name = _existing_draft(doctype, start_date, end_date)
@@ -1139,6 +1161,9 @@ def create_processing_draft(
 	)
 	get_employees = frappe.get_attr(f"{module}.get_employees")
 	already_there = {row.employee for row in doc.entries}
+	# get_employees() never recalculates a row already in the draft (it may
+	# hold hand edits). Say so, so "refreshed" is not read as "recalculated".
+	kept_rows = len(already_there)
 	if whole_workforce:
 		result = get_employees(doc.name, all_employees=False, employees=None)
 		if extra:
@@ -1170,6 +1195,7 @@ def create_processing_draft(
 		"reused": reused,
 		"rows_before": rows_before,
 		"rows_after": len(doc.entries),
+		"kept_rows": kept_rows,
 		"filtered": not whole_workforce,
 		"result": result,
 		"route": f"/app/{frappe.scrub(doctype).replace('_', '-')}/{doc.name}",
@@ -1434,7 +1460,11 @@ def _build_net_pay_preview(employee, start_date, end_date, today, settings,
 	# dated after the cut-off -- but every day after the cut-off is already
 	# removed as future_days. Take the future part out so it is not subtracted
 	# twice in a month that is still running.
-	lwp = max(flt(slip.leave_without_pay) - _lwp_days_after(employee, upto, last), 0)
+	lwp = max(
+		flt(slip.leave_without_pay)
+		- _lwp_days_after(employee, upto, last, holidays, include_holidays=include_holidays),
+		0,
+	)
 
 	native_payment_days = flt(slip.payment_days)
 	slip.payment_days = expected_payment_days(
@@ -1527,24 +1557,36 @@ def _build_net_pay_preview(employee, start_date, end_date, today, settings,
 	}
 
 
-def _lwp_days_after(employee, after, last):
-	"""Approved leave-without-pay days strictly after `after`, up to `last`."""
+def _lwp_days_after(employee, after, last, holidays=None, include_holidays=True):
+	"""Approved leave-without-pay days strictly after `after`, up to `last`.
+
+	Counted the way HRMS counts leave_without_pay: a holiday inside the leave
+	is NOT a leave day unless the Leave Type has "Include holidays" ticked.
+	"""
 	if after >= last:
 		return 0.0
-	lwp_types = frappe.get_all("Leave Type", filters={"is_lwp": 1}, pluck="name")
+	lwp_types = {
+		lt.name: cint(lt.include_holiday)
+		for lt in frappe.get_all("Leave Type", filters={"is_lwp": 1}, fields=["name", "include_holiday"])
+	}
 	if not lwp_types:
 		return 0.0
+	holidays = holidays or set()
 	total = 0.0
 	for la in frappe.get_all(
 		"Leave Application",
-		filters={"employee": employee, "leave_type": ["in", lwp_types], "docstatus": 1,
+		filters={"employee": employee, "leave_type": ["in", list(lwp_types)], "docstatus": 1,
 				 "status": "Approved", "to_date": [">", after], "from_date": ["<=", last]},
-		fields=["from_date", "to_date", "half_day", "half_day_date"],
+		fields=["leave_type", "from_date", "to_date", "half_day", "half_day_date"],
 	):
 		start = max(getdate(la.from_date), getdate(add_days(after, 1)))
 		end = min(getdate(la.to_date), getdate(last))
 		for i in range(date_diff(end, start) + 1):
 			day = getdate(add_days(start, i))
+			# HRMS: with "Include holidays in total working days" OFF, holidays
+			# are never working days, so never LWP -- whatever the Leave Type.
+			if day in holidays and not (include_holidays and lwp_types.get(la.leave_type)):
+				continue
 			if cint(la.half_day) and la.half_day_date and getdate(la.half_day_date) == day:
 				total += 0.5
 			else:

@@ -33,6 +33,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		netpay: new Map(),    // employee -> computed pay result
 		netopen: new Set(),   // employees whose breakdown is expanded
 		leave: new Map(),     // employee -> Set of ticked absent dates
+		netpay_busy: new Set(), // employees with a Compute net pay call running
 	};
 
 	const month_field = page.add_field({
@@ -126,12 +127,20 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 				end_date: range.end,
 				employees: employee ? JSON.stringify([employee]) : null,
 				only_flagged: filter_field.get_value() === __("Needs attention") ? 1 : 0,
-				advance_cutoff: cutoff_field.get_value() || null,
+				// Only a cut-off the user TYPED is sent. The auto-filled one
+				// belongs to the month it was loaded for; sending it again
+				// pinned September's cut-off onto October.
+				advance_cutoff: (cutoff_field.get_value() && cutoff_field.get_value() !== state.auto_cutoff)
+					? cutoff_field.get_value() : null,
 			},
 			freeze: true,
 			freeze_message: __("Reading attendance..."),
 			error() {
 				status(__("Could not load. Check the Error Log, then try again."));
+				// Nothing on screen to act on: hide the footer/bulk bar so their
+				// buttons cannot act on the previously loaded month.
+				state.data = null;
+				$body.find(".ac-foot, .ac-bulk").hide();
 			},
 			callback(r) {
 				// Summary overrides belong to one period and employee set. A
@@ -152,9 +161,12 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 				(state.data.groups || []).forEach((g) => {
 					state.adv.set(g.employee, new Set((g.advances || []).map((a) => a.name)));
 				});
-				if (state.data.advance_cutoff && !cutoff_field.get_value()) {
+				const typed_cutoff = cutoff_field.get_value() && cutoff_field.get_value() !== state.auto_cutoff;
+				if (state.data.advance_cutoff && !typed_cutoff) {
+					state.auto_cutoff = state.data.advance_cutoff;
 					cutoff_field.set_value(state.data.advance_cutoff);
 				}
+				refresh_derived_overrides();
 				if (state.data && state.data.groups.length === 1) {
 					state.expanded.add(state.data.groups[0].employee);
 				}
@@ -337,8 +349,9 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 						<span class="ea-cut">${__("Cut")} &minus;${format_currency(late_amount || 0)}</span>
 						<span class="ea-cut">${__("Advance")} &minus;${format_currency(advance_total(g))}</span>
 						<span class="ac-spacer"></span>
-						<button class="btn btn-xs ac-netpay" data-employee="${emp}">${
-							state.netpay.has(emp) ? __("Recompute") : __("Compute net pay")}</button>
+						<button class="btn btn-xs ac-netpay" data-employee="${emp}" ${state.netpay_busy.has(emp) ? "disabled" : ""}>${
+							state.netpay_busy.has(emp) ? __("Computing...")
+								: state.netpay.has(emp) ? __("Recompute") : __("Compute net pay")}</button>
 					</div>
 					${render_netpay(g)}
 				</td>
@@ -561,6 +574,14 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 
 	// A pending edit shows what was typed; otherwise the exact paid seconds
 	// from the server (falls back to the stored hours for older payloads).
+	function day_ot_hhmm_saved(att) {
+		if (att.overtime_seconds === undefined || att.overtime_seconds === null) {
+			return hhmm_from_seconds(flt(att.overtime_hours) * 3600);
+		}
+		if (att.overtime_manual && !flt(att.overtime_seconds)) return "0:00";
+		return hhmm_from_seconds(att.overtime_seconds);
+	}
+
 	function day_ot_hhmm(att) {
 		const pending = state.pending.get(att.name);
 		if (pending && "custom_overtime_hours" in pending) {
@@ -568,6 +589,9 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 				: hhmm_from_seconds(Math.round(flt(pending.custom_overtime_hours) * 3600));
 		}
 		if (att.overtime_seconds !== undefined && att.overtime_seconds !== null) {
+			// A pinned zero shows "0:00" so it is distinguishable from blank
+			// ("automatic").
+			if (att.overtime_manual && !flt(att.overtime_seconds)) return "0:00";
 			return hhmm_from_seconds(att.overtime_seconds);
 		}
 		return hhmm_from_seconds(flt(att.overtime_hours) * 3600);
@@ -643,11 +667,33 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 
 	$body.on("click", ".ac-emp-row", function (e) {
 		if ($(e.target).is("input, select, button")) return;
-		const employee = $(this).data("employee");
+		const employee = String($(this).attr("data-employee"));
 		if (state.expanded.has(employee)) state.expanded.delete(employee);
 		else state.expanded.add(employee);
 		render();
 	});
+
+	// Overrides keep only what was TYPED; an amount the Console derived from
+	// typed hours/rate is recomputed from the freshly loaded figures, so a
+	// reload after Apply cannot leave a stale amount to go into the draft.
+	function refresh_derived_overrides() {
+		const bands = state.data.bands || [];
+		state.overrides.forEach((o, employee) => {
+			const g = (state.data.groups || []).find((x) => x.employee === employee);
+			if (!g) return;
+			if (o._amount_auto) {
+				const secs = flt(ov(employee, "ot_hours_hhmm", g.entry.ot_hours_hhmm));
+				o.amount = Math.round(secs / 3600 * flt(ov(employee, "ot_rate", g.entry.ot_rate)));
+			}
+			if (o._late_auto) {
+				let fraction = 0;
+				bands.forEach((b, i) => {
+					fraction += flt(b.fraction) * flt(ov(employee, `band_${i + 1}_count`, g.entry.band_counts[b.label] || 0));
+				});
+				o.late_amount = Math.round(fraction * flt(ov(employee, "per_day_rate", g.entry.per_day_rate)));
+			}
+		});
+	}
 
 	$body.on("change", ".ac-sum", function () {
 		// Cascade copied from the doctype forms so the Console and the created
@@ -656,7 +702,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		//   rate    changed -> amount = round(hours x rate)
 		//   amount  changed -> stands alone (not recomputed until h:mm or rate move)
 		//   band count / per-day rate changed -> cut = round(sum(count x fraction) x per_day)
-		const employee = $(this).data("employee");
+		const employee = String($(this).attr("data-employee"));
 		const field = $(this).data("field");
 		const raw = $(this).val();
 		const g = state.data.groups.find((x) => x.employee === employee);
@@ -670,7 +716,18 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 				return render();
 			}
 			set_ov(employee, "ot_hours_hhmm", secs || 0);
+		} else if (field.startsWith("band_")) {
+			// Whole days only: 1.5 would price at 1.5 but be stored as 2.
+			if (raw !== "" && !/^\d+$/.test(String(raw).trim())) {
+				frappe.show_alert({ message: __("Band counts must be whole numbers (0 or more)"), indicator: "orange" });
+				return render();
+			}
+			set_ov(employee, field, flt(raw));
 		} else {
+			if (raw !== "" && (isNaN(parseFloat(raw)) || parseFloat(raw) < 0)) {
+				frappe.show_alert({ message: __("Enter a number of 0 or more"), indicator: "orange" });
+				return render();
+			}
 			set_ov(employee, field, flt(raw));
 		}
 
@@ -682,7 +739,10 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 
 		if (field === "ot_hours_hhmm" || field === "ot_rate") {
 			o.amount = Math.round(hours * rate);
+			o._amount_auto = true;   // derived -- recomputed after every reload
 		}
+		if (field === "amount") delete o._amount_auto;       // typed -- stands
+		if (field === "late_amount") delete o._late_auto;
 		if (field.startsWith("band_") || field === "per_day_rate") {
 			const per_day = flt(ov(employee, "per_day_rate", g.entry.per_day_rate));
 			let fraction = 0;
@@ -690,14 +750,16 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 				fraction += flt(b.fraction) * flt(ov(employee, `band_${i + 1}_count`, g.entry.band_counts[b.label] || 0));
 			});
 			o.late_amount = Math.round(fraction * per_day);
+			o._late_auto = true;
 		}
 		state.overrides.set(employee, o);
+		state.netpay.delete(employee);   // the net figure used the old amounts
 		render();
 	});
 
 	$body.on("change", ".ac-leave-pick", function (e) {
 		e.stopPropagation();
-		const emp = $(this).data("employee");
+		const emp = String($(this).attr("data-employee"));
 		const date = String($(this).data("date"));
 		const g = state.data.groups.find((x) => x.employee === emp);
 		const picked = leave_picked(emp);
@@ -725,7 +787,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 
 	$body.on("click", ".ac-leave-create", function (e) {
 		e.stopPropagation();
-		const emp = $(this).data("employee");
+		const emp = String($(this).attr("data-employee"));
 		const dates = Array.from(leave_picked(emp));
 		if (!dates.length) return;
 		frappe.confirm(
@@ -755,7 +817,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 
 	$body.on("click", ".ac-adv-head", function (e) {
 		e.stopPropagation();
-		const key = "adv:" + $(this).data("employee");
+		const key = "adv:" + String($(this).attr("data-employee"));
 		if (state.expanded.has(key)) state.expanded.delete(key);
 		else state.expanded.add(key);
 		render();
@@ -763,24 +825,32 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 
 	$body.on("click", ".ac-adv-pick", function (e) {
 		e.stopPropagation();
-		const emp = $(this).data("employee");
+		const emp = String($(this).attr("data-employee"));
 		const adv = $(this).data("advance");
 		const picked = state.adv.get(emp) || new Set();
 		if (this.checked) picked.add(adv);
 		else picked.delete(adv);
 		state.adv.set(emp, picked);
+		state.netpay.delete(emp);   // the net figure used the old advance total
 		render();
 	});
 
 	$body.on("click", ".ac-netpay", function (e) {
 		e.stopPropagation();
-		const emp = $(this).data("employee");
-		const g = state.data.groups.find((x) => x.employee === emp);
-		if (!g) return;
+		const emp = String($(this).attr("data-employee"));
+		const g = state.data && state.data.groups.find((x) => x.employee === emp);
+		if (!g) {
+			// Never fail silently -- this button used to do nothing at all for
+			// IDs like "75" (jQuery's .data() turned them into the number 75).
+			frappe.show_alert({ message: __("Reload the console and try again."), indicator: "orange" });
+			return;
+		}
 		const range = loaded_period();
 		const token = state.data && state.data.loaded_at;
 		const $btn = $(this);
-		if ($btn.prop("disabled")) return;
+		// A re-render recreates the button, so the busy flag lives in state.
+		if ($btn.prop("disabled") || state.netpay_busy.has(emp)) return;
+		state.netpay_busy.add(emp);
 		$btn.prop("disabled", true).text(__("Computing..."));
 		frappe.call({
 			method: "rapl_payroll_automation.api.attendance_console.compute_net_pay",
@@ -811,14 +881,17 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 				render();
 			},
 			always() {
+				state.netpay_busy.delete(emp);
 				$btn.prop("disabled", false);
+				// Not after a failed reload: that would replace its error message.
+				if (state.data) render();
 			},
 		});
 	});
 
 	$body.on("click", ".ac-pay-toggle", function (e) {
 		e.stopPropagation();
-		const emp = $(this).closest(".ac-netpay-bar").data("employee");
+		const emp = String($(this).closest(".ac-netpay-bar").attr("data-employee"));
 		if (state.netopen.has(emp)) state.netopen.delete(emp);
 		else state.netopen.add(emp);
 		render();
@@ -848,6 +921,20 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 			if (v !== "" && seconds_from_hhmm(v) === null) {
 				frappe.show_alert({ message: __("Use H:MM, e.g. 2:30"), indicator: "orange" });
 				$(this).val("");
+				return;
+			}
+			// Typed back exactly what was shown: not a change. The display drops
+			// seconds, so treating it as one would turn a pinned 4:43:48 into
+			// 4:43:00 (or pin an automatic day) without anyone meaning to.
+			if (v !== "" && v === day_ot_hhmm_saved(att)) {
+				delete entry.custom_overtime_hours;
+				if (Object.keys(entry).filter((k) => k !== "name" && k !== "modified").length === 0) {
+					state.pending.delete(name);
+					$tr.removeClass("ac-dirty");
+				} else {
+					state.pending.set(name, entry);
+				}
+				render_footer();
 				return;
 			}
 			entry.custom_overtime_hours = v === "" ? "" : seconds_from_hhmm(v) / 3600;
@@ -882,9 +969,24 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		const $out = $tr.find(".ac-out");
 		const $status = $tr.find(".ac-status");
 
-		entry.in_time = combine($tr, $in.val());
-		entry.out_time = combine($tr, $out.val());
-		if ($status.length) entry.status = $status.val();
+		// Send ONLY what changed. The boxes show HH:MM without seconds, so
+		// resending an untouched punch stored 22:43:48 as 22:43:00 -- moving
+		// overtime by up to 59 s and possibly a late mark across a band edge.
+		// The server leaves any field that is not sent exactly as it is.
+		const in_now = combine($tr, $in.val());
+		const out_now = combine($tr, $out.val());
+		if ((in_now || "") !== (hhmm(att.in_time) || "")) entry.in_time = in_now;
+		else delete entry.in_time;
+		if ((out_now || "") !== (hhmm(att.out_time) || "")) entry.out_time = out_now;
+		else delete entry.out_time;
+		if ($status.length && $status.val() !== att.status) entry.status = $status.val();
+		else delete entry.status;
+		if (Object.keys(entry).filter((k) => k !== "name" && k !== "modified").length === 0) {
+			state.pending.delete(name);
+			$tr.removeClass("ac-dirty");
+			render_footer();
+			return;
+		}
 
 		state.pending.set(name, entry);
 		$tr.addClass("ac-dirty");
@@ -952,7 +1054,6 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 			const entry = state.pending.get(name) || { name, modified: att.modified };
 			if (out) entry.out_time = String(out).trim();
 			if (st) entry.status = st;
-			if (!("in_time" in entry)) entry.in_time = hhmm(att.in_time) || null;
 			state.pending.set(name, entry);
 		});
 		render();
@@ -987,8 +1088,8 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 
 	$body.on("click", ".ac-create", function () {
 		const $tr = $(this).closest("tr");
-		const employee = $tr.data("employee");
-		const date = $tr.data("date");
+		const employee = String($tr.attr("data-employee"));
+		const date = String($tr.attr("data-date"));
 
 		const d = new frappe.ui.Dialog({
 			title: __("Create attendance"),
@@ -1037,7 +1138,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 							}
 						});
 						(res.failed || []).forEach((f) => frappe.msgprint({
-							title: __("Could not create"), indicator: "red", message: f.error,
+							title: __("Could not create"), indicator: "red", message: frappe.utils.escape_html(f.error || ""),
 						}));
 						do_load(loaded_period());
 					},
@@ -1174,11 +1275,16 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 					title: res.reused ? __("Draft refreshed") : __("Draft created"),
 					indicator: "blue",
 					message:
-						`<p><a href="${encodeURI(res.route)}" target="_blank">${frappe.utils.escape_html(res.name)}</a></p>` +
+						// get_form_link encodes the name: drafts can be named "... #1", and an
+						// unencoded "#" made the link open the FIRST draft of the month.
+						`<p><a href="${frappe.utils.get_form_link(res.doctype, res.name)}" target="_blank">${frappe.utils.escape_html(res.name)}</a></p>` +
 						`<p class="text-muted">${__("Rows: {0} &rarr; {1}", [res.rows_before, res.rows_after])}` +
 						(res.filtered ? ` &middot; ${__("filtered")}` : "") +
 						(overridden.length ? ` &middot; ${__("{0} manual override(s) applied", [overridden.length])}` : "") +
 						"</p>" +
+						(res.reused && res.kept_rows
+							? `<p class="text-muted">${__("{0} row(s) already in this draft were kept as they were, not recalculated. To rebuild them from current attendance, delete those rows (or the draft) and create it again.", [res.kept_rows])}</p>`
+							: "") +
 						(errors.length
 							? `<div class="text-muted">${errors.map((e) => frappe.utils.escape_html(e)).join("<br>")}</div>`
 							: ""),
@@ -1210,7 +1316,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 							(res.created || []).map((c) =>
 								`<div><a href="${encodeURI(c.route)}" target="_blank">${frappe.utils.escape_html(c.name)}</a> &mdash; ${frappe.utils.escape_html(c.advance)} ${format_currency(c.amount)}</div>`).join("") +
 							(res.failed || []).map((f) =>
-								`<div class="text-muted">${f.advance}: ${frappe.utils.escape_html(f.error)}</div>`).join(""),
+								`<div class="text-muted">${frappe.utils.escape_html(f.advance || "")}: ${frappe.utils.escape_html(f.error || "")}</div>`).join(""),
 					});
 					do_load(loaded_period());
 				},

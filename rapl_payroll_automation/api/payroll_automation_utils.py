@@ -146,6 +146,20 @@ def get_employee_weekly_off_dates(employee, start_date, end_date):
 	}
 
 
+def get_salary_month(any_date):
+	"""(first_day, last_day, days) of the calendar month containing any_date.
+
+	Per-day and per-hour RATES are always a month's salary over that MONTH's
+	days -- never over the length of whatever period is being processed. A
+	1-15 run divided by 15 and paid every late mark and overtime hour at twice
+	the rate.
+	"""
+	from frappe.utils import get_first_day, get_last_day
+
+	first, last = get_first_day(any_date), get_last_day(any_date)
+	return first, last, date_diff(last, first) + 1
+
+
 def get_total_working_days(start_date, end_date):
 	"""
 	Matches native get_working_days_details() exactly for RAPL's settings

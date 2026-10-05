@@ -176,11 +176,13 @@ class OvertimeTotals(unittest.TestCase):
 		out = []
 		for i in range(days):
 			exact = minutes_each / 60
-			att = {"status": "Present", "overtime_hours": round(exact, 2),
+			att = {"status": "Present", "overtime_hours": round(exact, 2), "docstatus": 1,
 				   "expected_overtime_exact": exact, "overtime_manual": False,
+				   "overtime_seconds": round(minutes_each * 60),
 				   "late_mark_band": None, "half_day_status": None}
 			if pinned and i == 0:
-				att.update(overtime_manual=True, overtime_hours=pinned)
+				att.update(overtime_manual=True, overtime_hours=pinned,
+						   overtime_seconds=round(pinned * 3600))
 			out.append({"date": f"2026-09-{i + 1:02d}", "flags": [], "is_holiday": False,
 						"in_service": True, "is_future": False, "attendance": att})
 		return out
@@ -189,6 +191,15 @@ class OvertimeTotals(unittest.TestCase):
 		s = attendance_data.summarise(self.rows(47, 26), settings(), dt.date(2026, 10, 5))
 		# 26 x 47 min = 1222 min = 20.3667 h. Per-day rounding gave 20.28.
 		self.assertEqual(s["overtime_hours"], 20.37)
+
+	def test_drafts_and_leave_day_bands_not_counted(self):
+		rows = self.rows(60, 3)
+		rows[0]["attendance"]["docstatus"] = 0                      # draft: shown, not paid
+		rows[1]["attendance"].update(status="On Leave", late_mark_band="L1")
+		rows[2]["attendance"].update(late_mark_band="L1")
+		s = attendance_data.summarise(rows, settings(), dt.date(2026, 10, 5))
+		self.assertEqual(s["overtime_hours"], 2.0)                   # drafts excluded
+		self.assertEqual(s["band_counts"], {"L1": 1})                # leave-day band excluded
 
 	def test_pinned_day_uses_pinned_value(self):
 		s = attendance_data.summarise(self.rows(60, 3, pinned=2.5), settings(), dt.date(2026, 10, 5))
@@ -397,3 +408,42 @@ class DisplayText(unittest.TestCase):
 		self.assertEqual(attendance_data.plain_text(raw), "Krishna Janmashtami")
 		self.assertEqual(attendance_data.plain_text("<p>Eid &amp; Diwali</p>"), "Eid & Diwali")
 		self.assertIsNone(attendance_data.plain_text(None))
+
+
+class DraftOverrides(unittest.TestCase):
+	"""Console overrides land on the right draft and only there."""
+
+	class Doc(types.SimpleNamespace):
+		def save(self):
+			self.saved = True
+
+	def late_doc(self):
+		row = types.SimpleNamespace(employee="E1", band_1_count=2, band_2_count=0,
+									per_day_rate=500.0, amount=250.0)
+		return self.Doc(entries=[row])
+
+	def test_ot_amount_never_becomes_late_deduction(self):
+		doc = self.late_doc()
+		bands = [{"fraction": 0.25}, {"fraction": 0.5}]
+		touched = ac._apply_overrides(doc, "late_mark", {"E1": {"amount": 2083.0}}, bands)
+		self.assertEqual(touched, [])                 # an OT-only edit is not a late-mark edit
+		self.assertEqual(doc.entries[0].amount, 250.0)
+
+	def test_late_override_applies(self):
+		doc = self.late_doc()
+		bands = [{"fraction": 0.25}, {"fraction": 0.5}]
+		ac._apply_overrides(doc, "late_mark", {"E1": {"band_1_count": 4}}, bands)
+		self.assertEqual(doc.entries[0].amount, 500)  # 4 x 0.25 x 500, rounded once
+
+
+class SalaryMonth(unittest.TestCase):
+	def test_rates_use_the_month_not_the_period(self):
+		self.assertEqual(pau.get_salary_month("2026-10-15"),
+						 (dt.date(2026, 10, 1), dt.date(2026, 10, 31), 31))
+		self.assertEqual(pau.get_salary_month("2028-02-10")[2], 29)
+
+	def test_processing_period_must_be_one_month(self):
+		doc = ns(start_date="2026-10-20", end_date="2026-11-05", entries=[])
+		with self.assertRaises(frappe.ValidationError):
+			processing_common.validate_processing_doc(doc)
+		processing_common.validate_processing_doc(ns(start_date="2026-10-01", end_date="2026-10-15", entries=[]))

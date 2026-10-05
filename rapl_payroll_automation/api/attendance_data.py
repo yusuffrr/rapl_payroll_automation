@@ -25,7 +25,7 @@
 # is precisely the bug this app spent a month unwinding.
 
 import frappe
-from frappe.utils import flt, get_datetime, getdate, time_diff_in_hours
+from frappe.utils import cint, flt, get_datetime, getdate, time_diff_in_hours
 
 from rapl_payroll_automation.api.attendance_automation import (
 	is_early_exit,
@@ -363,6 +363,8 @@ def _add_record_flags(row, record, day, is_holiday, holiday_dates, settings, emp
 	# stored custom_overtime_hours is rounded to 0.01 h (36 s), so turning it
 	# back into h:mm showed 22:43 out as 4:44 of overtime instead of 4:43.
 	if record.custom_overtime_manual or expected_ot_exact is None:
+		# Pinned hours are stored from whole seconds (h:mm / 3600), so x3600
+		# gives those seconds back.
 		att["overtime_seconds"] = round_half_up(flt(record.custom_overtime_hours) * 3600)
 	else:
 		att["overtime_seconds"] = round_half_up(max(flt(expected_ot_exact), 0) * 3600)
@@ -404,6 +406,7 @@ def summarise(rows, settings=None, today=None):
 	"""
 	settings = settings or get_automation_settings()
 	today = today or getdate()
+	late_only_present = cint(settings.get("count_late_marks_only_when_present", 1))
 
 	summary = {
 		"present": 0, "half_day": 0, "absent": 0, "on_leave": 0,
@@ -439,17 +442,25 @@ def summarise(rows, settings=None, today=None):
 		if status_key:
 			summary[status_key] += 1
 
+		# Money totals mirror what the processing documents PAY: submitted
+		# records only (a draft is shown for editing but is not paid yet).
+		if att.get("docstatus") != 1:
+			continue
+
 		# EXACT hours, the same figure RAPL Overtime Processing pays from
-		# (recomputed from punches; a pinned day uses its pinned value).
+		# (recomputed from punches; a pinned day uses its exact pinned value).
 		# Adding the 2-dp day figures instead built in a bias: 47 minutes is
 		# 0.7833 h, shown as 0.78, and 26 such days lost 0.09 h of pay.
-		exact = att.get("expected_overtime_exact")
-		if att.get("overtime_manual") or exact is None:
-			summary["overtime_hours"] += flt(att["overtime_hours"])
+		if att.get("overtime_seconds") is not None:
+			summary["overtime_hours"] += flt(att["overtime_seconds"]) / 3600
 		else:
-			summary["overtime_hours"] += max(flt(exact), 0)
+			summary["overtime_hours"] += flt(att["overtime_hours"])
+
+		# Late Mark Processing counts a band only on Present / Half Day when
+		# "count late marks only when present" is on (the default) -- e.g. a
+		# band left on a day later turned into approved leave is not paid.
 		band = att["late_mark_band"]
-		if band:
+		if band and (not late_only_present or att["status"] in ("Present", "Half Day")):
 			summary["band_counts"][band] = summary["band_counts"].get(band, 0) + 1
 
 	# Rounded ONCE, after adding. The day rows show 2-dp figures, so their

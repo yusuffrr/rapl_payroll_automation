@@ -76,8 +76,14 @@ def _employee_rows(employees):
 	return frappe.get_all(
 		"Employee",
 		filters={"name": ["in", list(employees)]},
-		fields=["name", "employee_name", "grade", "custom_monthly_salary"],
+		fields=["name", "employee_name", "grade", f"{_salary_field()} as custom_monthly_salary"],
 	)
+
+
+def _salary_field():
+	"""The Employee field the rates are based on (Settings), not a literal."""
+	field = frappe.get_cached_doc("RAPL Payroll Automation Settings").get("ot_rate_base_fieldname")
+	return field if field and field.replace("_", "").isalnum() else "custom_monthly_salary"
 
 
 def _check_missing_grade_rule(start_date, end_date):
