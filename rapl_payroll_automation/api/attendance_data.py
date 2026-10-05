@@ -152,7 +152,7 @@ def build_month_rows(employee, start_date, end_date, settings=None):
 
 	# The list(s) in force DURING the period, not the one assigned today.
 	holiday_names = {
-		getdate(h.holiday_date): {"description": h.description, "weekly_off": bool(h.weekly_off)}
+		getdate(h.holiday_date): {"description": plain_text(h.description), "weekly_off": bool(h.weekly_off)}
 		for h in get_employee_holiday_rows(employee, start_date, end_date)
 	}
 	holiday_dates = set(holiday_names)
@@ -358,6 +358,14 @@ def _add_record_flags(row, record, day, is_holiday, holiday_dates, settings, emp
 	att["expected_late_mark_band"] = expected_band
 	att["expected_overtime_hours"] = expected_ot
 	att["expected_overtime_exact"] = expected_ot_exact
+	# Whole SECONDS of overtime for display: the figure that is actually paid
+	# (recomputed from the punches; a pinned day uses its pinned value). The
+	# stored custom_overtime_hours is rounded to 0.01 h (36 s), so turning it
+	# back into h:mm showed 22:43 out as 4:44 of overtime instead of 4:43.
+	if record.custom_overtime_manual or expected_ot_exact is None:
+		att["overtime_seconds"] = round_half_up(flt(record.custom_overtime_hours) * 3600)
+	else:
+		att["overtime_seconds"] = round_half_up(max(flt(expected_ot_exact), 0) * 3600)
 	att["expected_early_exit"] = (
 		1 if (not is_holiday and is_early_exit(record.out_time, day, settings)) else 0
 	)
@@ -452,6 +460,17 @@ def summarise(rows, settings=None, today=None):
 	summary.update(day_totals(rows, today))
 	summary["month_in_progress"] = bool(rows) and str(rows[-1]["date"]) > str(today)
 	return summary
+
+
+def plain_text(value):
+	"""Holiday descriptions are a Text Editor field and arrive as HTML
+	('<div class="ql-editor read-mode"><p>Krishna Janmashtami</p></div>').
+	The pages escape what they show, so the markup appeared literally."""
+	import html
+
+	if not value:
+		return value
+	return html.unescape(frappe.utils.strip_html(str(value))).strip()
 
 
 def get_band_definitions(settings=None):

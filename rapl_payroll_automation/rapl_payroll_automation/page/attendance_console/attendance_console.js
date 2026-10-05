@@ -205,11 +205,15 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		state.overrides.set(employee, o);
 	}
 
+	// Whole minutes, seconds dropped -- the same way In/Out times are shown
+	// (22:43:40 reads 22:43), so Out minus shift end matches the OT shown.
+	// Rounding the minutes used to show 4:44 for 4h 43m 48s, and could even
+	// produce "4:60".
 	function hhmm_from_seconds(seconds) {
 		const s = Math.max(0, Math.round(flt(seconds)));
 		if (!s) return "";
 		const h = Math.floor(s / 3600);
-		const m = Math.round((s % 3600) / 60);
+		const m = Math.floor((s % 3600) / 60);
 		return `${h}:${String(m).padStart(2, "0")}`;
 	}
 
@@ -549,10 +553,24 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 				<td class="ac-num">${leave_cell(g, row, att)}</td>
 				<td>${band_select(pv("custom_late_mark_band", att.late_mark_band), att, bands)}</td>
 				<td class="ac-num"><input class="ac-cell ac-day-ot ${att.overtime_manual ? "ac-pinned" : ""}"
-					value="${hhmm_from_seconds(flt(pv("custom_overtime_hours", att.overtime_hours)) * 3600)}" placeholder="0:00"
+					value="${day_ot_hhmm(att)}" placeholder="0:00"
 					title="${att.overtime_manual ? __("Set by hand - the rules will not recalculate this day") : __("Leave blank for automatic")}"></td>
 				<td class="ac-num">${cut ? `<span class="ea-cut">${Math.round(cut)}</span>` : '<span class="ea-dim">&mdash;</span>'}</td>
 			</tr>`;
+	}
+
+	// A pending edit shows what was typed; otherwise the exact paid seconds
+	// from the server (falls back to the stored hours for older payloads).
+	function day_ot_hhmm(att) {
+		const pending = state.pending.get(att.name);
+		if (pending && "custom_overtime_hours" in pending) {
+			return pending.custom_overtime_hours === "" ? ""
+				: hhmm_from_seconds(Math.round(flt(pending.custom_overtime_hours) * 3600));
+		}
+		if (att.overtime_seconds !== undefined && att.overtime_seconds !== null) {
+			return hhmm_from_seconds(att.overtime_seconds);
+		}
+		return hhmm_from_seconds(flt(att.overtime_hours) * 3600);
 	}
 
 	function band_select(value, att, bands) {

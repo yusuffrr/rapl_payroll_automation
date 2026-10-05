@@ -388,3 +388,12 @@ class HolidayListForPeriod(unittest.TestCase):
 		self.assertEqual(r, [("HL-A", dt.date(2026, 12, 1), dt.date(2026, 12, 9)),
 							 ("HL-B", dt.date(2026, 12, 10), dt.date(2026, 12, 31))])
 		self.assertEqual(self.calls, [])        # HRMS 16.20+: no fallback lookups
+
+
+class DisplayText(unittest.TestCase):
+	def test_holiday_description_is_plain_text(self):
+		frappe.utils.strip_html = lambda t: __import__("re").sub(r"<[^>]*>", "", t)
+		raw = '<div class="ql-editor read-mode"><p>Krishna Janmashtami</p></div>'
+		self.assertEqual(attendance_data.plain_text(raw), "Krishna Janmashtami")
+		self.assertEqual(attendance_data.plain_text("<p>Eid &amp; Diwali</p>"), "Eid & Diwali")
+		self.assertIsNone(attendance_data.plain_text(None))
