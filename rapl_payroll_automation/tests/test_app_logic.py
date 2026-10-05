@@ -82,6 +82,31 @@ class OvertimeEngine(unittest.TestCase):
 		)
 		self.assertAlmostEqual(reg, 2.0)  # measured from shift end, break never enters
 
+	def test_regular_day_whole_minutes(self):
+		# 22:43:48 out -> 4:43, the seconds never count.
+		h = ot_engine.compute_day_ot("2026-10-05 09:30:00", "2026-10-05 22:43:48", 0,
+									 dt.date(2026, 10, 5), "Present", SHIFT, settings(), set())
+		self.assertEqual(round(h * 60), 4 * 60 + 43)
+		self.assertEqual(h * 60, 283)
+
+	def test_month_total_equals_sum_of_shown_days(self):
+		# 20 days, each with leftover seconds: the month must equal the days as
+		# shown, not drift up by the hidden seconds (the 51:44 vs 51:39 report).
+		total_seconds, shown_minutes = 0, 0
+		for i in range(20):
+			out = dt.datetime(2026, 9, 1, 20, 30 + (i % 7), 15 + i * 2)   # 20:30:15 .. with seconds
+			h = ot_engine.compute_day_ot("2026-09-01 09:30:00", str(out), 0, dt.date(2026, 9, 1),
+										 "Present", SHIFT, settings(), set())
+			total_seconds += round(h * 3600)
+			shown_minutes += (out.replace(second=0) - dt.datetime(2026, 9, 1, 18, 0)).seconds // 60
+		self.assertEqual(total_seconds, shown_minutes * 60)
+
+	def test_minimum_overrun_on_shown_minutes(self):
+		# 18:45:40 shows 18:45 = 45 minutes, which is NOT more than 45.
+		h = ot_engine.compute_day_ot("2026-10-05 09:30:00", "2026-10-05 18:45:40", 0,
+									 dt.date(2026, 10, 5), "Present", SHIFT, settings(), set())
+		self.assertEqual(h, 0.0)
+
 	def test_minimum_overrun(self):
 		at_limit = ot_engine.compute_day_ot(
 			"2026-10-05 09:30:00", "2026-10-05 18:45:00", 0, dt.date(2026, 10, 5), "Present",
@@ -149,12 +174,12 @@ class AttendanceRules(unittest.TestCase):
 		d = self.derive(in_time=dt.datetime(2026, 10, 5, 9, 50), status="Absent")
 		self.assertIsNone(d["custom_late_mark_band"])
 
-	def test_stored_ot_uses_half_up(self):
-		# Holiday span 2h 07m 30s = 2.125 h: round-to-even would store 2.12.
+	def test_holiday_ot_whole_minutes(self):
+		# Holiday span 2h 07m 30s: the 30 seconds are dropped -> 2:07 (2.12 h).
 		d = self.derive(in_time=dt.datetime(2026, 10, 4, 9, 0, 0),
 						out_time=dt.datetime(2026, 10, 4, 11, 7, 30),
 						attendance_date=dt.date(2026, 10, 4), holiday_dates={dt.date(2026, 10, 4)})
-		self.assertEqual(d["custom_overtime_hours"], 2.13)
+		self.assertEqual(d["custom_overtime_hours"], 2.12)
 
 	def test_pinned_ot_survives(self):
 		d = self.derive(overtime_manual=1, current_overtime_hours=3.25,

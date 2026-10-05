@@ -123,6 +123,10 @@ def compute_day_ot(
 	in_time = get_datetime(in_time)
 	out_time = get_datetime(out_time)
 
+	# OT is counted in WHOLE MINUTES per day, seconds dropped -- exactly what
+	# every screen shows (22:43:48 out reads 22:43, so 4:43 of OT). Counting
+	# the hidden seconds made the month's total drift above the sum of the
+	# days HR can see (51:44 against a hand count of 51:39).
 	if attendance_date in holiday_dates:
 		# Voluntary attendance on a holiday/weekly off -- the whole day counts.
 		ot_hours = (
@@ -134,7 +138,9 @@ def compute_day_ot(
 		# Deduct it here -- holiday OT only; regular-day OT is measured from
 		# shift end so the break never enters it. Default 0 = no change.
 		ot_hours -= flt(settings.get("unpaid_break_minutes")) / 60
-		return max(ot_hours, 0.0)
+		# Nearest whole second first (removes float noise), then whole minutes.
+		whole_minutes = int(round(max(ot_hours, 0.0) * 3600)) // 60
+		return whole_minutes / 60
 
 	if shift.end_time is not None and shift.start_time is not None:
 		if shift.end_time <= shift.start_time:
@@ -143,12 +149,16 @@ def compute_day_ot(
 			)
 
 	shift_end_dt = get_datetime_combine(attendance_date, shift.end_time)
-	minutes_over = (out_time - shift_end_dt).total_seconds() / 60
+	# The out-punch to the minute, as shown: 22:43:48 counts as 22:43.
+	out_minute = out_time.replace(second=0, microsecond=0)
+	minutes_over = int((out_minute - shift_end_dt).total_seconds() // 60)
 
+	# Minimum overrun judged on the same whole minutes: out at 18:45:40 shows
+	# 18:45, which is NOT more than 45 minutes past 18:00.
 	if minutes_over <= flt(settings.ot_minimum_minutes):
 		return 0.0
 
-	return max(minutes_over / 60, 0.0)
+	return max(minutes_over, 0) / 60
 
 
 def compute_ot_for_attendance_doc(doc, settings):
