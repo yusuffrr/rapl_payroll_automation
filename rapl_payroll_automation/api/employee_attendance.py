@@ -147,6 +147,13 @@ def _build_statement(employee, start_date, end_date, show_money, settings):
 		"show_money": show_money,
 	}
 
+	# Each day's OT shown from the seconds that are PAID (whole minutes,
+	# recomputed from the punches), so the day column adds up to the total.
+	for row in rows:
+		att = row.get("attendance")
+		if att and att.get("overtime_seconds") is not None:
+			att["overtime_hours"] = round_half_up(flt(att["overtime_seconds"]) / 3600, 2)
+
 	if not show_money:
 		# Strip every per-day money field before the payload leaves the server.
 		for row in rows:
@@ -164,7 +171,11 @@ def _build_statement(employee, start_date, end_date, show_money, settings):
 		att = row.get("attendance")
 		if not att:
 			continue
-		amount = round_half_up(flt(att["overtime_hours"]) * flt(pay["hourly_rate"]))
+		amount = (
+			ot_amount(att["overtime_seconds"], pay["hourly_rate"])
+			if att.get("overtime_seconds") is not None
+			else round_half_up(flt(att["overtime_hours"]) * flt(pay["hourly_rate"]))
+		)
 		att["overtime_amount"] = amount
 		ot_total += amount
 
@@ -190,7 +201,13 @@ def _build_statement(employee, start_date, end_date, show_money, settings):
 				for label, count in summary["band_counts"].items())
 			* flt(pay["per_day_rate"])
 		),
-		"half_day_amount": round_half_up(summary["half_day"] * 0.5 * flt(pay["per_day_rate"])),
+		# Only half days whose other half is unpaid cost anything, at the
+		# Payroll Settings fraction -- the way the slip deducts them.
+		"half_day_amount": round_half_up(
+			flt(summary.get("half_days_unpaid", summary["half_day"]))
+			* (1 - (flt(frappe.db.get_single_value("Payroll Settings", "daily_wages_fraction_for_half_day")) or 0.5))
+			* flt(pay["per_day_rate"])
+		),
 	}
 	return statement
 

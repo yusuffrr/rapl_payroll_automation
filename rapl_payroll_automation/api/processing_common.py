@@ -32,6 +32,12 @@ def validate_processing_doc(doc):
 				)
 			)
 		seen.add(row.employee)
+		# Amounts are paid in whole rupees: a hand-typed 1234.5 would otherwise
+		# reach the Additional Salary as 1234.5 (Currency precision 0 only
+		# affects display).
+		if row.meta.has_field("amount") and row.get("amount") is not None:
+			from rapl_payroll_automation.api.payroll_math import round_half_up
+			row.amount = round_half_up(flt(row.amount))
 		for field in ("amount", "ot_hours", "ot_rate", "per_day_rate"):
 			if row.meta.has_field(field) and flt(row.get(field)) < 0:
 				frappe.throw(
@@ -42,7 +48,9 @@ def validate_processing_doc(doc):
 def before_submit_processing_doc(doc):
 	if not doc.entries:
 		frappe.throw(_("Add at least one employee before submitting."))
-	if not any(flt(r.amount) > 0 for r in doc.entries):
+	# A Late Mark document whose deductions were all waived is still worth
+	# submitting: it is the month's record of the marks and the waivers.
+	if not any(flt(r.amount) > 0 or flt(r.get("waived_amount")) > 0 for r in doc.entries):
 		frappe.throw(_("Every row has a zero amount -- nothing would be paid or deducted."))
 
 

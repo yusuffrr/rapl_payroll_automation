@@ -158,3 +158,66 @@ class EsiRoundUp(unittest.TestCase):
 	def test_float_artefact_in_wages_ignored(self):
 		wages = 20000.000000000004           # what adding salary lines can produce
 		self.assertEqual(pm.esi_employee_contribution(wages), 150)
+
+
+class Waiver(unittest.TestCase):
+	# Band 1 = 0.25 day, band 2 = 0.5 day
+	F = [0.25, 0.5]
+
+	def test_single_band_caps_at_its_count(self):
+		# 4 marks in band 2, waive 5 from band 2 -> 4 waived, never -1
+		self.assertEqual(pm.allocate_waiver([4, 4], self.F, 5, "band", 1), [0, 4])
+
+	def test_single_band_never_spills(self):
+		self.assertEqual(pm.allocate_waiver([3, 1], self.F, 5, "band", 1), [0, 1])
+
+	def test_any_band_costliest_first_spills(self):
+		self.assertEqual(pm.allocate_waiver([4, 4], self.F, 5, "costliest"), [1, 4])
+
+	def test_any_band_cheapest_first(self):
+		self.assertEqual(pm.allocate_waiver([4, 4], self.F, 5, "cheapest"), [4, 1])
+
+	def test_more_than_all_marks_goes_to_zero_not_below(self):
+		w = pm.allocate_waiver([4, 4], self.F, 50, "costliest")
+		self.assertEqual(w, [4, 4])
+		self.assertEqual(pm.late_amounts([4, 4], w, self.F, 500), (1500, 0))
+
+	def test_add_vs_replace(self):
+		self.assertEqual(pm.allocate_waiver([4, 4], self.F, 2, "band", 0, existing=[1, 3]), [3, 3])
+		self.assertEqual(pm.allocate_waiver([4, 4], self.F, 2, "band", 0), [2, 0])
+		# adding past the count still stops at the count
+		self.assertEqual(pm.allocate_waiver([4, 4], self.F, 9, "band", 0, existing=[3, 0]), [4, 0])
+
+	def test_no_marks_nothing_waived(self):
+		self.assertEqual(pm.allocate_waiver([0, 0], self.F, 5, "costliest"), [0, 0])
+
+	def test_bad_inputs(self):
+		with self.assertRaises(ValueError):
+			pm.allocate_waiver([1, 1], self.F, 1, "band", 2)
+		with self.assertRaises(ValueError):
+			pm.allocate_waiver([1, 1], self.F, 1, "everything")
+		self.assertEqual(pm.allocate_waiver([2, 2], self.F, -3, "costliest"), [0, 0])
+
+	def test_amounts_rounded_once(self):
+		# 3 x 0.25 x 333.333333 = 249.99999975 -> 250; after waiving 1 -> 166.67 -> 167
+		before, after = pm.late_amounts([3, 0], [1, 0], self.F, 333.333333)
+		self.assertEqual((before, after), (250, 167))
+
+	def test_clamp(self):
+		self.assertEqual(pm.clamp_waived([2, 1], [5, -1]), [2, 0])
+		self.assertEqual(pm.clamp_waived([2, 1], None), [0, 0])
+
+
+class WaivedRowAmount(unittest.TestCase):
+	F = [0.25, 0.5]
+
+	def test_normal_row_priced_once(self):
+		self.assertEqual(pm.waived_row_amount([3, 0], [1, 0], self.F, 333.333333, 250), (250, 167))
+
+	def test_hand_set_zero_never_increases(self):
+		self.assertEqual(pm.waived_row_amount([0, 3], [0, 1], self.F, 400, 0), (0, 0))
+
+	def test_hand_amount_reduced_by_waived_value(self):
+		# computed would be 600; HR typed 500; waiving one 0.5 mark at 400 takes 200 off
+		self.assertEqual(pm.waived_row_amount([0, 3], [0, 1], self.F, 400, 500), (500, 300))
+		self.assertEqual(pm.waived_row_amount([0, 3], [0, 3], self.F, 400, 500), (500, 0))

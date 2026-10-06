@@ -147,8 +147,9 @@ def get_recoverable_advances(employee, cutoff):
 		order_by="posting_date, name",
 	)
 	out = []
+	rec_state = _advance_recovery_state([r.name for r in rows])
 	for r in rows:
-		outstanding = flt(r.paid_amount) - flt(r.claimed_amount) - flt(r.return_amount)
+		outstanding = _recoverable_amount(r, rec_state)
 		if outstanding <= 0.005:
 			continue
 		out.append({
@@ -369,7 +370,7 @@ def _prefetch(names, start_date, end_date, cutoff, settings):
 		):
 			out["processed"].add((a.employee, a.salary_component))
 
-	for r in frappe.get_all(
+	advances = frappe.get_all(
 		"Employee Advance",
 		filters={"docstatus": 1, "employee": ["in", names],
 				 "repay_unclaimed_amount_from_salary": 1,
@@ -377,8 +378,13 @@ def _prefetch(names, start_date, end_date, cutoff, settings):
 		fields=["name", "employee", "posting_date", "purpose", "paid_amount",
 				"claimed_amount", "return_amount", "status", "company", "currency"],
 		order_by="posting_date, name",
-	):
-		outstanding = flt(r.paid_amount) - flt(r.claimed_amount) - flt(r.return_amount)
+	)
+	rec_state = _advance_recovery_state([a.name for a in advances])
+	for r in advances:
+		# Not yet covered by a recovery record: a partial recovery leaves the
+		# rest available (it used to block the advance for good), and an
+		# amount already scheduled is not offered twice.
+		outstanding = _recoverable_amount(r, rec_state)
 		if outstanding <= 0.005:
 			continue
 		out["advances"].setdefault(r.employee, []).append({
@@ -387,6 +393,43 @@ def _prefetch(names, start_date, end_date, cutoff, settings):
 			"company": r.company, "currency": r.currency,
 		})
 	return out
+
+
+def _advance_recovery_state(advance_names):
+	"""{advance: {"drafts": n, "scheduled": amount}} from its recovery records.
+
+	scheduled = submitted Additional Salary recoveries -- the figure HRMS's own
+	validate_employee_advance_return() subtracts (it allows partial
+	recoveries up to paid - claimed - scheduled). A draft recovery means one
+	is already being prepared, so another must not be offered.
+	"""
+	state = {}
+	if not advance_names:
+		return state
+	for r in frappe.get_all(
+		"Additional Salary",
+		filters={"ref_doctype": "Employee Advance", "ref_docname": ["in", list(advance_names)],
+				 "docstatus": ["<", 2]},
+		fields=["ref_docname", "docstatus", "amount"],
+	):
+		st = state.setdefault(r.ref_docname, {"drafts": 0, "scheduled": 0.0})
+		if r.docstatus == 0:
+			st["drafts"] += 1
+		else:
+			st["scheduled"] += flt(r.amount)
+	return state
+
+
+def _recoverable_amount(adv, rec_state):
+	"""What can still be recovered: what is outstanding (paid - claimed -
+	returned) but never more than HRMS will accept (paid - claimed - already
+	scheduled). Zero while a draft recovery exists."""
+	st = rec_state.get(adv.name) or {"drafts": 0, "scheduled": 0.0}
+	if st["drafts"]:
+		return 0.0
+	outstanding = flt(adv.paid_amount) - flt(adv.claimed_amount) - flt(adv.return_amount)
+	allowed = flt(adv.paid_amount) - flt(adv.claimed_amount) - st["scheduled"]
+	return flt(max(min(outstanding, allowed), 0), 2)
 
 
 def _entry_preview(emp, start_date, end_date, summary, bands, settings, pre=None):
@@ -678,7 +721,11 @@ def apply_edits(changes, confirm_processed=0):
 						"Present with no check-in or check-out needs a visit type "
 						"(Site / Client / Vendor Visit)."
 					)
-				doc.working_hours = 0
+				# Recomputed only when a punch changed: HRMS may have computed it
+				# from every check-in (breaks excluded), which the raw in-to-out
+				# span would overwrite on a plain Recalculate.
+				if "in_time" in change or "out_time" in change:
+					doc.working_hours = 0
 				doc.save()
 				applied.append({
 					"name": name, "employee": doc.employee,
@@ -762,7 +809,8 @@ def apply_edits(changes, confirm_processed=0):
 				record[flag] = 1
 				record[field] = flt(value) if field.endswith("_hours") else value
 
-		record["working_hours"] = 0
+		if "in_time" in change or "out_time" in change:
+			record["working_hours"] = 0
 		derived = _recompute(record, settings)
 
 		update = {
@@ -778,6 +826,8 @@ def apply_edits(changes, confirm_processed=0):
 			"custom_status_manual": cint(record.get("custom_status_manual")),
 			"custom_attendance_type": record.get("custom_attendance_type"),
 		}
+		if derived.get("reset_band"):
+			update["custom_late_mark_band"] = derived["custom_late_mark_band"]
 		if derived["rules_applied"]:
 			update["custom_late_mark_band"] = derived["custom_late_mark_band"]
 			update["early_exit"] = derived["early_exit"]
@@ -943,6 +993,10 @@ def create_attendance(rows):
 		try:
 			doc = frappe.new_doc("Attendance")
 			doc.employee = row["employee"]
+			if not row.get("attendance_date"):
+				# getdate(None) is TODAY -- a row without a date silently
+				# created attendance for today.
+				raise frappe.ValidationError("Attendance date is required")
 			doc.attendance_date = getdate(row["attendance_date"])
 			doc.status = row.get("status") or "Present"
 			# Same list as apply_edits. "On Leave" with no Leave Application
@@ -1073,7 +1127,7 @@ def _apply_overrides(doc, kind, overrides, bands):
 			if values.get("ot_rate") is not None:
 				row.ot_rate = flt(values["ot_rate"])
 			row.amount = (
-				flt(values["amount"]) if values.get("amount") is not None
+				round_half_up(flt(values["amount"])) if values.get("amount") is not None
 				# Priced from the exact seconds, not the 2-dp display hours.
 				else ot_amount(row.ot_hours_hhmm, row.ot_rate)
 			)
@@ -1089,13 +1143,19 @@ def _apply_overrides(doc, kind, overrides, bands):
 			# late-mark deduction when only their OT had been edited.
 			late_amount = values.get("late_amount")
 			if late_amount is not None:
-				row.amount = flt(late_amount)
+				row.amount = round_half_up(flt(late_amount))   # whole rupees, like computed amounts
 			else:
 				fraction = sum(
 					flt(b["fraction"]) * int(getattr(row, f"band_{i}_count", 0) or 0)
 					for i, b in enumerate(bands, start=1)
 				)
 				row.amount = round_half_up(fraction * flt(row.per_day_rate))
+			# On a row with a late-mark waiver, the Console's figure is the
+			# deduction BEFORE the waiver; validate() then takes the waived
+			# marks off it. Without this the save re-derived Amount from the
+			# old pre-waiver figure and the Console's value was lost.
+			if int(getattr(row, "waived_marks", 0) or 0):
+				row.amount_before_waiver = row.amount
 		touched.append(employee)
 
 	if touched:
@@ -1298,19 +1358,16 @@ def create_advance_drafts(advances, payroll_date=None):
 				raise frappe.ValidationError(
 					f"{advance_name} is not marked 'Repay Unclaimed Amount from Salary'"
 				)
-			outstanding = flt(adv.paid_amount) - flt(adv.claimed_amount) - flt(adv.return_amount)
+			rec_state = _advance_recovery_state([advance_name])
+			if (rec_state.get(advance_name) or {}).get("drafts"):
+				raise frappe.ValidationError(
+					f"{advance_name} already has a draft recovery record -- submit or delete it first"
+				)
+			# Partial recoveries are allowed (HRMS caps a new one at paid -
+			# claimed - already scheduled); only what is left is recovered.
+			outstanding = _recoverable_amount(adv, rec_state)
 			if outstanding <= 0.005:
 				raise frappe.ValidationError(f"{advance_name} has nothing left to recover")
-
-			existing = frappe.db.exists(
-				"Additional Salary",
-				{"ref_doctype": "Employee Advance", "ref_docname": advance_name,
-				 "docstatus": ["<", 2]},
-			)
-			if existing:
-				raise frappe.ValidationError(
-					f"{advance_name} already has a recovery record ({existing})"
-				)
 
 			ads = frappe.new_doc("Additional Salary")
 			ads.employee = adv.employee
@@ -1502,7 +1559,8 @@ def _build_net_pay_preview(employee, start_date, end_date, today, settings,
 	# twice in a month that is still running.
 	lwp = max(
 		flt(slip.leave_without_pay)
-		- _lwp_days_after(employee, upto, last, holidays, include_holidays=include_holidays),
+		- _lwp_days_after(employee, upto, last, holidays, include_holidays=include_holidays,
+						  half_fraction=half_fraction),
 		0,
 	)
 
@@ -1523,7 +1581,11 @@ def _build_net_pay_preview(employee, start_date, end_date, today, settings,
 	for table, key, component, amount in pending:
 		if not component or not amount:
 			continue
-		if get_additional_salary_total(employee, component, start_date, end_date) > 0:
+		# Overtime / Late Mark: one record per month, so a submitted one means
+		# this is already on the slip. Advances are different -- the Console
+		# only offers what no recovery record covers yet, so a pending advance
+		# is always added on top of any recovery already submitted.
+		if key != "advance" and get_additional_salary_total(employee, component, start_date, end_date) > 0:
 			already_submitted.append({"component": component, "kind": key})
 			continue
 		comp = frappe.db.get_value(
@@ -1611,7 +1673,7 @@ def _build_net_pay_preview(employee, start_date, end_date, today, settings,
 	}
 
 
-def _lwp_days_after(employee, after, last, holidays=None, include_holidays=True):
+def _lwp_days_after(employee, after, last, holidays=None, include_holidays=True, half_fraction=0.5):
 	"""Approved leave-without-pay days strictly after `after`, up to `last`.
 
 	Counted the way HRMS counts leave_without_pay: a holiday inside the leave
@@ -1619,10 +1681,17 @@ def _lwp_days_after(employee, after, last, holidays=None, include_holidays=True)
 	"""
 	if after >= last:
 		return 0.0
-	lwp_types = {
-		lt.name: cint(lt.include_holiday)
-		for lt in frappe.get_all("Leave Type", filters={"is_lwp": 1}, fields=["name", "include_holiday"])
-	}
+	# Leave without pay AND partially paid leave, as HRMS's get_leave_type_map:
+	# a PPL day counts as (1 - fraction paid) of an LWP day.
+	lwp_types = {}
+	for lt in frappe.get_all(
+		"Leave Type", or_filters={"is_lwp": 1, "is_ppl": 1},
+		fields=["name", "include_holiday", "is_ppl", "fraction_of_daily_salary_per_leave"],
+	):
+		weight = 1.0
+		if cint(lt.is_ppl) and flt(lt.fraction_of_daily_salary_per_leave):
+			weight = 1 - flt(lt.fraction_of_daily_salary_per_leave)
+		lwp_types[lt.name] = {"include_holiday": cint(lt.include_holiday), "weight": weight}
 	if not lwp_types:
 		return 0.0
 	holidays = holidays or set()
@@ -1639,12 +1708,13 @@ def _lwp_days_after(employee, after, last, holidays=None, include_holidays=True)
 			day = getdate(add_days(start, i))
 			# HRMS: with "Include holidays in total working days" OFF, holidays
 			# are never working days, so never LWP -- whatever the Leave Type.
-			if day in holidays and not (include_holidays and lwp_types.get(la.leave_type)):
+			lt = lwp_types.get(la.leave_type) or {"include_holiday": 0, "weight": 1.0}
+			if day in holidays and not (include_holidays and lt["include_holiday"]):
 				continue
 			if cint(la.half_day) and la.half_day_date and getdate(la.half_day_date) == day:
-				total += 0.5
+				total += (1 - flt(half_fraction)) * lt["weight"]   # as HRMS: (1 - half-day fraction)
 			else:
-				total += 1
+				total += lt["weight"]
 	return total
 
 

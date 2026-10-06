@@ -162,7 +162,15 @@ def get_employees(docname, all_employees=False, employees=None):
 			)
 		)
 		ot_eligible_employees = set(
-			frappe.get_all("Employee", filters={"custom_ot": 1, "status": "Active"}, pluck="name")
+			# Active, or relieved during/after this period: a leaver's final
+			# month is paid too (the Console shows it; Late Mark already
+			# includes leavers).
+			frappe.get_all(
+				"Employee",
+				filters={"custom_ot": 1},
+				or_filters={"status": "Active", "relieving_date": [">=", start_date]},
+				pluck="name",
+			)
 		)
 		employees = sorted(attendance_employees & ot_eligible_employees)
 

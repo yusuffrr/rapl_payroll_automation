@@ -98,8 +98,13 @@ def correct_statutory_deductions(doc, method):
 	# were computed on a lower income without any warning.
 	basic = _get_earning_amount(doc, settings.get("basic_salary_component") or "Basic")
 	hra = _get_earning_amount(doc, settings.get("hra_salary_component") or "HRA")
-	conveyance = flt(doc.custom_conveyance_for_deductions)
-	overtime = flt(doc.custom_overtime_for_pt)
+	# Overtime and Conveyance as PAID on this slip -- their earnings rows,
+	# after any proration by payment days -- like Basic and HRA above.
+	# PF/PT/ESI are due on wages actually paid; the raw Additional Salary
+	# totals overstated them whenever those components are prorated. The
+	# totals are only the fallback for a slip without the row.
+	overtime = _row_or(doc, settings.get("overtime_salary_component"), doc.custom_overtime_for_pt)
+	conveyance = _row_or(doc, "Conveyance", doc.custom_conveyance_for_deductions)
 
 	emp = frappe.db.get_value(
 		"Employee", doc.employee, ["gender", "custom_pf", "custom_pt", "custom_esi"], as_dict=True
@@ -135,6 +140,14 @@ def correct_statutory_deductions(doc, method):
 					   "compute_component_wise_year_to_date"):
 			if hasattr(doc, method):
 				getattr(doc, method)()
+
+
+def _row_or(doc, component_name, fallback):
+	"""Sum of EVERY earnings row for the component (HRMS gives each
+	non-overwrite Additional Salary its own row); the fallback only when the
+	slip has none."""
+	rows = [flt(r.amount) for r in doc.earnings if component_name and r.salary_component == component_name]
+	return sum(rows) if rows else flt(fallback)
 
 
 def _get_earning_amount(doc, component_name):

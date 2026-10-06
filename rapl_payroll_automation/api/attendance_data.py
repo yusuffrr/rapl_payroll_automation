@@ -325,7 +325,10 @@ def _add_record_flags(row, record, day, is_holiday, holiday_dates, settings, emp
 
 	expected_band = None
 	expected_half_day = False
-	if not genuine_leave and not is_holiday and record.in_time:
+	# Not on days the rules never band (Absent / On Leave / WFH), or the drift
+	# flag would claim a band Recalculate can never produce.
+	if (not genuine_leave and not is_holiday and record.in_time
+			and record.status not in ("Absent", "On Leave", "Work From Home")):
 		expected_band, past_all_bands = match_late_band(record.in_time, settings)
 		expected_half_day = past_all_bands or is_early_exit(record.out_time, day, settings)
 

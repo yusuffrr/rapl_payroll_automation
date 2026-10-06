@@ -16,7 +16,18 @@
     "column_break_amt",
     "per_day_rate",
     "amount",
-    "additional_salary"
+    "waived_marks",
+    "waived_amount",
+    "additional_salary",
+    "section_break_waiver",
+    "band_1_waived",
+    "band_2_waived",
+    "band_3_waived",
+    "band_4_waived",
+    "band_5_waived",
+    "column_break_waiver",
+    "amount_before_waiver",
+    "waiver_reason"
   ],
   "fields": [
     {
@@ -98,6 +109,81 @@
       "no_copy": 1,
       "options": "Additional Salary",
       "read_only": 1
+    },
+    {
+      "fieldname": "waived_marks",
+      "fieldtype": "Int",
+      "label": "Waived Marks",
+      "read_only": 1,
+      "default": "0",
+      "in_list_view": 1,
+      "columns": 1,
+      "description": "Total late marks waived on this row (sum of the per-band waivers below)."
+    },
+    {
+      "fieldname": "waived_amount",
+      "fieldtype": "Currency",
+      "label": "Waived Amount",
+      "precision": "0",
+      "read_only": 1,
+      "in_list_view": 1,
+      "description": "Amount Before Waiver minus Amount: the deduction forgiven."
+    },
+    {
+      "fieldname": "section_break_waiver",
+      "fieldtype": "Section Break",
+      "label": "Late Mark Waiver",
+      "collapsible": 1,
+      "collapsible_depends_on": "eval:doc.waived_marks"
+    },
+    {
+      "fieldname": "band_1_waived",
+      "fieldtype": "Int",
+      "label": "Waived: Band 1",
+      "default": "0",
+      "description": "Late marks of this band forgiven for the month. Kept between 0 and the band's own count: waiving more than the employee has stops at their count -- never a negative deduction or extra pay."
+    },
+    {
+      "fieldname": "band_2_waived",
+      "fieldtype": "Int",
+      "label": "Waived: Band 2",
+      "default": "0"
+    },
+    {
+      "fieldname": "band_3_waived",
+      "fieldtype": "Int",
+      "label": "Waived: Band 3",
+      "default": "0"
+    },
+    {
+      "fieldname": "band_4_waived",
+      "fieldtype": "Int",
+      "label": "Waived: Band 4",
+      "default": "0"
+    },
+    {
+      "fieldname": "band_5_waived",
+      "fieldtype": "Int",
+      "label": "Waived: Band 5",
+      "default": "0"
+    },
+    {
+      "fieldname": "column_break_waiver",
+      "fieldtype": "Column Break"
+    },
+    {
+      "fieldname": "amount_before_waiver",
+      "fieldtype": "Currency",
+      "label": "Amount Before Waiver",
+      "precision": "0",
+      "read_only": 1,
+      "description": "What this row would deduct with no waiver: sum(count x fraction) x Per-Day Rate, rounded once."
+    },
+    {
+      "fieldname": "waiver_reason",
+      "fieldtype": "Small Text",
+      "label": "Waiver Reason",
+      "description": "Required whenever any marks are waived. While a waiver is on the row, Amount is always calculated from the counts minus the waived marks."
     }
   ],
   "permissions": []

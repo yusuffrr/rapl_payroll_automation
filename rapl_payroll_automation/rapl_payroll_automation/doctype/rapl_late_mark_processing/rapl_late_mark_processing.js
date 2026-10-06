@@ -27,6 +27,17 @@ frappe.ui.form.on("RAPL Late Mark Processing", {
 			);
 		});
 
+		// Ticked rows are read BEFORE any save: saving re-renders the grid and
+		// drops the ticks, which would turn "these rows" into "every row".
+		frm.add_custom_button(__("Waive Late Marks"), () => {
+			const targets = waiver_targets(frm);
+			with_saved(frm, () => open_waiver_dialog(frm, targets));
+		}, __("Waiver"));
+		frm.add_custom_button(__("Clear Waiver"), () => {
+			const targets = waiver_targets(frm);
+			with_saved(frm, () => clear_waiver(frm, targets));
+		}, __("Waiver"));
+
 		frm.add_custom_button(__("Select Employees Manually"), () => {
 			new frappe.ui.form.MultiSelectDialog({
 				doctype: "Employee",
@@ -112,11 +123,15 @@ function setup_band_columns(frm) {
 			const grid = frm.fields_dict["entries"].grid;
 			for (let i = 1; i <= MAX_BANDS; i++) {
 				const fieldname = `band_${i}_count`;
+				const waived = `band_${i}_waived`;
 				if (i <= labels.length) {
 					grid.update_docfield_property(fieldname, "label", labels[i - 1]);
 					grid.toggle_display(fieldname, true);
+					grid.update_docfield_property(waived, "label", __("Waived: {0}", [labels[i - 1]]));
+					grid.toggle_display(waived, true);
 				} else {
 					grid.toggle_display(fieldname, false);
+					grid.toggle_display(waived, false);
 				}
 			}
 			frm.refresh_field("entries");
@@ -173,20 +188,249 @@ frappe.ui.form.on("RAPL Late Mark Processing Entry", {
 	band_4_count(frm, cdt, cdn) { recalculate_late_mark_amount(frm, cdt, cdn); },
 	band_5_count(frm, cdt, cdn) { recalculate_late_mark_amount(frm, cdt, cdn); },
 	per_day_rate(frm, cdt, cdn) { recalculate_late_mark_amount(frm, cdt, cdn); },
+	band_1_waived(frm, cdt, cdn) { recalculate_late_mark_amount(frm, cdt, cdn, true); },
+	band_2_waived(frm, cdt, cdn) { recalculate_late_mark_amount(frm, cdt, cdn, true); },
+	band_3_waived(frm, cdt, cdn) { recalculate_late_mark_amount(frm, cdt, cdn, true); },
+	band_4_waived(frm, cdt, cdn) { recalculate_late_mark_amount(frm, cdt, cdn, true); },
+	band_5_waived(frm, cdt, cdn) { recalculate_late_mark_amount(frm, cdt, cdn, true); },
 });
 
-function recalculate_late_mark_amount(frm, cdt, cdn) {
+function recalculate_late_mark_amount(frm, cdt, cdn, waiver_edit) {
 	const row = locals[cdt][cdn];
 	const fractions = frm.__late_mark_band_fractions;
 	// Fractions not loaded yet: leave the amount alone rather than price it
 	// at zero. The server value stands until they arrive.
 	if (!fractions) return;
-	let total_fraction = 0;
+	// Same rules as the server (apply_waiver_math / waived_row_amount): a
+	// waiver is kept between 0 and the band's own count, and it can only
+	// LOWER the deduction. The server recomputes on save; this is only so the
+	// row reads right now.
+	let gross = 0, net = 0, waived_units = 0, waived_marks = 0;
 	for (let i = 0; i < MAX_BANDS; i++) {
-		const count = flt(row[`band_${i + 1}_count`]);
+		const count = Math.max(cint(row[`band_${i + 1}_count`]), 0);
 		const fraction = fractions[i] || 0;
-		total_fraction += count * fraction;
+		const waived = i < fractions.length
+			? Math.min(Math.max(cint(row[`band_${i + 1}_waived`]), 0), count) : 0;
+		row[`band_${i + 1}_waived`] = waived;
+		waived_marks += waived;
+		gross += count * fraction;
+		net += (count - waived) * fraction;
+		waived_units += waived * fraction;
 	}
-	row.amount = Math.round(total_fraction * flt(row.per_day_rate));
+	const rate = flt(row.per_day_rate);
+	const priced = round_half_up(gross * rate);
+	// Pre-waiver amount. A count/rate edit re-prices it (as before waivers
+	// existed); a waiver edit keeps it -- including a hand-typed amount.
+	let base;
+	if (!waiver_edit) base = priced;
+	else if (flt(row.amount_before_waiver) > 0) base = flt(row.amount_before_waiver);
+	else base = flt(row.amount);
+
+	row.waived_marks = waived_marks;
+	if (waived_marks) {
+		row.amount_before_waiver = base;
+		row.amount = base === priced
+			? round_half_up(net * rate)
+			: Math.max(base - round_half_up(waived_units * rate), 0);
+		row.waived_amount = base - row.amount;
+	} else {
+		row.amount = base;
+		row.amount_before_waiver = 0;
+		row.waived_amount = 0;
+	}
 	frm.refresh_field("entries");
+}
+
+// Positive amounts only (a deduction is never negative), so half-up is
+// Math.round after nudging away float noise like 340.49999999.
+function round_half_up(x) {
+	return Math.round(flt(x, 6));
+}
+
+const WAIVER_METHOD = "rapl_payroll_automation.rapl_payroll_automation.doctype.rapl_late_mark_processing.rapl_late_mark_processing";
+
+// The server reads the SAVED document. Save first; continue only if the save
+// actually worked (frm.save() resolves even when the server refuses it).
+function with_saved(frm, fn) {
+	if (frm.is_new()) {
+		frappe.msgprint(__("Save the document and add employees first."));
+		return;
+	}
+	if (frm.is_dirty()) {
+		return frm.save().then(() => { if (!frm.is_dirty()) fn(); });
+	}
+	fn();
+}
+
+// Selected rows, or null for "every row".
+function waiver_targets(frm) {
+	const selected = frm.fields_dict.entries.grid.get_selected_children()
+		.map((r) => r.employee).filter(Boolean);
+	return selected.length ? selected : null;
+}
+
+function open_waiver_dialog(frm, targets) {
+	if (!(frm.doc.entries || []).length) {
+		frappe.msgprint(__("Add employees first (Get Employees)."));
+		return;
+	}
+	const labels = frm.__late_mark_band_labels || [];
+	const fractions = frm.__late_mark_band_fractions || [];
+	if (!labels.length) {
+		frappe.msgprint(__("Late mark bands are still loading, or none are configured in Settings. Try again in a moment."));
+		return;
+	}
+	const scope = targets
+		? __("Applies to the {0} selected row(s).", [targets.length])
+		: __("No rows are selected, so this applies to ALL {0} rows. Tick rows in the table first to waive for some employees only.", [frm.doc.entries.length]);
+
+	const from_options = labels.map((label, i) => ({
+		label: __("{0} only (fraction {1})", [frappe.utils.escape_html(String(label)), fractions[i]]),
+		value: `band:${i + 1}`,
+	}));
+	from_options.push({ label: __("Any band -- highest deduction first"), value: "costliest" });
+	from_options.push({ label: __("Any band -- lowest deduction first"), value: "cheapest" });
+
+	const d = new frappe.ui.Dialog({
+		title: __("Waive Late Marks"),
+		size: "extra-large",
+		fields: [
+			{ fieldtype: "HTML", fieldname: "scope_html" },
+			{ fieldtype: "Int", fieldname: "marks", label: __("Late marks to waive (per employee)"), default: 1, reqd: 1 },
+			{ fieldtype: "Select", fieldname: "waive_from", label: __("Waive from"), options: from_options, default: "costliest", reqd: 1,
+			  description: __("A single band never spills into another: waiving 5 from a band with 4 marks waives 4. \"Any band\" moves on to the next band.") },
+			{ fieldtype: "Column Break" },
+			{ fieldtype: "Select", fieldname: "combine", label: __("Existing waivers on these rows"), default: "replace", reqd: 1,
+			  options: [
+				{ label: __("Replace them"), value: "replace" },
+				{ label: __("Add to them"), value: "add" },
+			  ] },
+			{ fieldtype: "Small Text", fieldname: "reason", label: __("Reason"), reqd: 1 },
+			{ fieldtype: "Section Break", label: __("Effect") },
+			{ fieldtype: "HTML", fieldname: "preview_html" },
+		],
+		primary_action_label: __("Apply Waiver"),
+		primary_action(values) {
+			const args = waiver_args(frm, values, targets);
+			if (!args) return;
+			args.reason = values.reason;
+			frappe.call({
+				method: `${WAIVER_METHOD}.apply_waiver`,
+				args,
+				freeze: true,
+				freeze_message: __("Applying waiver..."),
+				callback(r) {
+					d.hide();
+					frm.reload_doc();
+					const m = r.message || {};
+					frappe.show_alert({
+						message: __("Waiver applied to {0} row(s). Total deduction {1} -> {2}.",
+							[m.changed || 0, format_currency(m.total_now || 0), format_currency(m.total_after || 0)]),
+						indicator: "green",
+					}, 7);
+				},
+			});
+		},
+	});
+	d.fields_dict.scope_html.$wrapper.html(`<p class="text-muted">${frappe.utils.escape_html(scope)}</p>`);
+
+	let timer = null, seq = 0;
+	const refresh_preview = () => {
+		clearTimeout(timer);
+		timer = setTimeout(() => {
+			const args = waiver_args(frm, d.get_values(true), targets);
+			if (!args) {
+				d.fields_dict.preview_html.$wrapper.html("");
+				return;
+			}
+			const mine = ++seq;   // ignore answers to older requests
+			frappe.call({
+				method: `${WAIVER_METHOD}.preview_waiver`,
+				args,
+				callback(r) {
+					if (mine !== seq) return;
+					d.fields_dict.preview_html.$wrapper.html(render_waiver_preview(r.message || {}));
+				},
+				error() {
+					if (mine === seq) d.fields_dict.preview_html.$wrapper.html("");
+				},
+			});
+		}, 250);
+	};
+	["marks", "waive_from", "combine"].forEach((f) => {
+		d.fields_dict[f].df.onchange = refresh_preview;
+	});
+	d.show();
+	refresh_preview();
+}
+
+function waiver_args(frm, values, targets) {
+	if (!values || cint(values.marks) < 1 || !values.waive_from) return null;
+	const from = String(values.waive_from);
+	const args = {
+		docname: frm.doc.name,
+		marks: cint(values.marks),
+		combine: values.combine || "replace",
+		employees: targets || [],
+	};
+	if (from.startsWith("band:")) {
+		args.mode = "band";
+		args.band = cint(from.split(":")[1]);
+	} else {
+		args.mode = from;
+	}
+	return args;
+}
+
+function render_waiver_preview(m) {
+	const esc = (v) => frappe.utils.escape_html(String(v == null ? "" : v));
+	const labels = m.labels || [];
+	const rows = m.rows || [];
+	if (!rows.length) return `<p class="text-muted">${esc(__("No rows to change."))}</p>`;
+	const marks = (counts, waived) => labels.map((_, i) => {
+		const c = counts[i] || 0, w = waived[i] || 0;
+		return `<td class="text-right">${w ? `${esc(c)} <span class="text-success">(-${esc(w)})</span>` : esc(c)}</td>`;
+	}).join("");
+	const head = labels.map((l) => `<th class="text-right">${esc(l)}</th>`).join("");
+	const body = rows.map((r) => `
+		<tr${r.changed ? "" : ' class="text-muted"'}>
+			<td>${esc(r.employee)}<br><small>${esc(r.employee_name || "")}</small></td>
+			${marks(r.counts || [], r.waived_after || [])}
+			<td class="text-right">${esc(format_currency(r.amount_now))}</td>
+			<td class="text-right"><b>${esc(format_currency(r.amount_after))}</b></td>
+			<td class="text-right">${esc(format_currency(r.saving))}</td>
+		</tr>`).join("");
+	const saving = (m.total_now || 0) - (m.total_after || 0);
+	return `
+		<p>${esc(__("{0} of {1} row(s) change. Marks shown as count (-waived). Rows with nothing to waive this way are left as they are.", [m.changed || 0, rows.length]))}</p>
+		<div style="max-height: 50vh; overflow: auto;">
+		<table class="table table-bordered table-condensed" style="font-size: 12px;">
+			<thead><tr><th>${esc(__("Employee"))}</th>${head}
+				<th class="text-right">${esc(__("Deduction now"))}</th>
+				<th class="text-right">${esc(__("After waiver"))}</th>
+				<th class="text-right">${esc(__("Waived"))}</th></tr></thead>
+			<tbody>${body}</tbody>
+			<tfoot><tr><th colspan="${labels.length + 1}">${esc(__("Total"))}</th>
+				<th class="text-right">${esc(format_currency(m.total_now || 0))}</th>
+				<th class="text-right">${esc(format_currency(m.total_after || 0))}</th>
+				<th class="text-right">${esc(format_currency(saving))}</th></tr></tfoot>
+		</table></div>`;
+}
+
+function clear_waiver(frm, targets) {
+	const waived_rows = (frm.doc.entries || []).filter((r) =>
+		cint(r.waived_marks) && (!targets || targets.includes(r.employee)));
+	if (!waived_rows.length) {
+		frappe.msgprint(targets ? __("None of the selected rows has a waiver.") : __("No row has a waiver."));
+		return;
+	}
+	frappe.confirm(
+		__("Remove the waiver from {0} row(s)? Their deduction goes back to the full amount.", [waived_rows.length]),
+		() => frappe.call({
+			method: `${WAIVER_METHOD}.clear_waiver`,
+			args: { docname: frm.doc.name, employees: targets || [] },
+			freeze: true,
+			callback: () => frm.reload_doc(),
+		})
+	);
 }

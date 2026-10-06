@@ -134,8 +134,10 @@ frappe.pages["rapl-attendance-export"].on_page_load = function (wrapper) {
 // ─── Toggle Bulk Mode ─────────────────────────────────────────────────────────
 
 function toggle_bulk_mode(state, page, employee_field, bulk_btn) {
-    // The report on screen is cleared, so nothing from it may be exported.
+    // The report on screen is cleared, so nothing from it may be exported --
+    // and a Load still in flight must not render into the other mode.
     state.data = {};
+    state.request_id = (state.request_id || 0) + 1;
     state.employees = [];
     if (state.is_bulk) {
         $(employee_field.wrapper).hide();

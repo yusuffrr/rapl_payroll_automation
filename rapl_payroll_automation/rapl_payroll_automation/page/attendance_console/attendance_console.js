@@ -34,6 +34,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		netopen: new Set(),   // employees whose breakdown is expanded
 		leave: new Map(),     // employee -> Set of ticked absent dates
 		netpay_busy: new Set(), // employees with a Compute net pay call running
+		netver: new Map(),      // employee -> bumps on every edit that changes net pay
 	};
 
 	const month_field = page.add_field({
@@ -104,20 +105,30 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 	function load() {
 		const range = period();
 		if (!range) return frappe.msgprint(__("Choose a month and year."));
+		// A cut-off date typed for another month would silently hide this
+		// month's later advances: a load of a DIFFERENT month ignores it.
+		const opts = { reset_cutoff: Boolean(state.range && state.range.start !== range.start) };
 
 		if (state.pending.size) {
 			frappe.confirm(
 				__("Discard {0} unsaved change(s)?", [state.pending.size]),
-				() => { state.pending.clear(); state.selected.clear(); do_load(range); }
+				() => { state.pending.clear(); state.selected.clear(); do_load(range, undefined, opts); }
 			);
 			return;
 		}
-		do_load(range);
+		do_load(range, undefined, opts);
 	}
 
 	// A follow-up reload (after Apply, Create, ...) passes the employee that
 	// was LOADED; only the Load button reads the live Employee box.
-	function do_load(range, employee = employee_field.get_value()) {
+	function do_load(range, employee = employee_field.get_value(), opts = {}) {
+		if (employee === undefined) employee = employee_field.get_value();
+		if (opts.reset_cutoff) {
+			// Cleared HERE (only when the load really happens), and not read
+			// back from the field below: set_value is asynchronous.
+			state.auto_cutoff = null;
+			cutoff_field.set_value("");
+		}
 		status(__("Loading..."));
 		$body.find(".ac-grid-out").empty();
 
@@ -131,7 +142,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 				// Only a cut-off the user TYPED is sent. The auto-filled one
 				// belongs to the month it was loaded for; sending it again
 				// pinned September's cut-off onto October.
-				advance_cutoff: (cutoff_field.get_value() && cutoff_field.get_value() !== state.auto_cutoff)
+				advance_cutoff: (!opts.reset_cutoff && cutoff_field.get_value() && cutoff_field.get_value() !== state.auto_cutoff)
 					? cutoff_field.get_value() : null,
 			},
 			freeze: true,
@@ -142,6 +153,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 				// buttons cannot act on the previously loaded month.
 				state.data = null;
 				$body.find(".ac-foot, .ac-bulk").hide();
+				$body.find(".ac-grid-out").empty();   // nothing left to edit against null data
 			},
 			callback(r) {
 				// Summary overrides belong to one period and employee set. A
@@ -190,7 +202,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 						state.leave.set(g.employee, still);
 					});
 				}
-				const typed_cutoff = cutoff_field.get_value() && cutoff_field.get_value() !== state.auto_cutoff;
+				const typed_cutoff = !opts.reset_cutoff && cutoff_field.get_value() && cutoff_field.get_value() !== state.auto_cutoff;
 				if (state.data.advance_cutoff && !typed_cutoff) {
 					state.auto_cutoff = state.data.advance_cutoff;
 					cutoff_field.set_value(state.data.advance_cutoff);
@@ -643,13 +655,16 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		// on the next save. __none__ means "pinned, and the band is cleared".
 		// "auto" is selected when nothing is pinned. Marking "none" selected made
 		// every ordinary row look like a deliberately waived late mark.
-		const opts = ['<option value="__none__"' + (att.late_mark_manual && !value ? " selected" : "") + ">" + __("none") + "</option>"]
-			.concat(bands.map((b) =>
-				`<option value="${frappe.utils.escape_html(b.label)}" ${b.label === value ? "selected" : ""}>${frappe.utils.escape_html(b.label)}</option>`))
-			.join("");
+		// What is SELECTED: a pending choice wins over the saved state (a
+		// pending "none" used to re-render as "auto", a pending "auto" as "none").
+		const pending = state.pending.get(att.name);
+		const sel = pending && "custom_late_mark_band" in pending
+			? (pending.custom_late_mark_band === "" ? "__auto__" : pending.custom_late_mark_band)
+			: (att.late_mark_manual ? (att.late_mark_band || "__none__") : "__auto__");
+		const opt = (v, label) => `<option value="${frappe.utils.escape_html(v)}" ${v === sel ? "selected" : ""}>${frappe.utils.escape_html(label)}</option>`;
 		return `<select class="ac-cell ac-day-band ${att.late_mark_manual ? "ac-pinned" : ""}"
 			title="${att.late_mark_manual ? __("Set by hand - the rules will not recalculate this day") : __("Automatic")}">
-			<option value="__auto__" ${att.late_mark_manual ? "" : "selected"}>${__("auto")}</option>${opts}</select>`;
+			${opt("__auto__", __("auto"))}${opt("__none__", __("none"))}${bands.map((b) => opt(b.label, b.label)).join("")}</select>`;
 	}
 
 	function visit_select(value, att, val) {
@@ -679,6 +694,12 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		// check_leave_record() never runs -- payroll would find no leave to
 		// deduct against. On Leave belongs to an approved Leave Application.
 		const options = ["Present", "Absent", "Half Day", "Work From Home"];
+		// A status the Console cannot set (e.g. a legacy "On Leave" with no
+		// leave type) is shown read-only: a dropdown would silently display
+		// -- and on the next edit queue -- "Present" instead.
+		if (!options.includes(value)) {
+			return `<span class="ea-dim">${frappe.utils.escape_html(value || "")}</span>`;
+		}
 		const pinned = att.status_manual;
 		return `<select class="ac-status ac-cell ${pinned ? "ac-pinned" : ""}"
 			title="${pinned ? __("Status set by hand - the rules will not re-apply Half Day for this day") : __("Automatic")}">${options
@@ -693,6 +714,12 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 			flags.find((f) => f.level === "amber") ||
 			flags[0]
 		);
+	}
+
+	// "9:33" and "09:33" are the same time.
+	function norm_hhmm(v) {
+		const m = /^(\d{1,2}):(\d{2})$/.exec(String(v || "").trim());
+		return m ? `${m[1].padStart(2, "0")}:${m[2]}` : String(v || "").trim();
 	}
 
 	function hhmm(value) {
@@ -752,6 +779,10 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 				frappe.show_alert({ message: __("Use H:MM, e.g. 2:30"), indicator: "orange" });
 				return render();
 			}
+			// Same minutes as shown (4:43 vs 04:43, or the seconds the display
+			// drops): not an edit -- don't override the exact figure.
+			const shown = Math.floor(flt(ov(employee, "ot_hours_hhmm", g.entry.ot_hours_hhmm)) / 60) * 60;
+			if (raw && secs === shown) return render();
 			set_ov(employee, "ot_hours_hhmm", secs || 0);
 		} else if (field.startsWith("band_")) {
 			// Whole days only: 1.5 would price at 1.5 but be stored as 2.
@@ -791,6 +822,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		}
 		state.overrides.set(employee, o);
 		state.netpay.delete(employee);   // the net figure used the old amounts
+		state.netver.set(employee, (state.netver.get(employee) || 0) + 1);
 		render();
 	});
 
@@ -869,6 +901,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		else picked.delete(adv);
 		state.adv.set(emp, picked);
 		state.netpay.delete(emp);   // the net figure used the old advance total
+		state.netver.set(emp, (state.netver.get(emp) || 0) + 1);
 		render();
 	});
 
@@ -884,6 +917,8 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		}
 		const range = loaded_period();
 		const token = state.data && state.data.loaded_at;
+		const ver = state.netver.get(emp) || 0;   // edits made while it runs make the result stale
+		const stale = () => !state.data || state.data.loaded_at !== token || (state.netver.get(emp) || 0) !== ver;
 		const $btn = $(this);
 		// A re-render recreates the button, so the busy flag lives in state.
 		if ($btn.prop("disabled") || state.netpay_busy.has(emp)) return;
@@ -907,13 +942,13 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 			callback(r) {
 				// The grid was reloaded (other month / filter) while this ran:
 				// the result belongs to a view that is gone.
-				if (!state.data || state.data.loaded_at !== token) return;
+				if (stale()) return;
 				state.netpay.set(emp, r.message || { error: __("No result returned") });
 				state.netopen.add(emp);
 				render();
 			},
 			error() {
-				if (!state.data || state.data.loaded_at !== token) return;
+				if (stale()) return;
 				state.netpay.set(emp, { error: __("Could not compute - see Error Log, or try again.") });
 				render();
 			},
@@ -970,7 +1005,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 			// Typed back exactly what was shown: not a change. The display drops
 			// seconds, so treating it as one would turn a pinned 4:43:48 into
 			// 4:43:00 (or pin an automatic day) without anyone meaning to.
-			if (v !== "" && v === day_ot_hhmm_saved(att)) {
+			if (v !== "" && seconds_from_hhmm(v) === seconds_from_hhmm(day_ot_hhmm_saved(att))) {
 				delete entry.custom_overtime_hours;
 				if (Object.keys(entry).filter((k) => k !== "name" && k !== "modified").length === 0) {
 					state.pending.delete(name);
@@ -1019,9 +1054,9 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		// The server leaves any field that is not sent exactly as it is.
 		const in_now = combine($tr, $in.val());
 		const out_now = combine($tr, $out.val());
-		if ((in_now || "") !== (hhmm(att.in_time) || "")) entry.in_time = in_now;
+		if (norm_hhmm(in_now) !== norm_hhmm(hhmm(att.in_time))) entry.in_time = in_now;
 		else delete entry.in_time;
-		if ((out_now || "") !== (hhmm(att.out_time) || "")) entry.out_time = out_now;
+		if (norm_hhmm(out_now) !== norm_hhmm(hhmm(att.out_time))) entry.out_time = out_now;
 		else delete entry.out_time;
 		if ($status.length && $status.val() !== att.status) entry.status = $status.val();
 		else delete entry.status;
@@ -1098,7 +1133,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 			const entry = state.pending.get(name) || { name, modified: att.modified };
 			// Only real changes (an unchanged out time would lose its seconds),
 			// and never a status change on a day decided by leave.
-			if (out && String(out).trim() !== (hhmm(att.out_time) || "")) entry.out_time = String(out).trim();
+			if (out && norm_hhmm(out) !== norm_hhmm(hhmm(att.out_time))) entry.out_time = String(out).trim();
 			if (st && st !== att.status && !att.genuine_leave) entry.status = st;
 			if (Object.keys(entry).filter((k) => k !== "name" && k !== "modified").length === 0) return;
 			state.pending.set(name, entry);
@@ -1320,6 +1355,19 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		const overrides = {};
 		state.overrides.forEach((v, k) => {
 			const c = Object.assign({}, v);
+			const g = (state.data.groups || []).find((x) => x.employee === k);
+			// ...together with the inputs it was priced from, so the server
+			// recomputes the SAME figure: without the hours, an employee the
+			// Console showed with 0 OT (Employee: OT off) got full punch OT at
+			// the typed rate, and a kept draft row used its old stored hours.
+			if (c._amount_auto && !("ot_hours_hhmm" in c) && g) c.ot_hours_hhmm = g.entry.ot_hours_hhmm;
+			if (c._late_auto && g) {
+				(state.data.bands || []).forEach((b, i) => {
+					const f = `band_${i + 1}_count`;
+					if (!(f in c)) c[f] = g.entry.band_counts[b.label] || 0;
+				});
+				if (!("per_day_rate" in c)) c.per_day_rate = g.entry.per_day_rate;
+			}
 			if (c._amount_auto) delete c.amount;
 			if (c._late_auto) delete c.late_amount;
 			delete c._amount_auto;

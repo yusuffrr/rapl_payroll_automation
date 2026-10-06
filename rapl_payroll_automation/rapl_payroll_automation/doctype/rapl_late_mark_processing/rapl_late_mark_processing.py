@@ -11,7 +11,13 @@ from rapl_payroll_automation.api.processing_common import (
 	cancel_additional_salaries,
 	validate_processing_doc,
 )
-from rapl_payroll_automation.api.payroll_math import RATE_DP, round_half_up
+from rapl_payroll_automation.api.payroll_math import (
+	RATE_DP,
+	allocate_waiver,
+	clamp_waived,
+	round_half_up,
+	waived_row_amount,
+)
 from rapl_payroll_automation.api.payroll_automation_utils import (
 	additional_salary_already_exists,
 	create_and_submit_additional_salary,
@@ -43,6 +49,7 @@ class RAPLLateMarkProcessing(Document):
 
 	def validate(self):
 		validate_processing_doc(self)
+		apply_waiver_math(self)
 
 	def before_submit(self):
 		before_submit_processing_doc(self)
@@ -285,3 +292,210 @@ def get_employee_late_mark_details(docname, employee):
 		"amount": result["amount"],
 		"errors": [err] if err else [],
 	}
+
+
+# --- Late-mark waivers -------------------------------------------------------
+#
+# A waiver forgives a number of an employee's late marks for this document's
+# month, band by band. The band counts themselves are never changed (they
+# are the attendance record); the waived marks sit beside them, and Amount is
+# priced from (count - waived). Waived counts are clamped to the band's count,
+# so a waiver can bring a deduction to zero but never below it.
+
+WAIVER_MODE_LABELS = {
+	"costliest": "Any band -- highest deduction first",
+	"cheapest": "Any band -- lowest deduction first",
+}
+
+
+def _bands():
+	settings = get_automation_settings()
+	bands = sorted(settings.late_mark_bands, key=lambda r: time_to_seconds(r.from_time))[:MAX_BANDS]
+	return [b.label for b in bands], [flt(b.fraction) for b in bands]
+
+
+def _counts(row, n):
+	return [cint(row.get(f"band_{i}_count")) for i in range(1, n + 1)]
+
+
+def _waived(row, n):
+	return [cint(row.get(f"band_{i}_waived")) for i in range(1, n + 1)]
+
+
+def _set_waived(row, waived):
+	for i in range(1, MAX_BANDS + 1):
+		row.set(f"band_{i}_waived", waived[i - 1] if i <= len(waived) else 0)
+
+
+def _base_amount(row):
+	"""What the row deducts with no waiver: the stored pre-waiver amount while
+	a waiver is on, otherwise the row's own Amount (computed or hand-typed)."""
+	if flt(row.get("amount_before_waiver")) > 0:
+		return flt(row.amount_before_waiver)
+	return flt(row.amount)
+
+
+def apply_waiver_math(doc, fractions=None):
+	"""validate(): keep every row's waiver consistent with its counts.
+
+	Rows with a waiver get Amount derived from the pre-waiver amount minus the
+	waived marks (priced once from count - waived in the normal case). Rows
+	without one keep their Amount; one whose waiver was just removed gets its
+	pre-waiver amount back.
+	"""
+	if fractions is None:
+		fractions = _bands()[1]
+	n = len(fractions)
+	for row in doc.entries:
+		counts = _counts(row, n)
+		# Waivers on band columns that are no longer configured are dropped.
+		waived = clamp_waived(counts, _waived(row, n))
+		_set_waived(row, waived)
+		row.waived_marks = sum(waived)
+		if not row.waived_marks:
+			if flt(row.get("amount_before_waiver")) > 0:
+				row.amount = flt(row.amount_before_waiver)
+			row.waived_amount = 0
+			row.amount_before_waiver = 0
+			row.waiver_reason = None
+			continue
+		if not (row.waiver_reason or "").strip():
+			frappe.throw(
+				_("Row {0} ({1}): enter a Waiver Reason for the waived late marks.").format(
+					row.idx, row.employee
+				)
+			)
+		before, after = waived_row_amount(counts, waived, fractions, row.per_day_rate, _base_amount(row))
+		row.amount_before_waiver = before
+		row.amount = after
+		row.waived_amount = before - after
+
+
+def _waiver_doc(docname):
+	doc = frappe.get_doc("RAPL Late Mark Processing", docname)
+	doc.check_permission("write")
+	if doc.docstatus != 0:
+		frappe.throw(_("Waivers can only be changed while the document is a draft."))
+	return doc
+
+
+def _target_rows(doc, employees):
+	"""The rows a bulk action applies to: the named employees, or every row."""
+	if isinstance(employees, str):
+		employees = frappe.parse_json(employees) if employees.strip() else None
+	if not employees:
+		return list(doc.entries)
+	wanted = set(employees)
+	return [row for row in doc.entries if row.employee in wanted]
+
+
+def _plan_waiver(doc, employees, mode, band, marks, combine):
+	labels, fractions = _bands()
+	n = len(fractions)
+	if not n:
+		frappe.throw(_("No late mark bands are configured in RAPL Payroll Automation Settings."))
+	if mode not in ("band", "costliest", "cheapest"):
+		frappe.throw(_("Choose where to waive the marks from."))
+	band_index = None
+	if mode == "band":
+		band_index = cint(band) - 1
+		if not 0 <= band_index < n:
+			frappe.throw(_("Choose a valid band."))
+	marks = cint(marks)
+	if marks < 1:
+		frappe.throw(_("Enter how many late marks to waive (1 or more)."))
+	add = combine == "add"
+
+	plan = []
+	for row in _target_rows(doc, employees):
+		counts = _counts(row, n)
+		current = clamp_waived(counts, _waived(row, n))
+		new = allocate_waiver(
+			counts, fractions, marks, mode, band_index, existing=current if add else None
+		)
+		amount_now = round_half_up(flt(row.amount))
+		applies = bool(sum(new))
+		if not applies:
+			# Nothing of this kind to waive for this employee (e.g. no marks in
+			# the chosen band). Leave the row -- including any earlier waiver --
+			# exactly as it is; removing waivers is "Clear Waiver"'s job.
+			new, amount_after = current, amount_now
+		else:
+			base = _base_amount(row)
+			amount_after = waived_row_amount(counts, new, fractions, row.per_day_rate, base)[1]
+		plan.append({
+			"row": row,
+			"employee": row.employee,
+			"employee_name": row.employee_name,
+			"counts": counts,
+			"waived_before": current,
+			"waived_after": new,
+			"amount_now": amount_now,
+			"amount_after": amount_after,
+			"saving": amount_now - amount_after,
+			"changed": new != current,
+			"waives": applies and new != current,
+			"applies": applies,
+		})
+	return labels, plan
+
+
+def _public(labels, plan):
+	rows = [{k: v for k, v in p.items() if k not in ("row", "applies")} for p in plan]
+	for r in rows:
+		r["changed"] = r.pop("waives")
+	return {
+		"labels": labels,
+		"rows": rows,
+		"total_now": sum(p["amount_now"] for p in plan),
+		"total_after": sum(p["amount_after"] for p in plan),
+		"changed": sum(1 for p in plan if p["waives"]),
+	}
+
+
+@frappe.whitelist()
+def preview_waiver(docname, mode, marks, band=None, combine="replace", employees=None):
+	"""What a waiver WOULD do to each row, without saving anything."""
+	doc = _waiver_doc(docname)
+	labels, plan = _plan_waiver(doc, employees, mode, band, marks, combine)
+	return _public(labels, plan)
+
+
+@frappe.whitelist(methods=["POST"])
+def apply_waiver(docname, mode, marks, reason, band=None, combine="replace", employees=None):
+	"""Apply a waiver to the chosen rows (or every row) and save the draft."""
+	reason = (reason or "").strip()
+	if not reason:
+		frappe.throw(_("Enter a reason for the waiver."))
+	doc = _waiver_doc(docname)
+	labels, plan = _plan_waiver(doc, employees, mode, band, marks, combine)
+	for p in plan:
+		if not p["applies"]:
+			continue
+		row = p["row"]
+		# Remember the pre-waiver amount before the first waiver lowers it.
+		row.amount_before_waiver = _base_amount(row)
+		_set_waived(row, p["waived_after"])
+		row.waiver_reason = reason   # also refreshed when the counts were already this
+	doc.save()
+	return _public(labels, plan)
+
+
+@frappe.whitelist(methods=["POST"])
+def clear_waiver(docname, employees=None):
+	"""Remove the waiver from the chosen rows (or every row); amounts go back
+	to the normal sum(count x fraction) x Per-Day Rate."""
+	doc = _waiver_doc(docname)
+	labels, fractions = _bands()
+	n = len(fractions)
+	cleared = 0
+	for row in _target_rows(doc, employees):
+		if not cint(row.waived_marks) and not any(_waived(row, MAX_BANDS)):
+			continue
+		row.amount = _base_amount(row)   # back to the pre-waiver amount
+		_set_waived(row, [])
+		row.amount_before_waiver = 0
+		cleared += 1
+	if cleared:
+		doc.save()
+	return {"cleared": cleared}

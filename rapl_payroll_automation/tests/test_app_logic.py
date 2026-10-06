@@ -493,3 +493,185 @@ class AuditRound3(unittest.TestCase):
 		self.assertIsNotNone(ac._check_pin("custom_overtime_hours", "abc", bands))
 		self.assertIsNone(ac._check_pin("custom_late_mark_band", "__none__", bands))
 		self.assertIsNotNone(ac._check_pin("custom_late_mark_band", "L9", bands))
+
+
+class AuditRound4(unittest.TestCase):
+	def derive(self, **kw):
+		return AttendanceRules.derive(self, **kw)
+
+	def test_stale_band_cleared_without_checkin(self):
+		d = self.derive(in_time=None, out_time=None, current_late_mark_band="L1")
+		self.assertTrue(d.get("reset_band"))
+		self.assertIsNone(d["custom_late_mark_band"])
+
+	def test_stale_band_cleared_on_holiday(self):
+		d = self.derive(in_time=dt.datetime(2026, 10, 4, 10, 5), attendance_date=dt.date(2026, 10, 4),
+						holiday_dates={dt.date(2026, 10, 4)}, current_late_mark_band="L2")
+		self.assertTrue(d.get("reset_band"))
+		self.assertIsNone(d["custom_late_mark_band"])
+
+	def test_pinned_band_survives_reset(self):
+		d = self.derive(in_time=None, late_mark_manual=1, current_late_mark_band="L1")
+		self.assertEqual(d["custom_late_mark_band"], "L1")
+
+	def test_partial_advance_recovery_leaves_the_rest(self):
+		adv = ns(name="EA1", paid_amount=10000, claimed_amount=0, return_amount=5000)
+		# 5,000 recovered and posted: 5,000 still recoverable (it used to be blocked)
+		self.assertEqual(ac._recoverable_amount(adv, {"EA1": {"drafts": 0, "scheduled": 5000}}), 5000)
+		# 5,000 scheduled but not yet posted: HRMS allows only the other 5,000
+		adv0 = ns(name="EA1", paid_amount=10000, claimed_amount=0, return_amount=0)
+		self.assertEqual(ac._recoverable_amount(adv0, {"EA1": {"drafts": 0, "scheduled": 5000}}), 5000)
+		# a draft recovery exists: nothing offered
+		self.assertEqual(ac._recoverable_amount(adv0, {"EA1": {"drafts": 1, "scheduled": 0}}), 0)
+		self.assertEqual(ac._recoverable_amount(adv0, {}), 10000)
+
+	def test_advance_hook_saves_after_submit(self):
+		from rapl_payroll_automation.api import employee_advance as ea
+		calls = []
+		doc = types.SimpleNamespace(paid_amount=1000, claimed_amount=200, return_amount=300,
+									custom_outstanding_balance=800)
+		doc.get = lambda k: getattr(doc, k, None)
+		doc.db_set = lambda *a, **k: calls.append(a)
+		ea.update_outstanding_balance(doc, "on_update_after_submit")
+		self.assertEqual(calls, [("custom_outstanding_balance", 500)])   # written, not just assigned
+		ea.update_outstanding_balance(doc, "validate")
+		self.assertEqual(doc.custom_outstanding_balance, 500)
+
+
+class StatutoryRows(unittest.TestCase):
+	def test_all_rows_of_a_component_are_summed(self):
+		doc = ns(earnings=[ns(salary_component="Conveyance", amount=500),
+						   ns(salary_component="Basic", amount=10000),
+						   ns(salary_component="Conveyance", amount=300)])
+		self.assertEqual(salary_slip_hooks._row_or(doc, "Conveyance", 999), 800)
+		self.assertEqual(salary_slip_hooks._row_or(doc, "Overtime", 75), 75)   # no row -> fallback
+
+
+from rapl_payroll_automation.rapl_payroll_automation.doctype.rapl_late_mark_processing import (  # noqa: E402
+	rapl_late_mark_processing as lmp,
+)
+
+
+class WRow(types.SimpleNamespace):
+	def get(self, k, d=None):
+		return getattr(self, k, d)
+
+	def set(self, k, v):
+		setattr(self, k, v)
+
+
+class LateMarkWaiver(unittest.TestCase):
+	LABELS, FRACTIONS = ["L1", "L2"], [0.25, 0.5]
+
+	def setUp(self):
+		self._bands = lmp._bands
+		lmp._bands = lambda: (self.LABELS, self.FRACTIONS)
+
+	def tearDown(self):
+		lmp._bands = self._bands
+
+	def row(self, emp, c1, c2, w1=0, w2=0, reason=None, amount=None, rate=400.0):
+		gross = round((c1 * 0.25 + c2 * 0.5) * rate)
+		return WRow(idx=1, employee=emp, employee_name=emp, band_1_count=c1, band_2_count=c2,
+					band_1_waived=w1, band_2_waived=w2, band_3_waived=0, band_4_waived=0,
+					band_5_waived=0, waived_marks=w1 + w2, per_day_rate=rate,
+					amount=gross if amount is None else amount, waiver_reason=reason)
+
+	class Doc(types.SimpleNamespace):
+		def save(self):
+			lmp.apply_waiver_math(self)
+			self.saved = True
+
+	def test_validate_prices_from_count_minus_waived(self):
+		r = self.row("E1", 4, 4, w2=5, reason="good attendance")
+		lmp.apply_waiver_math(ns(entries=[r]))
+		self.assertEqual((r.band_2_waived, r.waived_marks), (4, 4))   # capped, not 5
+		self.assertEqual((r.amount_before_waiver, r.amount, r.waived_amount), (1200, 400, 800))
+
+	def test_validate_requires_reason(self):
+		with self.assertRaises(frappe.ValidationError):
+			lmp.apply_waiver_math(ns(entries=[self.row("E1", 2, 0, w1=1)]))
+
+	def test_validate_leaves_unwaived_hand_amount(self):
+		r = self.row("E1", 2, 0, amount=999, reason="old")
+		lmp.apply_waiver_math(ns(entries=[r]))
+		self.assertEqual((r.amount, r.waived_amount, r.waiver_reason), (999, 0, None))
+
+	def test_bulk_waive_all_rows_and_selected(self):
+		doc = self.Doc(docstatus=0, entries=[self.row("E1", 4, 4), self.row("E2", 0, 1), self.row("E3", 2, 0)])
+		self._doc = lmp._waiver_doc
+		lmp._waiver_doc = lambda name: doc
+		try:
+			p = lmp.preview_waiver("X", mode="band", band=2, marks=5)
+			self.assertEqual([r["waived_after"] for r in p["rows"]], [[0, 4], [0, 1], [0, 0]])
+			self.assertEqual(p["changed"], 2)
+			self.assertFalse(getattr(doc, "saved", False))          # preview never saves
+			lmp.apply_waiver("X", mode="band", band=2, marks=5, reason="Diwali")
+			e1, e2, e3 = doc.entries
+			self.assertEqual((e1.amount, e2.amount, e3.amount), (400, 0, 200))
+			self.assertIsNone(e3.waiver_reason)                     # nothing waived there
+			# only E3 selected, any band
+			lmp.apply_waiver("X", mode="costliest", marks=1, reason="x", employees='["E3"]')
+			self.assertEqual((e3.band_1_waived, e3.amount), (1, 100))
+			self.assertEqual(e1.band_2_waived, 4)                   # untouched
+			lmp.clear_waiver("X", employees=["E1"])
+			self.assertEqual((e1.band_2_waived, e1.amount, e1.waived_marks), (0, 1200, 0))
+		finally:
+			lmp._waiver_doc = self._doc
+
+	def test_apply_needs_reason_and_marks(self):
+		doc = self.Doc(docstatus=0, entries=[self.row("E1", 1, 1)])
+		self._doc = lmp._waiver_doc
+		lmp._waiver_doc = lambda name: doc
+		try:
+			with self.assertRaises(frappe.ValidationError):
+				lmp.apply_waiver("X", mode="costliest", marks=1, reason="  ")
+			with self.assertRaises(frappe.ValidationError):
+				lmp.preview_waiver("X", mode="costliest", marks=0)
+			with self.assertRaises(frappe.ValidationError):
+				lmp.preview_waiver("X", mode="band", band=3, marks=1)
+		finally:
+			lmp._waiver_doc = self._doc
+
+	def test_fully_waived_document_can_submit(self):
+		r = self.row("E1", 2, 0, w1=2, reason="r")
+		lmp.apply_waiver_math(ns(entries=[r]))
+		self.assertEqual(r.amount, 0)
+		processing_common.before_submit_processing_doc(ns(entries=[r]))
+
+
+class LateMarkWaiverEdges(LateMarkWaiver):
+	def with_doc(self, rows):
+		doc = self.Doc(docstatus=0, entries=rows)
+		self._doc = lmp._waiver_doc
+		lmp._waiver_doc = lambda name: doc
+		self.addCleanup(lambda: setattr(lmp, "_waiver_doc", self._doc))
+		return doc
+
+	def test_waiver_never_raises_hand_set_amount(self):
+		doc = self.with_doc([self.row("E1", 0, 3, amount=0)])
+		p = lmp.preview_waiver("X", mode="costliest", marks=1)
+		self.assertEqual((p["rows"][0]["amount_after"], p["rows"][0]["saving"]), (0, 0))
+		lmp.apply_waiver("X", mode="costliest", marks=1, reason="r")
+		self.assertEqual(doc.entries[0].amount, 0)
+
+	def test_replace_leaves_rows_the_waiver_does_not_reach(self):
+		doc = self.with_doc([self.row("E1", 2, 0, w1=1, reason="earlier", amount=100)])
+		doc.entries[0].amount_before_waiver = 200
+		lmp.apply_waiver("X", mode="band", band=2, marks=1, reason="new")
+		r = doc.entries[0]
+		self.assertEqual((r.band_1_waived, r.waiver_reason, r.amount), (1, "earlier", 100))
+
+	def test_reapply_refreshes_reason(self):
+		doc = self.with_doc([self.row("E1", 2, 0)])
+		lmp.apply_waiver("X", mode="band", band=1, marks=1, reason="first")
+		lmp.apply_waiver("X", mode="band", band=1, marks=1, reason="second")
+		self.assertEqual((doc.entries[0].waiver_reason, doc.entries[0].amount), ("second", 100))
+
+	def test_console_override_on_waived_row_is_pre_waiver_amount(self):
+		r = self.row("E1", 0, 3, w2=1, reason="r")
+		doc = self.Doc(entries=[r])
+		lmp.apply_waiver_math(doc)                      # 600 -> 400
+		ac._apply_overrides(doc, "late_mark", {"E1": {"late_amount": 500}},
+							[{"fraction": 0.25}, {"fraction": 0.5}])
+		self.assertEqual((r.amount_before_waiver, r.amount), (500, 300))

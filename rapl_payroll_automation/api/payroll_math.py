@@ -213,3 +213,102 @@ def expected_payment_days(
 		- float(future_days or 0)
 	)
 	return max(paid, 0.0)
+
+
+# --- Late-mark waivers -------------------------------------------------------
+#
+# A waiver forgives a NUMBER of late marks for one month. It never goes below
+# zero: waiving 5 marks from a band that has 4 waives 4, and the 5th is simply
+# unused -- it does not carry to another band (unless "any band" was chosen),
+# to another month, or turn into a payment.
+
+WAIVER_MODES = ("band", "costliest", "cheapest")
+
+
+def _int0(value):
+	try:
+		return max(int(value or 0), 0)
+	except (TypeError, ValueError):
+		return 0
+
+
+def clamp_waived(counts, waived):
+	"""Each band's waived count kept between 0 and that band's own count."""
+	waived = list(waived or [])
+	waived += [0] * (len(counts) - len(waived))
+	return [min(_int0(w), _int0(c)) for w, c in zip(waived, counts)]
+
+
+def allocate_waiver(counts, fractions, marks, mode, band_index=None, existing=None):
+	"""Per-band waived counts after forgiving `marks` late marks.
+
+	counts     marks in each band, in band order
+	fractions  each band's day fraction, same order
+	mode       "band"      only band `band_index` (0-based); never spills over
+	           "costliest" highest-fraction band first, then the next
+	           "cheapest"  lowest-fraction band first, then the next
+	existing   waived counts already on the row, to ADD to; None replaces them
+	"""
+	if mode not in WAIVER_MODES:
+		raise ValueError(f"Unknown waiver mode: {mode}")
+	n = len(counts)
+	counts = [_int0(c) for c in counts]
+	fractions = [float(f or 0) for f in list(fractions) + [0] * (n - len(fractions))]
+	waived = clamp_waived(counts, existing) if existing is not None else [0] * n
+	remaining = _int0(marks)
+
+	if mode == "band":
+		if band_index is None or not 0 <= int(band_index) < n:
+			raise ValueError("Choose a valid band.")
+		order = [int(band_index)]
+	elif mode == "costliest":
+		# Ties: the later (later-in-the-morning) band first.
+		order = sorted(range(n), key=lambda i: (-fractions[i], -i))
+	else:
+		order = sorted(range(n), key=lambda i: (fractions[i], i))
+
+	for i in order:
+		if remaining <= 0:
+			break
+		take = min(counts[i] - waived[i], remaining)
+		waived[i] += take
+		remaining -= take
+	return waived
+
+
+def late_amounts(counts, waived, fractions, per_day_rate):
+	"""(amount before waiver, amount after waiver), each rounded ONCE.
+
+	Both are priced from day-units the same way RAPL Late Mark Processing
+	prices a row, so "before" equals the normal amount and the saving is
+	exactly before - after.
+	"""
+	n = len(counts)
+	fractions = [float(f or 0) for f in list(fractions) + [0] * (n - len(fractions))]
+	waived = clamp_waived(counts, waived)
+	gross = sum(_int0(c) * f for c, f in zip(counts, fractions))
+	net = sum((_int0(c) - w) * f for c, w, f in zip(counts, waived, fractions))
+	rate = float(per_day_rate or 0)
+	return round_half_up(gross * rate), round_half_up(net * rate)
+
+
+def waived_row_amount(counts, waived, fractions, per_day_rate, base=None):
+	"""(amount before waiver, amount after waiver) for one row.
+
+	`base` is what the row deducted with no waiver. Normally that is the priced
+	amount, and the result is priced once from (count - waived). When someone
+	set the amount by hand (or the Console typed one), the waiver takes the
+	waived marks' value OFF that amount instead -- so a waiver can only ever
+	lower a deduction, and never below zero.
+	"""
+	gross, net = late_amounts(counts, waived, fractions, per_day_rate)
+	if base is None:
+		return gross, net
+	base = max(round_half_up(float(base or 0)), 0)
+	if base == gross:
+		return gross, net
+	n = len(counts)
+	fractions = [float(f or 0) for f in list(fractions) + [0] * (n - len(fractions))]
+	units = sum(w * f for w, f in zip(clamp_waived(counts, waived), fractions))
+	value = round_half_up(units * float(per_day_rate or 0))
+	return base, max(base - value, 0)

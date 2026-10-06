@@ -218,7 +218,13 @@ def derive_attendance_fields(
 		return derived
 
 	# --- Guard 2: no check-in data at all ---
+	# No check-in and holidays carry no late mark. "reset_band" tells callers
+	# to WRITE that, or a band left from an earlier punch (cleared for a site
+	# visit, or a day later declared a holiday) stayed on the record, was
+	# deducted by Late Mark Processing, and Recalculate could never clear it.
 	if not in_time:
+		derived["custom_late_mark_band"] = _pin("band", None)
+		derived["reset_band"] = True
 		return derived
 
 	# --- Guard 3: Sunday or any holiday -- OT only, no lateness rules ---
@@ -226,6 +232,8 @@ def derive_attendance_fields(
 		hours = _pin("ot", _ot(status))
 		derived["custom_overtime_hours"] = hours
 		derived["custom_overtime"] = 1 if hours > 0 else 0
+		derived["custom_late_mark_band"] = _pin("band", None)
+		derived["reset_band"] = True
 		return derived
 
 	derived["rules_applied"] = True
@@ -344,6 +352,8 @@ def apply_attendance_deduction_logic(doc, method):
 	if not derived["rules_applied"]:
 		if doc.status == "Half Day":
 			doc.half_day_status = derived["half_day_status"]
+		if derived.get("reset_band"):
+			doc.custom_late_mark_band = derived["custom_late_mark_band"]
 		return
 
 	doc.custom_late_mark_band = derived["custom_late_mark_band"]

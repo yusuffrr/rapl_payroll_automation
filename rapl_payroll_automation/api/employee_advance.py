@@ -4,9 +4,14 @@ from frappe.utils import flt
 
 def update_outstanding_balance(doc, method):
 	"""Called on Employee Advance validate and on_update_after_submit."""
-	doc.custom_outstanding_balance = (
-		flt(doc.paid_amount) - flt(doc.claimed_amount) - flt(doc.return_amount)
-	)
+	outstanding = flt(doc.paid_amount) - flt(doc.claimed_amount) - flt(doc.return_amount)
+	if method == "on_update_after_submit":
+		# Frappe has already written the document by the time this event
+		# runs, so a plain assignment here was never saved.
+		if flt(doc.get("custom_outstanding_balance")) != outstanding:
+			doc.db_set("custom_outstanding_balance", outstanding, update_modified=False)
+		return
+	doc.custom_outstanding_balance = outstanding
 
 
 def update_outstanding_balance_from_payment_entry(doc, method):
