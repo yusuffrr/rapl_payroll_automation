@@ -52,8 +52,25 @@ doc_events = {
 		"on_cancel": "rapl_payroll_automation.api.employee_advance.update_outstanding_balance_from_payment_entry",
 	},
 	"Expense Claim": {
-		"on_submit": "rapl_payroll_automation.api.employee_advance.update_outstanding_balance_from_expense_claim",
-		"on_cancel": "rapl_payroll_automation.api.employee_advance.update_outstanding_balance_from_expense_claim",
+		# order-cost rollout, step 6: link claim lines to their order's Project
+		"validate": "rapl_payroll_automation.api.order_costs.expense_claim_validate",
+		"on_submit": [
+			"rapl_payroll_automation.api.employee_advance.update_outstanding_balance_from_expense_claim",
+			"rapl_payroll_automation.api.order_costs.expense_claim_on_change",
+		],
+		"on_cancel": [
+			"rapl_payroll_automation.api.employee_advance.update_outstanding_balance_from_expense_claim",
+			"rapl_payroll_automation.api.order_costs.expense_claim_on_change",
+		],
+	},
+	# order-cost rollout, step 6: trips linked to orders; ticket Purchase Invoices
+	"Travel Request": {
+		"validate": "rapl_payroll_automation.api.order_costs.travel_request_validate",
+		"on_submit": "rapl_payroll_automation.api.order_costs.travel_request_on_change",
+		"on_cancel": "rapl_payroll_automation.api.order_costs.travel_request_on_change",
+	},
+	"Purchase Invoice": {
+		"validate": "rapl_payroll_automation.api.order_costs.purchase_invoice_validate",
 	},
 	"Journal Entry": {
 		"on_submit": "rapl_payroll_automation.api.employee_advance.update_outstanding_balance_from_journal_entry",
@@ -75,6 +92,16 @@ doc_events = {
 # public/css/x.css is never compiled and never reaches assets.json, so the
 # stylesheet silently never loads and the page renders unstyled.
 app_include_css = "rapl_attendance.bundle.css"
+
+# Form scripts (order-cost rollout, step 6).
+# employee_advance.js replaces Client Script "Employee Advance, Partial Payment Entry enabler".
+doctype_js = {
+	"Employee Advance": "public/js/employee_advance.js",
+	"Travel Request": "public/js/travel_request.js",
+}
+doctype_list_js = {
+	"Travel Request": "public/js/travel_request_list.js",
+}
 
 # Fixtures ---------------------------------------------------------------
 # Filtered by explicit dt + fieldname rather than by module. The previous
