@@ -11,6 +11,9 @@ D  Advances stay with the engineer and roll over. Nothing here touches Employee
 5  Trips and claims are NEVER blocked by the order's installation or site-cost answers.
    Those can be decided later; frappe_attachment_plus works out the client's share
    at billing.
+   A claim line is linked to the order's Project only when its account is a Site Cost
+   Account (Order Cost Settings) or it is for a Travel Request; samples and site courier
+   lines must name their order (13 Nov).
 6  No automatic "Paid By" on claim lines. Who pays is decided on the order (Travel /
    Food / Accommodation), so late decisions and splits work. The trial field is hidden.
 7  Open: how to assign a ticket when one engineer goes straight from one client to
@@ -182,13 +185,30 @@ def purchase_invoice_validate(doc, method=None):
 
 
 def expense_claim_validate(doc, method=None):
+	"""A claim line that names an order (directly or through its Travel Request) gets the
+	order's Project, on the same rule as purchase lines: only when the line's account is a
+	Site Cost Account, or the line is for a Travel Request. A line on any other account (e.g.
+	Sales Expenses) keeps its Sales Order for reference but isn't linked to the Project, so
+	it neither counts nor creates one. Lines on an "Order required" account (Client Samples,
+	Site Courier) must name their order."""
+	is_site_cost = _fap("api.site_billing.is_site_cost_account")
+	require_order = _fap("api.site_billing.require_order")
 	for row in doc.expenses:
 		if row.get("custom_travel_request") and not row.get("custom_sales_order"):
 			row.custom_sales_order = frappe.db.get_value(
 				"Travel Request", row.custom_travel_request, "custom_sales_order"
 			)
-		if row.get("custom_sales_order"):
+		account = row.get("default_account")
+		if row.get("custom_sales_order") and (
+			row.get("custom_travel_request") or (is_site_cost and is_site_cost(account))
+		):
 			row.project = _project_for(row.custom_sales_order) or row.get("project")
+		if require_order:
+			require_order(
+				_("Row {0} ({1})").format(row.idx, row.get("expense_type") or ""),
+				account,
+				bool(row.get("custom_sales_order") or row.get("project")),
+			)
 
 
 def expense_claim_on_change(doc, method=None):
