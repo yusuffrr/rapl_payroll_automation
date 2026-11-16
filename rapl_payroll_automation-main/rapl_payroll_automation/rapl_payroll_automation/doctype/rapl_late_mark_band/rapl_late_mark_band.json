@@ -1,0 +1,50 @@
+{
+  "doctype": "DocType",
+  "name": "RAPL Late Mark Band",
+  "module": "RAPL Payroll Automation",
+  "istable": 1,
+  "editable_grid": 1,
+  "engine": "InnoDB",
+  "field_order": [
+    "label",
+    "from_time",
+    "to_time",
+    "fraction"
+  ],
+  "fields": [
+    {
+      "fieldname": "label",
+      "fieldtype": "Data",
+      "label": "Label",
+      "reqd": 1,
+      "in_list_view": 1,
+      "description": "Shown as the column header in RAPL Late Mark Processing (e.g. '9:46-10:00')."
+    },
+    {
+      "fieldname": "from_time",
+      "fieldtype": "Time",
+      "label": "From Time",
+      "reqd": 1,
+      "in_list_view": 1,
+      "description": "Inclusive. A check-in exactly at this time falls into this band."
+    },
+    {
+      "fieldname": "to_time",
+      "fieldtype": "Time",
+      "label": "To Time",
+      "reqd": 1,
+      "in_list_view": 1,
+      "description": "Inclusive. Anything later than every defined band's To Time triggers native Half Day instead."
+    },
+    {
+      "fieldname": "fraction",
+      "fieldtype": "Float",
+      "label": "Fraction",
+      "precision": "4",
+      "reqd": 1,
+      "in_list_view": 1,
+      "description": "Fraction of one day's salary deducted per occurrence in this band."
+    }
+  ],
+  "permissions": []
+}

@@ -1,0 +1,516 @@
+# Copyright (c) 2026, RAPL and contributors
+#
+# Shared data layer for BOTH the Employee Attendance page (read-only) and the
+# Attendance Console (HR editing). One query, one set of rules, two surfaces.
+#
+# WHY CALENDAR-DRIVEN
+# -------------------
+# Rows are generated from the calendar and Attendance is LEFT JOINed on, so a
+# working day with NO Attendance document still produces a row. That is the
+# only way to surface "nobody marked attendance for Ramesh on the 17th", which
+# a record-driven query cannot see. The previous hrms_custom export already
+# used a recursive CTE for this; the logic is inherited, not invented.
+#
+# WHY DRIFT DETECTION
+# -------------------
+# For every day this recomputes what the rules SAY the band and OT should be,
+# and compares against what is STORED on the record. They diverge whenever a
+# record was changed without passing through Attendance.validate() -- most
+# commonly a direct SQL correction. Before this, that drift was invisible until
+# payroll. Now it is an amber flag.
+#
+# The recomputation calls match_late_band(), is_early_exit() and
+# compute_day_ot() -- the SAME functions the live validate hook uses. It must
+# never grow its own copy of a rule; two implementations of the OT calculation
+# is precisely the bug this app spent a month unwinding.
+
+import frappe
+from frappe.utils import cint, flt, get_datetime, getdate, time_diff_in_hours
+
+from rapl_payroll_automation.api.attendance_automation import (
+	is_early_exit,
+	match_late_band,
+)
+from rapl_payroll_automation.api.ot_engine import (
+	NightShiftNotSupported,
+	compute_day_ot,
+	is_ot_eligible,
+	resolve_shift,
+)
+from rapl_payroll_automation.api.payroll_automation_utils import (
+	get_employee_holiday_rows,
+	get_automation_settings,
+)
+from rapl_payroll_automation.api.payroll_math import day_totals, round_half_up
+from rapl_payroll_automation.api.payroll_automation_utils import time_to_seconds
+from erpnext.setup.doctype.employee.employee import get_holiday_list_for_employee
+
+# Flag codes. "red" = something is wrong and payroll will be affected.
+# "amber" = valid but worth a look. "info" = context, not a problem.
+FLAG_MISSING_PUNCH = "missing_punch"
+FLAG_NO_RECORD = "no_record"
+FLAG_CANCELLED_ONLY = "cancelled_only"
+FLAG_OT_DRIFT = "ot_drift"
+FLAG_LATE_DRIFT = "late_drift"
+FLAG_OFF_DAY_WORKED = "off_day_worked"
+FLAG_ON_LEAVE = "on_leave"
+FLAG_STATUS_DRIFT = "status_drift"
+FLAG_DUPLICATE_RECORDS = "duplicate_records"
+FLAG_CHECKIN_MISMATCH = "checkin_mismatch"
+
+FLAG_LEVELS = {
+	FLAG_MISSING_PUNCH: "red",
+	FLAG_NO_RECORD: "red",
+	FLAG_CANCELLED_ONLY: "red",
+	FLAG_OT_DRIFT: "amber",
+	FLAG_LATE_DRIFT: "amber",
+	FLAG_OFF_DAY_WORKED: "amber",
+	FLAG_STATUS_DRIFT: "amber",
+	FLAG_DUPLICATE_RECORDS: "red",
+	FLAG_CHECKIN_MISMATCH: "info",
+	FLAG_ON_LEAVE: "info",
+}
+
+
+def _daterange(start_date, end_date):
+	from datetime import timedelta
+
+	current = getdate(start_date)
+	last = getdate(end_date)
+	while current <= last:
+		yield current
+		current += timedelta(days=1)
+
+
+def _fetch_attendance(employee, start_date, end_date):
+	"""All Attendance for the period INCLUDING cancelled (docstatus 2).
+
+	Cancelled records matter: validate_duplicate_record() in attendance.py
+	filters on docstatus < 2, so a cancelled record does NOT block creating a
+	new one for that date. A day whose only record is cancelled is therefore
+	genuinely missing as far as payroll is concerned, and must be flagged as
+	such rather than looking occupied.
+	"""
+	rows = frappe.get_all(
+		"Attendance",
+		filters={
+			"employee": employee,
+			"attendance_date": ["between", [start_date, end_date]],
+			"docstatus": ["<", 3],
+		},
+		fields=[
+			"name", "docstatus", "attendance_date", "status", "half_day_status",
+			"in_time", "out_time", "working_hours", "shift", "late_entry",
+			"early_exit", "leave_type", "leave_application",
+			"custom_late_mark_band", "custom_overtime_hours", "custom_overtime",
+			"custom_overtime_manual", "custom_late_mark_manual",
+			"custom_status_manual", "custom_attendance_type", "modified",
+		],
+		order_by="attendance_date, docstatus",
+	)
+
+	by_date = {}
+	for row in rows:
+		by_date.setdefault(getdate(row.attendance_date), []).append(row)
+	return by_date
+
+
+def _pick_active(records):
+	"""Submitted beats draft beats cancelled. Returns (record, cancelled_only)."""
+	if not records:
+		return None, False
+	submitted = [r for r in records if r.docstatus == 1]
+	if submitted:
+		return submitted[0], False
+	draft = [r for r in records if r.docstatus == 0]
+	if draft:
+		return draft[0], False
+	return records[0], True
+
+
+def _employee_context(employee):
+	emp = frappe.db.get_value(
+		"Employee",
+		employee,
+		["name", "employee_name", "grade", "status", "date_of_joining",
+		 "relieving_date", "company", "holiday_list"],
+		as_dict=True,
+	)
+	if not emp:
+		frappe.throw(f"Employee {employee} not found")
+	return emp
+
+
+def build_month_rows(employee, start_date, end_date, settings=None):
+	"""One row per calendar day. The single source both pages read.
+
+	Each row carries what is STORED and what the rules COMPUTE, so the caller
+	can show either and the difference between them.
+	"""
+	settings = settings or get_automation_settings()
+	emp = _employee_context(employee)
+
+	# The list(s) in force DURING the period, not the one assigned today.
+	holiday_names = {
+		getdate(h.holiday_date): {"description": plain_text(h.description), "weekly_off": bool(h.weekly_off)}
+		for h in get_employee_holiday_rows(employee, start_date, end_date)
+	}
+	holiday_dates = set(holiday_names)
+
+	# Employee.custom_ot -- looked up once for the whole period, not per day.
+	ot_eligible = is_ot_eligible(employee)
+
+	by_date = _fetch_attendance(employee, start_date, end_date)
+
+	# Linked check-ins for the whole period in ONE query (was one per record).
+	record_names = [r.name for recs in by_date.values() for r in recs]
+	checkins_by_record = {}
+	if record_names:
+		for c in frappe.get_all(
+			"Employee Checkin",
+			filters={"attendance": ["in", record_names]},
+			fields=["attendance", "time", "log_type"],
+			order_by="time",
+		):
+			checkins_by_record.setdefault(c.attendance, []).append(c)
+
+	joining = getdate(emp.date_of_joining) if emp.date_of_joining else None
+	relieving = getdate(emp.relieving_date) if emp.relieving_date else None
+
+	# A month that has not finished has days that simply have not happened yet.
+	# Those must never read as "nobody marked attendance" -- they are not
+	# missing, they are upcoming.
+	today = getdate()
+
+	rows = []
+	for day in _daterange(start_date, end_date):
+		# Outside employment: no row is expected, so never flag it as missing.
+		in_service = (not joining or day >= joining) and (not relieving or day <= relieving)
+
+		holiday = holiday_names.get(day)
+		is_holiday = day in holiday_dates
+
+		records = by_date.get(day, [])
+		record, cancelled_only = _pick_active(records)
+
+		row = {
+			"date": str(day),
+			"day_label": day.strftime("%a"),
+			"in_service": in_service,
+			"is_holiday": is_holiday,
+			"is_weekly_off": bool(holiday and holiday["weekly_off"]),
+			"is_future": day > today,
+			"holiday_description": (holiday or {}).get("description"),
+			"attendance": None,
+			"flags": [],
+		}
+
+		if len([r for r in records if r.docstatus == 1]) > 1:
+			# validate_duplicate_record() permits several submitted records for
+			# one date when the SHIFT differs. _pick_active() shows only the
+			# first, so the others would be edited by nobody and seen by
+			# nobody. Impossible with a single Shift Type, but silent if a
+			# second is ever added.
+			_flag(row, FLAG_DUPLICATE_RECORDS,
+				  f"{len([r for r in records if r.docstatus == 1])} submitted records "
+				  f"exist for this date; only the first is shown")
+
+		if record and not cancelled_only:
+			row["attendance"] = {
+				"name": record.name,
+				"docstatus": record.docstatus,
+				"status": record.status,
+				"half_day_status": record.half_day_status,
+				"in_time": str(record.in_time) if record.in_time else None,
+				"out_time": str(record.out_time) if record.out_time else None,
+				"working_hours": flt(record.working_hours, 2),
+				"shift": record.shift,
+				"late_entry": record.late_entry,
+				"early_exit": record.early_exit,
+				"leave_type": record.leave_type,
+				"leave_application": record.leave_application,
+				# Set again in _add_record_flags, but the Console needs it on
+				# every row to decide whether the status picker is editable --
+				# an auto half day must stay editable, a real leave must not.
+				"genuine_leave": bool(record.leave_type) and (
+					bool(record.leave_application)
+					or record.leave_type != settings.half_day_leave_type
+				),
+				"late_mark_band": record.custom_late_mark_band,
+				"overtime_hours": round_half_up(flt(record.custom_overtime_hours), 2),
+				"overtime_manual": bool(record.custom_overtime_manual),
+				"late_mark_manual": bool(record.custom_late_mark_manual),
+				"status_manual": bool(record.custom_status_manual),
+				"attendance_type": record.custom_attendance_type,
+				"modified": str(record.modified),
+			}
+			_add_record_flags(row, record, day, is_holiday, holiday_dates, settings, emp, ot_eligible,
+							  checkins=checkins_by_record.get(record.name, []))
+		elif in_service and day <= today:
+			if cancelled_only:
+				_flag(row, FLAG_CANCELLED_ONLY, "Only a cancelled record exists for this day")
+			elif not is_holiday and not (day == today):
+				# Today is not over: no record YET is normal until the day's
+				# check-ins have been turned into attendance.
+				_flag(row, FLAG_NO_RECORD, "No attendance marked on a working day")
+
+		rows.append(row)
+
+	return {"employee": emp, "rows": rows}
+
+
+def _flag(row, code, message, extra=None):
+	entry = {"code": code, "level": FLAG_LEVELS.get(code, "info"), "message": message}
+	if extra:
+		entry.update(extra)
+	row["flags"].append(entry)
+
+
+def _add_record_flags(row, record, day, is_holiday, holiday_dates, settings, emp, ot_eligible=True,
+					  checkins=None):
+	att = row["attendance"]
+
+	# A genuine leave is one backed by a Leave Application, or carrying a leave
+	# type the automation did not write. The automation's own half-day marker
+	# is NOT a leave for drift purposes -- treating it as one would skip
+	# recomputation on exactly the records most likely to be stale.
+	own_marker = settings.half_day_leave_type
+	genuine_leave = bool(record.leave_type) and (
+		bool(record.leave_application) or record.leave_type != own_marker
+	)
+	att["genuine_leave"] = genuine_leave
+
+	if record.leave_type:
+		_flag(row, FLAG_ON_LEAVE,
+			  f"On leave: {record.leave_type}" if genuine_leave
+			  else f"Auto half day ({record.leave_type})",
+			  {"leave_application": record.leave_application})
+
+	# Employee Checkin is the raw evidence; Attendance is the adjudicated
+	# version. A Console edit changes only the latter, and
+	# validate_time_change() blocks editing a linked checkin's time, so the two
+	# diverge permanently. Overwriting the evidence to match would destroy the
+	# ability to see a correction was ever made -- so this is surfaced, never
+	# reconciled.
+	if checkins is None:
+		checkins = frappe.get_all(
+			"Employee Checkin",
+			filters={"attendance": record.name},
+			fields=["time", "log_type"],
+			order_by="time",
+		)
+	if checkins and record.in_time:
+		first = get_datetime(checkins[0].time)
+		if abs((get_datetime(record.in_time) - first).total_seconds()) > 60:
+			_flag(row, FLAG_CHECKIN_MISMATCH,
+				  f"In time {str(record.in_time)[11:16]} differs from the linked "
+				  f"check-in {str(first)[11:16]}")
+
+	if record.status == "Present" and (not record.in_time or not record.out_time):
+		if not (record.custom_attendance_type and not record.in_time and not record.out_time):
+			# A Present day with BOTH punches empty and a visit type recorded is
+			# a site visit, not a forgotten punch. Anything else still flags.
+			missing = "check-out" if record.in_time else "check-in"
+			_flag(row, FLAG_MISSING_PUNCH, f"Missing {missing}")
+
+	if is_holiday:
+		_flag(row, FLAG_OFF_DAY_WORKED, "Attendance marked on a holiday or weekly off")
+
+	# --- drift: what the rules say now vs what is stored ---
+	expected_working_hours = att["working_hours"]
+	if not expected_working_hours and record.in_time and record.out_time:
+		in_dt, out_dt = get_datetime(record.in_time), get_datetime(record.out_time)
+		if out_dt > in_dt:
+			expected_working_hours = flt(time_diff_in_hours(out_dt, in_dt), 2)
+
+	expected_band = None
+	expected_half_day = False
+	# Not on days the rules never band (Absent / On Leave / WFH), or the drift
+	# flag would claim a band Recalculate can never produce.
+	if (not genuine_leave and not is_holiday and record.in_time
+			and record.status not in ("Absent", "On Leave", "Work From Home")):
+		expected_band, past_all_bands = match_late_band(record.in_time, settings)
+		expected_half_day = past_all_bands or is_early_exit(record.out_time, day, settings)
+
+	expected_ot = None
+	expected_ot_exact = None
+	if not genuine_leave:
+		try:
+			expected_ot_exact = (
+				compute_day_ot(
+					in_time=record.in_time,
+					out_time=record.out_time,
+					# EXACT hours (the stored Float keeps full precision), as
+					# Processing passes them -- the 2-dp display figure lost up
+					# to 18 s on every holiday worked.
+					working_hours=flt(record.working_hours) or None,
+					attendance_date=day,
+					status=record.status,
+					shift=resolve_shift(record.shift, settings),
+					settings=settings,
+					holiday_dates=holiday_dates,
+					ot_eligible=ot_eligible,
+				)
+			)
+			# Rounded for DISPLAY only. The period total adds the exact
+			# figures and rounds once (see summarise()).
+			expected_ot = round_half_up(expected_ot_exact, 2)
+		except NightShiftNotSupported:
+			expected_ot = None
+			expected_ot_exact = None
+
+	att["expected_working_hours"] = expected_working_hours
+	att["expected_half_day"] = expected_half_day
+	att["expected_late_mark_band"] = expected_band
+	att["expected_overtime_hours"] = expected_ot
+	att["expected_overtime_exact"] = expected_ot_exact
+	# Whole SECONDS of overtime for display: the figure that is actually paid
+	# (recomputed from the punches; a pinned day uses its pinned value). The
+	# stored custom_overtime_hours is rounded to 0.01 h (36 s), so turning it
+	# back into h:mm showed 22:43 out as 4:44 of overtime instead of 4:43.
+	if record.custom_overtime_manual or expected_ot_exact is None:
+		# Pinned hours are stored from whole seconds (h:mm / 3600), so x3600
+		# gives those seconds back.
+		att["overtime_seconds"] = round_half_up(flt(record.custom_overtime_hours) * 3600)
+	else:
+		att["overtime_seconds"] = round_half_up(max(flt(expected_ot_exact), 0) * 3600)
+	att["expected_early_exit"] = (
+		1 if (not is_holiday and is_early_exit(record.out_time, day, settings)) else 0
+	)
+
+	if (not record.custom_overtime_manual) and expected_ot is not None \
+			and abs(flt(expected_ot) - att["overtime_hours"]) > 0.01:
+		_flag(row, FLAG_OT_DRIFT,
+			  f"Overtime shows {att['overtime_hours']}h, rules give {expected_ot}h",
+			  {"stored": att["overtime_hours"], "expected": expected_ot})
+
+	if not genuine_leave and not is_holiday and record.in_time:
+		is_half_day_now = record.status == "Half Day"
+		if expected_half_day and not is_half_day_now:
+			_flag(row, FLAG_STATUS_DRIFT,
+				  "Rules call for Half Day; record shows " + (record.status or "-"))
+		elif is_half_day_now and not expected_half_day and record.leave_type == own_marker:
+			_flag(row, FLAG_STATUS_DRIFT,
+				  "Half Day no longer applies to these punches; recalculate to clear it")
+
+	if (not record.custom_late_mark_manual) and \
+			(expected_band or None) != (att["late_mark_band"] or None):
+		_flag(row, FLAG_LATE_DRIFT,
+			  f"Late mark shows {att['late_mark_band'] or 'none'}, "
+			  f"rules give {expected_band or 'none'}",
+			  {"stored": att["late_mark_band"], "expected": expected_band})
+
+
+def summarise(rows, settings=None, today=None):
+	"""Period totals for one employee, from the day rows.
+
+	`present` is unchanged (a plain count of Present + Work From Home records,
+	which other pages rely on). The payroll-meaningful figure is `payable_days`:
+	days worked + weekly offs and holidays + half days at 0.5. Days that have
+	not happened yet are excluded everywhere, so a month in progress is
+	summarised through today only.
+	"""
+	settings = settings or get_automation_settings()
+	today = today or getdate()
+	late_only_present = cint(settings.get("count_late_marks_only_when_present", 1))
+
+	summary = {
+		"present": 0, "half_day": 0, "absent": 0, "on_leave": 0,
+		"holiday": 0, "no_record": 0, "wfh": 0,
+		"overtime_hours": 0.0, "band_counts": {},
+		"red_flags": 0, "amber_flags": 0,
+	}
+
+	for row in rows:
+		for f in row["flags"]:
+			if f["level"] == "red":
+				summary["red_flags"] += 1
+			elif f["level"] == "amber":
+				summary["amber_flags"] += 1
+
+		att = row["attendance"]
+		if not att:
+			if row["is_holiday"]:
+				summary["holiday"] += 1
+			elif row["in_service"] and not row.get("is_future") and str(row["date"]) != str(today):
+				summary["no_record"] += 1
+			continue
+
+		# Work From Home is a separate status but is a working day and is paid
+		# in full, so it counts toward Present. Tracked separately too, so the
+		# figure can be explained.
+		status_key = {
+			"Present": "present", "Work From Home": "present",
+			"Half Day": "half_day", "Absent": "absent", "On Leave": "on_leave",
+		}.get(att["status"])
+		if att["status"] == "Work From Home":
+			summary["wfh"] = summary.get("wfh", 0) + 1
+		if status_key:
+			summary[status_key] += 1
+
+		# Money totals mirror what the processing documents PAY: submitted
+		# records only (a draft is shown for editing but is not paid yet).
+		if att.get("docstatus") != 1:
+			continue
+
+		# EXACT hours, the same figure RAPL Overtime Processing pays from
+		# (recomputed from punches; a pinned day uses its exact pinned value).
+		# Adding the 2-dp day figures instead built in a bias: 47 minutes is
+		# 0.7833 h, shown as 0.78, and 26 such days lost 0.09 h of pay.
+		if att.get("overtime_seconds") is not None:
+			summary["overtime_hours"] += flt(att["overtime_seconds"]) / 3600
+		else:
+			summary["overtime_hours"] += flt(att["overtime_hours"])
+
+		# Late Mark Processing counts a band only on Present / Half Day when
+		# "count late marks only when present" is on (the default) -- e.g. a
+		# band left on a day later turned into approved leave is not paid.
+		band = att["late_mark_band"]
+		if band and (not late_only_present or att["status"] in ("Present", "Half Day")):
+			summary["band_counts"][band] = summary["band_counts"].get(band, 0) + 1
+
+	# Rounded ONCE, after adding. The day rows show 2-dp figures, so their
+	# column can differ from this total by a hundredth or two -- the total is
+	# the accurate one and is what gets paid.
+	summary["overtime_hours_exact"] = summary["overtime_hours"]
+	summary["overtime_hours"] = round_half_up(summary["overtime_hours"], 2)
+	summary.update(day_totals(rows, today))
+	summary["month_in_progress"] = bool(rows) and str(rows[-1]["date"]) > str(today)
+	return summary
+
+
+def plain_text(value):
+	"""Holiday descriptions are a Text Editor field and arrive as HTML
+	('<div class="ql-editor read-mode"><p>Krishna Janmashtami</p></div>').
+	The pages escape what they show, so the markup appeared literally."""
+	import html
+
+	if not value:
+		return value
+	return html.unescape(frappe.utils.strip_html(str(value))).strip()
+
+
+def get_band_definitions(settings=None):
+	"""Band labels and fractions, in order. Drives the console's band columns
+	and the statement footer -- add a band in Settings and a column appears."""
+	settings = settings or get_automation_settings()
+	return [
+		{"label": b.label, "fraction": flt(b.fraction),
+		 "from_time": str(b.from_time), "to_time": str(b.to_time)}
+		# time_to_seconds, NOT str(): Time fields load as timedelta and
+		# str(timedelta) puts "9:46:00" after "10:01:00", which put the Console's
+		# band columns in a different order from the processing document's.
+		for b in sorted(settings.late_mark_bands, key=lambda r: time_to_seconds(r.from_time))
+	]
+
+
+def get_active_employees(employees=None):
+	filters = {"status": "Active"}
+	if employees:
+		filters["name"] = ["in", employees]
+	return frappe.get_all(
+		"Employee",
+		filters=filters,
+		fields=["name", "employee_name", "grade", "date_of_joining", "relieving_date"],
+		order_by="name",
+	)

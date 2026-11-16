@@ -1,0 +1,92 @@
+{
+  "doctype": "DocType",
+  "name": "RAPL Overtime Processing Entry",
+  "module": "RAPL Payroll Automation",
+  "istable": 1,
+  "editable_grid": 1,
+  "engine": "InnoDB",
+  "field_order": [
+    "employee",
+    "employee_name",
+    "grade",
+    "ot_hours_hhmm",
+    "ot_hours",
+    "ot_rate",
+    "column_break_amt",
+    "amount",
+    "additional_salary"
+  ],
+  "fields": [
+    {
+      "fieldname": "employee",
+      "fieldtype": "Link",
+      "label": "Employee",
+      "options": "Employee",
+      "reqd": 1,
+      "in_list_view": 1
+    },
+    {
+      "fieldname": "employee_name",
+      "fieldtype": "Data",
+      "label": "Employee Name",
+      "fetch_from": "employee.employee_name",
+      "read_only": 1,
+      "in_list_view": 1
+    },
+    {
+      "fieldname": "grade",
+      "fieldtype": "Data",
+      "label": "Grade",
+      "fetch_from": "employee.grade",
+      "read_only": 1,
+      "in_list_view": 1
+    },
+    {
+      "fieldname": "ot_hours_hhmm",
+      "fieldtype": "Duration",
+      "label": "OT Hours (HH:MM)",
+      "hide_days": 1,
+      "hide_seconds": 1,
+      "in_list_view": 1,
+      "description": "Editable. Enter hours and minutes directly -- this drives OT Hours (decimal) and Amount automatically."
+    },
+    {
+      "fieldname": "ot_hours",
+      "fieldtype": "Float",
+      "label": "OT Hours",
+      "precision": "2",
+      "in_list_view": 1,
+      "description": "Read-only, decimal hours -- derived automatically from OT Hours (HH:MM). Used internally for the Amount calculation.",
+      "read_only": 1
+    },
+    {
+      "fieldname": "ot_rate",
+      "fieldtype": "Currency",
+      "label": "Rate/hr",
+      "precision": "6",
+      "in_list_view": 1,
+      "description": "Exact hourly rate (monthly salary / OT days / OT divisor), to 6 decimals. Amount = OT time x this rate, rounded once to whole rupees. Editable; changing it recalculates Amount."
+    },
+    {
+      "fieldname": "column_break_amt",
+      "fieldtype": "Column Break"
+    },
+    {
+      "fieldname": "amount",
+      "fieldtype": "Currency",
+      "label": "Amount",
+      "precision": "0",
+      "in_list_view": 1,
+      "description": "Whole rupees. Auto-recalculated from OT Hours \u00d7 Rate/hr whenever either changes. You can also edit Amount directly -- doing so does NOT change OT Hours/Rate back (one-way: hours/rate drive Amount, not the reverse)."
+    },
+    {
+      "fieldname": "additional_salary",
+      "fieldtype": "Link",
+      "label": "Additional Salary (after processing)",
+      "no_copy": 1,
+      "options": "Additional Salary",
+      "read_only": 1
+    }
+  ],
+  "permissions": []
+}

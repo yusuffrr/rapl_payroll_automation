@@ -1,0 +1,176 @@
+/* Shared by the Employee Attendance statement and the Attendance Console so
+   the two pages read identically: same columns, same colour meanings. */
+
+.ea-statement { margin-bottom: 28px; }
+
+.ea-head {
+	display: flex; justify-content: space-between; align-items: baseline;
+	flex-wrap: wrap; gap: 8px; margin-bottom: 10px;
+}
+.ea-name { font-size: 15px; font-weight: 600; }
+.ea-meta { color: var(--text-muted); font-size: 12px; margin-left: 8px; }
+
+.ea-rates { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+.ea-rates > div {
+	background: var(--subtle-fg, var(--control-bg)); border-radius: var(--border-radius-md);
+	padding: 8px 12px; min-width: 130px;
+}
+.ea-rates span { display: block; color: var(--text-muted); font-size: 11px; }
+.ea-rates b { font-size: 15px; font-weight: 600; }
+
+.ea-table { width: 100%; table-layout: fixed; border-collapse: collapse; font-size: 12px; }
+.ea-table thead tr { background: var(--subtle-fg, var(--control-bg)); }
+.ea-table th {
+	text-align: left; font-weight: 400; color: var(--text-muted);
+	padding: 6px 5px; font-size: 11px;
+}
+.ea-table td { padding: 6px 5px; border-bottom: 1px solid var(--border-color); }
+.ea-table .ea-num { text-align: right; }
+.ea-dim { color: var(--text-muted); }
+
+.ea-table tr.ea-off { background: var(--subtle-fg, var(--control-bg)); }
+.ea-table tr.ea-worked-off { background: var(--bg-green, #eaf3de); }
+.ea-table tr.ea-missing { background: var(--bg-red, #fceaea); }
+.ea-table tr.ea-missing td { color: var(--red-600, #a32d2d); }
+
+.ea-late { color: var(--orange-600, #ba7517); }
+.ea-cut  { color: var(--red-600, #a32d2d); }
+.ea-ot   { color: var(--green-600, #3b6d11); }
+
+.ea-foot {
+	display: flex; flex-wrap: wrap; gap: 24px;
+	margin-top: 12px; padding-top: 10px;
+	border-top: 1px solid var(--border-color); font-size: 12px;
+}
+.ea-foot > div { min-width: 170px; }
+.ea-foot-h { color: var(--text-muted); margin-bottom: 5px; font-size: 11px; }
+.ea-foot > div > div { display: flex; justify-content: space-between; gap: 12px; }
+.ea-total { border-top: 1px solid var(--border-color); margin-top: 4px; padding-top: 4px; font-weight: 600; }
+
+/* Only on the statement page -- this file loads on every desk page. Scoped by
+   the route Frappe sets on <body>: a :has() test kept matching after leaving
+   the page, because Desk hides pages it has left rather than removing them. */
+@media print {
+	body[data-route="employee-attendance"] :is(.page-head, .navbar, .page-actions, .layout-side-section) { display: none !important; }
+	.ea-statement { margin-bottom: 0; }
+}
+
+/* ---- Attendance Console ---- */
+.ac-grid { font-size: 12px; border: 1px solid var(--border-color);
+	border-radius: var(--border-radius-md); overflow: hidden; }
+.ac-grid thead th { background: var(--subtle-fg, var(--control-bg));
+	font-size: 11px; font-weight: 400; color: var(--text-muted);
+	padding: 7px 6px; vertical-align: middle; }
+.ac-grid td { padding: 5px 6px; border-bottom: 1px solid var(--border-color);
+	vertical-align: middle; }
+.ac-num { text-align: right; }
+
+/* --- employee summary: a free-form BLOCK, not a row of the grid --- */
+.ac-emp-row { cursor: pointer; }
+.ac-emp-cell { background: var(--bg-light-gray, #f4f5f6); padding: 8px 10px !important; }
+.ac-emp-row.ac-open .ac-emp-cell { background: var(--bg-blue, #eef3fa); }
+.ac-emp-row.ac-ov .ac-emp-cell { box-shadow: inset 3px 0 0 var(--orange-400, #e5a44b); }
+
+.ac-emp-top { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.ac-caret { font-size: 10px; color: var(--text-muted); }
+.ac-emp-id { min-width: 150px; }
+.ac-emp-name { font-weight: 600; }
+.ac-emp-sub { font-size: 10px; color: var(--text-muted); display: flex; gap: 7px; flex-wrap: wrap; }
+.ac-emp-counts { flex: 1; text-align: center; color: var(--text-muted); }
+.ac-emp-counts b { color: var(--text-color); }
+
+.ac-emp-zones { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 7px; }
+.ac-zone { flex: 1; min-width: 250px; background: var(--fg-color, #fff);
+	border: 1px solid var(--border-color); border-radius: var(--border-radius-sm); padding: 5px 9px; }
+.ac-zone-h { font-size: 9.5px; letter-spacing: .04em; color: var(--text-muted); margin-bottom: 4px; }
+.ac-zone-body { display: flex; align-items: center; gap: 10px; flex-wrap: nowrap; overflow-x: auto; }
+.ac-spacer { flex: 1; min-width: 4px; }
+
+/* label and input side by side -- inline-flex, or Frappe's block-level label
+   stacks them and the row grows to three lines. */
+.ac-field { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+.ac-field label { font-size: 10px; color: var(--text-muted); margin: 0; font-weight: 400; }
+.ac-field .ac-cell { width: 56px; }
+.ac-field .ac-band { width: 34px; }
+
+/* --- day rows --- */
+.ac-day td { background: var(--fg-color, #fff); }
+.ac-indent { padding-left: 16px !important; }
+.ac-day.ac-dirty td { background: var(--bg-blue, #eef3fa); }
+.ac-day.ea-off td, .ac-day.ea-missing td { background: var(--subtle-fg, var(--control-bg)); }
+.ac-day.ea-worked-off td { background: var(--bg-green, #eaf3de); }
+.ac-day.ea-missing td { color: var(--red-600, #a32d2d); }
+.ac-create-inline { margin-left: 10px; }
+
+/* --- editable cells must look editable --- */
+.ac-cell { height: 25px; font-size: 12px; padding: 1px 4px; width: 100%;
+	border: 1px solid var(--border-color); border-radius: var(--border-radius-sm);
+	background: var(--fg-color, #fff); }
+.ac-cell:hover { border-color: var(--gray-400, #9ea3a8); }
+.ac-cell:focus { border-color: var(--blue-500, #4187e0);
+	box-shadow: 0 0 0 2px var(--blue-100, #dbe9fb); outline: none; }
+.ac-emp-cell .ac-cell { text-align: right; }
+select.ac-cell { padding-right: 2px; }
+
+.ac-pinned { border-color: var(--orange-400, #e5a44b) !important;
+	background: var(--bg-orange, #fdf5e9) !important; font-weight: 600; }
+.ac-required { border-color: var(--red-400, #e08b8b) !important;
+	background: var(--bg-red, #fceaea) !important; }
+
+.ac-bulk { display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+	background: var(--bg-blue, #eef3fa); border-radius: var(--border-radius-md);
+	padding: 8px 10px; margin-bottom: 8px; font-size: 12px; }
+.ac-bulk-count { font-weight: 600; color: var(--blue-600, #2a5fa8); }
+.ac-bulk input, .ac-bulk select { height: 26px; font-size: 12px; }
+
+.ac-foot { display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+	margin-top: 10px; padding-top: 9px; border-top: 1px solid var(--border-color); font-size: 12px; }
+.ac-dirty-text { color: var(--blue-600, #2a5fa8); font-weight: 600; }
+
+/* --- collapsed employee row: money at a glance --- */
+.ac-emp-money { display: flex; gap: 9px; align-items: center; white-space: nowrap; font-size: 11px; }
+
+/* --- EFFECT strip --- */
+.ac-effect { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+	margin-top: 6px; padding-top: 5px; border-top: 1px solid var(--border-color); font-size: 11px; }
+
+/* --- advance zone --- */
+.ac-adv-head { cursor: pointer; }
+.ac-adv-toggle { color: var(--text-muted); font-size: 10px; margin-left: 6px; }
+.ac-adv-list { margin-top: 5px; border-top: 1px solid var(--border-color); padding-top: 4px; }
+.ac-adv-line { display: flex; align-items: center; gap: 7px; padding: 2px 0; font-size: 11px; }
+.ac-adv-line input[type="checkbox"] { margin: 0; }
+.ac-adv-name { font-weight: 600; min-width: 52px; }
+.ac-adv-purpose { overflow: hidden; text-overflow: ellipsis; max-width: 110px; white-space: nowrap; }
+
+/* --- computed pay --- */
+.ac-netpay-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+	background: var(--fg-color, #fff); border-top: 1px solid var(--border-color);
+	padding: 6px 10px; font-size: 11px; cursor: pointer; }
+.ac-net { font-size: 13px; }
+.ac-pay-toggle { color: var(--blue-600, #2a5fa8); font-size: 10px; }
+.ac-pay-detail { background: var(--fg-color, #fff); border-top: 1px solid var(--border-color);
+	padding: 9px 11px; font-size: 11px; }
+.ac-pay-cols { display: flex; gap: 30px; flex-wrap: wrap; }
+.ac-pay-cols > div { min-width: 200px; }
+.ac-pay-row { display: flex; justify-content: space-between; gap: 20px; }
+.ac-pay-injected { color: var(--blue-600, #2a5fa8); }
+.ac-pay-total { border-top: 1px solid var(--border-color); margin-top: 4px; padding-top: 4px; font-weight: 600; }
+.ac-pay-net { display: flex; align-items: flex-end; gap: 16px; flex-wrap: wrap;
+	margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--border-color); }
+.ac-net-big { font-size: 24px; font-weight: 600; line-height: 1.15; }
+.ac-pay-note { flex: 1; font-size: 10px; padding-bottom: 3px; }
+
+/* zone bodies must not clip: min-width sized to real content, wrap, then scroll */
+.ac-emp-zones > .ac-zone:nth-child(1) { flex: 1 1 310px; min-width: 310px; }
+.ac-emp-zones > .ac-zone:nth-child(2) { flex: 1 1 270px; min-width: 270px; }
+.ac-emp-zones > .ac-zone:nth-child(3) { flex: 1 1 250px; min-width: 250px; }
+.ac-spacer { flex: 1; min-width: 6px; }
+
+/* --- paid leave --- */
+.ac-leave-head { display: inline-flex; align-items: center; gap: 4px;
+	white-space: nowrap; font-size: 11px; }
+.ac-leave-pick { margin: 0; }
+
+.ac-month-banner { padding: 6px 10px; margin: 0 0 8px; border: 1px solid var(--border-color); border-radius: 6px; }
+.ac-future { opacity: .55; }

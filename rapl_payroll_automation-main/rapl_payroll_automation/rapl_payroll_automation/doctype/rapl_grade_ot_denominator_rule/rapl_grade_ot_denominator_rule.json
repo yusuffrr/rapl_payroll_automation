@@ -1,0 +1,30 @@
+{
+  "doctype": "DocType",
+  "name": "RAPL Grade OT Denominator Rule",
+  "module": "RAPL Payroll Automation",
+  "istable": 1,
+  "editable_grid": 1,
+  "engine": "InnoDB",
+  "field_order": [
+    "grade",
+    "exclude_weekly_off_from_denominator"
+  ],
+  "fields": [
+    {
+      "fieldname": "grade",
+      "fieldtype": "Link",
+      "label": "Grade",
+      "options": "Employee Grade",
+      "reqd": 1,
+      "in_list_view": 1
+    },
+    {
+      "fieldname": "exclude_weekly_off_from_denominator",
+      "fieldtype": "Check",
+      "label": "Exclude Weekly Off (Sunday) from OT Denominator",
+      "in_list_view": 1,
+      "description": "Tick for grades like 'Floor' where OT hourly rate should be computed using working days EXCLUDING Sunday. Leave unticked for grades like 'Office' where Sunday is included in the denominator (same as Late Mark's per-day rate)."
+    }
+  ],
+  "permissions": []
+}
