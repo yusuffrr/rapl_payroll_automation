@@ -36,9 +36,60 @@ STATUS_ORDER = ["Absent", "On Leave", "On Duty", "Present", "Holiday"]
 ONE_DAY = datetime.timedelta(days=1)
 
 
+# ------------------------------------------------------------------ workspace widgets
+# Number Cards (Type: Custom) and the "Today Attendance Status" chart source call these.
+# They share one cached computation so a workspace with 4 cards + a chart runs it once a minute.
+
+CACHE_SECONDS = 60
+
+
+def _cached_status(grade=None):
+	key = f"rapl_live_attendance::{grade or 'all'}"
+	data = frappe.cache().get_value(key)
+	if data is None:
+		data = _compute_status(grade)
+		frappe.cache().set_value(key, data, expires_in_sec=CACHE_SECONDS)
+	return data
+
+
+def _card(status):
+	frappe.only_for(ALLOWED_ROLES)
+	return {
+		"value": (_cached_status().get("summary") or {}).get(status, 0),
+		"fieldtype": "Int",
+		"route": ["today-attendance"],
+	}
+
+
+@frappe.whitelist()
+def card_absent(filters=None):
+	return _card("Absent")
+
+
+@frappe.whitelist()
+def card_present(filters=None):
+	return _card("Present")
+
+
+@frappe.whitelist()
+def card_on_leave(filters=None):
+	return _card("On Leave")
+
+
+@frappe.whitelist()
+def card_overnight(filters=None):
+	return _card("Overnight")
+
+
+# ------------------------------------------------------------------ page
+
 @frappe.whitelist()
 def get_status(grade=None):
 	frappe.only_for(ALLOWED_ROLES)
+	return _compute_status(grade)
+
+
+def _compute_status(grade=None):
 	now = now_datetime()
 	cal_today = getdate(today())
 
