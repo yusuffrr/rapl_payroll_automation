@@ -17,6 +17,7 @@ import datetime
 from collections import Counter
 
 import frappe
+from frappe import _
 from frappe.utils import add_days, cint, getdate, now_datetime, strip_html, today
 
 ALLOWED_ROLES = ("HR Manager", "HR User", "System Manager")
@@ -26,10 +27,11 @@ ALLOWED_ROLES = ("HR Manager", "HR User", "System Manager")
 # instead, so the board never shows everyone as Absent.
 BIOMETRIC_ONLY = True
 
-# Overnight: still "inside" from the previous shift day (unpaired punch) and that punch
-# was after this time on the previous day -> counted as Present today.
-# Unpaired punches earlier than this are treated as a forgotten OUT, not overnight work.
-OVERNIGHT_FROM = datetime.timedelta(hours=18)
+# Overnight: the previous shift day ended on an unpaired punch made at/after this time,
+# and the person has not punched yet today -> still inside, counted as Present.
+# Earlier unpaired punches (e.g. a lone 18:04 when the IN was missed) are treated as a
+# missed punch, not overnight work. 20:00 is after the evening leaving rush.
+OVERNIGHT_FROM = datetime.timedelta(hours=20)
 
 STRICT = "Strictly based on Log Type in Employee Checkin"
 STATUS_ORDER = ["Absent", "On Leave", "On Duty", "Present", "Holiday"]
@@ -58,6 +60,7 @@ def _card(status):
 		"value": (_cached_status().get("summary") or {}).get(status, 0),
 		"fieldtype": "Int",
 		"route": ["today-attendance"],
+		"route_options": {"status": status},  # page opens with this card selected
 	}
 
 
@@ -79,6 +82,52 @@ def card_on_leave(filters=None):
 @frappe.whitelist()
 def card_overnight(filters=None):
 	return _card("Overnight")
+
+
+# ------------------------------------------------------------------ missing punch
+
+#: device_id stamped on punches HR adds from the board. Non-empty on purpose, so the
+#: board's "device punches only" filter still counts them, and they stay easy to audit.
+MANUAL_DEVICE_ID = "HR - added on board"
+
+
+@frappe.whitelist(methods=["POST"])
+def add_missing_punch(employee, time):
+	"""HR adds the arrival punch someone forgot, for the shift day that is open now.
+
+	Auto-attendance builds a day only after its window closes (next morning), so a
+	punch added today is used like any device punch: the Attendance comes out right
+	with no correction afterwards.
+	"""
+	frappe.only_for(ALLOWED_ROLES)
+	now = now_datetime()
+	shift_of = _shift_map([frappe._dict(name=employee,
+		default_shift=frappe.db.get_value("Employee", employee, "default_shift"))], getdate(today()))
+	st = _load_shift_types(shift_of.values()).get(shift_of.get(employee))
+
+	cal_today = getdate(today())
+	board_date = cal_today if now >= _window(st, cal_today)[0] else add_days(cal_today, -1)
+	win_start, win_end = _window(st, board_date)
+
+	t = _to_td(time)
+	punch = datetime.datetime.combine(board_date, datetime.time.min) + t
+	if punch < win_start:  # e.g. 01:00 belongs to the night after board_date
+		punch += ONE_DAY
+	if punch > now:
+		frappe.throw(_("The punch time {0} is in the future.").format(_fmt(punch, now)))
+	if not (win_start <= punch <= win_end):
+		frappe.throw(_("The punch time must fall in today's shift day ({0} to {1}).").format(
+			_fmt(win_start, now), _fmt(win_end, now)))
+
+	doc = frappe.new_doc("Employee Checkin")
+	doc.employee = employee
+	doc.time = punch
+	doc.log_type = "IN"
+	doc.device_id = MANUAL_DEVICE_ID
+	doc.insert()
+	doc.add_comment("Comment", _("Missing arrival punch added by {0} from Today's Attendance.").format(
+		frappe.session.user))
+	return {"name": doc.name, "time": _fmt(punch, now)}
 
 
 # ------------------------------------------------------------------ page
@@ -129,11 +178,13 @@ def _compute_status(grade=None):
 	for p in frappe.db.sql(
 		f"""select employee, time, log_type from `tabEmployee Checkin`
 		where time >= %(f)s and time <= %(now)s and employee in %(emps)s {bio}
+		  and ifnull(skip_auto_attendance, 0) = 0
 		order by time asc""",
 		{"f": fetch_from, "now": now, "emps": emp_ids},
 		as_dict=True,
 	):
 		punches.setdefault(p.employee, []).append(p)
+	punches = {emp: _dedupe(ps) for emp, ps in punches.items()}
 
 	# ---------------------------------------------------------------- leaves / on duty / holidays
 	leaves = _leaves(emp_ids, board_date)
@@ -174,7 +225,11 @@ def _compute_status(grade=None):
 
 		check_in = _check_in(cur, strict)
 		open_in = _open_in(prv, strict)  # unpaired punch from the previous shift day
-		carried = bool(open_in and open_in.time >= datetime.datetime.combine(prev_date, datetime.time.min) + OVERNIGHT_FROM)
+		carried = bool(
+			open_in
+			and not cur  # once they punch today, today's punch decides
+			and open_in.time >= datetime.datetime.combine(prev_date, datetime.time.min) + OVERNIGHT_FROM
+		)
 
 		shift_start = datetime.datetime.combine(board_date, datetime.time.min) + st.start if st else None
 		grace = datetime.timedelta(minutes=cint(st.late_entry_grace_period)) if st else datetime.timedelta()
@@ -191,13 +246,7 @@ def _compute_status(grade=None):
 			row.status = "Present"
 			row.overnight = 1
 			row.first_in = _fmt(open_in.time, now)
-			if check_in and not strict:
-				row.note = (
-					f"Overnight. Punched at {_fmt(check_in.time, now)}: probably their OUT, "
-					"but HRMS will count it as today's check-in — check Attendance"
-				)
-			else:
-				row.note = "Working overnight, still inside"
+			row.note = "Working overnight, no punch yet today"
 		elif check_in:
 			row.status = "Present"
 			row.first_in = _fmt(check_in.time, now)
@@ -315,12 +364,30 @@ def _check_in(ps, strict):
 
 
 def _open_in(ps, strict):
-	"""Unpaired punch at the end of a shift day = person never punched out."""
+	"""Unpaired punch at the end of a shift day = person never punched out.
+
+	Alternating mode ignores IN/OUT labels (staff don't switch the key on the device),
+	so pairing is by count after duplicates are removed.
+	"""
 	if not ps:
 		return None
 	if strict:
 		return ps[-1] if ps[-1].log_type == "IN" else None
 	return ps[-1] if len(ps) % 2 == 1 else None
+
+
+DUPLICATE_WINDOW = datetime.timedelta(minutes=3)
+
+
+def _dedupe(ps):
+	"""Two punches within 3 minutes are one punch (double press or re-synced record),
+	whatever their IN/OUT label."""
+	out = []
+	for p in ps:
+		if out and p.time - out[-1].time <= DUPLICATE_WINDOW:
+			continue
+		out.append(p)
+	return out
 
 
 def _leaves(emp_ids, date):

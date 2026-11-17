@@ -14,10 +14,14 @@ frappe.pages["today-attendance"].on_page_load = function (wrapper) {
 };
 
 frappe.pages["today-attendance"].on_page_show = function (wrapper) {
-	wrapper.today_attendance && wrapper.today_attendance.refresh(true);
+	const board = wrapper.today_attendance;
+	if (!board) return;
+	board.apply_route_options();
+	board.refresh(true);
 };
 
 const TA_METHOD = "rapl_payroll_automation.api.live_attendance.get_status";
+const TA_ADD_METHOD = "rapl_payroll_automation.api.live_attendance.add_missing_punch";
 const TA_REFRESH_MS = 2 * 60 * 1000;
 
 const TA_CARDS = [
@@ -34,6 +38,7 @@ class TodayAttendance {
 	constructor(page) {
 		this.page = page;
 		this.active = "Absent";
+		this.apply_route_options();
 		this.data = null;
 		this.refresh_debounced = frappe.utils.debounce(() => this.refresh(), 300);
 
@@ -48,6 +53,18 @@ class TodayAttendance {
 				this.refresh(true);
 			}
 		}, TA_REFRESH_MS);
+	}
+
+	// A number card (or a link like /app/today-attendance?status=Present) can choose the card.
+	apply_route_options() {
+		const opts = frappe.route_options || {};
+		const qs = new URLSearchParams(window.location.search);
+		const wanted = opts.status || qs.get("status");
+		if (wanted && TA_CARDS.some((c) => c.key === wanted)) {
+			this.active = wanted;
+			if (this.data) this.render();
+		}
+		if (opts.status) delete frappe.route_options.status;
 	}
 
 	make_filters() {
@@ -80,6 +97,7 @@ class TodayAttendance {
 					.ta-table td { font-size: var(--text-md); vertical-align: middle; }
 					.ta-dept { background: var(--subtle-accent); font-weight: 600; font-size: var(--text-sm); }
 					.indicator-pill.cyan { background: var(--cyan-50, #e6f7fa); color: var(--cyan-700, #0b7285); }
+					.ta-add { margin-left: 6px; }
 					.ta-copy { align-self: center; margin-left: var(--margin-sm); }
 					.ta-empty { padding: 40px; text-align: center; color: var(--text-muted); }
 				</style>
@@ -91,6 +109,11 @@ class TodayAttendance {
 		this.$meta = this.$wrap.find(".ta-meta");
 		this.$cards = this.$wrap.find(".ta-cards");
 		this.$table = this.$wrap.find(".ta-table");
+
+		this.$table.on("click", ".ta-add", (e) => {
+			const $b = $(e.currentTarget);
+			this.add_missing_punch($b.attr("data-emp"), $b.attr("data-name"));
+		});
 
 		this.$cards.on("click", ".ta-card", (e) => {
 			this.active = $(e.currentTarget).attr("data-key");
@@ -155,11 +178,14 @@ class TodayAttendance {
 				const notes = [];
 				if (r.late_by) notes.push(`<span class="text-danger">${__("Late by {0} min", [r.late_by])}</span>`);
 				if (r.note) notes.push(esc(r.note));
+				const add_btn = r.status === "Absent"
+					? `<button class="btn btn-xs btn-default ta-add" data-emp="${esc(r.employee)}" data-name="${esc(r.employee_name)}">+ ${__("Add missing punch")}</button>`
+					: "";
 				return `${head}<tr>
 					<td><a href="/app/employee/${encodeURIComponent(r.employee)}">${esc(r.employee_name)}</a></td>
 					<td><span class="indicator-pill ${color_of[r.status] || "gray"}">${__(r.status)}</span></td>
 					<td style="white-space:nowrap">${r.first_in || ""}</td>
-					<td>${notes.join(" · ")}</td>
+					<td>${notes.join(" · ")} ${add_btn}</td>
 				</tr>`;
 			})
 			.join("");
@@ -171,6 +197,33 @@ class TodayAttendance {
 				</tr></thead>
 				<tbody>${body}</tbody>
 			</table>`);
+	}
+
+	// Someone is at work but the board says Absent: they forgot to punch in.
+	// HR adds the arrival time; tomorrow's auto-attendance then builds the day correctly.
+	add_missing_punch(employee, employee_name) {
+		frappe.prompt(
+			[{
+				fieldname: "time", fieldtype: "Time", label: __("Arrival time"), reqd: 1,
+				default: "09:30:00",
+				description: __("When {0} actually arrived today.", [employee_name]),
+			}],
+			(values) => {
+				frappe.call({
+					method: TA_ADD_METHOD,
+					args: { employee, time: values.time },
+					freeze: true,
+				}).then((r) => {
+					frappe.show_alert({
+						message: __("Punch added for {0} at {1}", [employee_name, r.message.time]),
+						indicator: "green",
+					});
+					this.refresh(true);
+				});
+			},
+			__("Add missing punch: {0}", [employee_name]),
+			__("Add punch")
+		);
 	}
 
 	filtered_rows() {

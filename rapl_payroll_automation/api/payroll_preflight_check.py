@@ -49,7 +49,9 @@ def _check_missing_checkout(start_date, end_date):
 		filters={
 			"attendance_date": ["between", [start_date, end_date]],
 			"docstatus": 1,
-			"status": "Present",
+			# Half Day too: a missed IN punch makes HRMS use the evening punch as
+			# in_time with no out_time, and the late rules turn that into a Half Day.
+			"status": ["in", ["Present", "Half Day"]],
 			"in_time": ["is", "set"],
 			"out_time": ["is", "not set"],
 		},
@@ -59,7 +61,7 @@ def _check_missing_checkout(start_date, end_date):
 		{
 			"employee": r.employee,
 			"employee_name": r.employee_name,
-			"reason": f"Missing checkout on {r.attendance_date} (Attendance: {r.name})",
+			"reason": f"Missing punch (only one punch) on {r.attendance_date} (Attendance: {r.name})",
 		}
 		for r in rows
 	]
