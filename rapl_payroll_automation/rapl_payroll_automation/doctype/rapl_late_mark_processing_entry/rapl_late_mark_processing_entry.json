@@ -92,7 +92,7 @@
       "label": "Per-Day Rate",
       "precision": "6",
       "in_list_view": 1,
-      "description": "Exact per-day rate (monthly salary / calendar days), to 6 decimals. Amount = sum(count x band fraction) x this rate, rounded once to whole rupees. Editable; changing it recalculates Amount."
+      "description": "Exact per-day rate (monthly salary / calendar days), to 6 decimals. Amount = sum(count x band fraction) x this rate, rounded once DOWN to whole rupees (Code on Wages s.20(2)). Editable; changing it recalculates Amount."
     },
     {
       "fieldname": "amount",
@@ -100,7 +100,7 @@
       "label": "Amount",
       "precision": "0",
       "in_list_view": 1,
-      "description": "Whole rupees. Auto-recalculated as SUM(band count x that band's configured fraction) x Per-Day Rate, whenever any band count or Per-Day Rate changes. You can also edit Amount directly -- one-way, does not push a value back into the band counts."
+      "description": "Whole rupees, rounded down. Auto-recalculated as SUM(band count x that band's configured fraction) x Per-Day Rate, whenever any band count or Per-Day Rate changes. You can also edit Amount directly -- one-way, does not push a value back into the band counts."
     },
     {
       "fieldname": "additional_salary",
@@ -177,7 +177,7 @@
       "label": "Amount Before Waiver",
       "precision": "0",
       "read_only": 1,
-      "description": "What this row would deduct with no waiver: sum(count x fraction) x Per-Day Rate, rounded once."
+      "description": "What this row would deduct with no waiver: sum(count x fraction) x Per-Day Rate, rounded once (down)."
     },
     {
       "fieldname": "waiver_reason",

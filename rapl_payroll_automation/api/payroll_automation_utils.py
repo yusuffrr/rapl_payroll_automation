@@ -14,7 +14,7 @@
 #   calendar day count of the period, identical for every employee.
 
 import frappe
-from frappe.utils import add_days, date_diff, get_datetime, getdate
+from frappe.utils import add_days, date_diff, flt, get_datetime, getdate
 from erpnext.setup.doctype.employee.employee import get_holiday_list_for_employee
 from hrms.utils.holiday_list import get_holiday_dates_between
 
@@ -175,6 +175,99 @@ def get_automation_settings():
 	# Cached: this runs on every Attendance validate and every Salary Slip
 	# validate. A Single's cache is cleared when the Settings are saved.
 	return frappe.get_cached_doc("RAPL Payroll Automation Settings")
+
+
+def pick_assignment_base(assignments, actual_start):
+	"""Base of the assignment HRMS would use for a slip starting `actual_start`.
+
+	Mirrors salary_slip.set_salary_structure_assignment(): the latest
+	submitted assignment with from_date <= the slip's actual start (period
+	start, or the joining date when that is later). `assignments` are dicts
+	with from_date / base (docstatus 1 only). Returns 0 when none applies.
+	"""
+	start = getdate(actual_start)
+	in_force = [a for a in assignments if getdate(a["from_date"]) <= start]
+	if not in_force:
+		return 0.0
+	latest = max(in_force, key=lambda a: getdate(a["from_date"]))
+	return flt(latest["base"])
+
+
+def get_monthly_salaries(employees, start_date, settings=None):
+	"""{employee: monthly salary} for overtime / late-mark rates in the month
+	that starts `start_date`.
+
+	The salary is Base on the Salary Structure Assignment in force for that
+	month -- the same figure the Salary Slip pays Basic and HRA from -- so an
+	increment from a given date changes the rates from that month on, and a
+	past month is still priced with its own salary.
+
+	Falls back to the Employee field named in Settings (custom_monthly_salary)
+	only where no assignment with a Base applies: employees not yet moved to
+	Base-driven structures.
+	"""
+	employees = [e for e in dict.fromkeys(employees or []) if e]
+	if not employees:
+		return {}
+	settings = settings or get_automation_settings()
+	field = settings.get("ot_rate_base_fieldname") or "custom_monthly_salary"
+	emp_rows = {
+		e.name: e for e in frappe.get_all(
+			"Employee", filters={"name": ["in", employees]},
+			fields=["name", "date_of_joining", field], limit_page_length=0,
+		)
+	}
+	by_emp = {}
+	for a in frappe.get_all(
+		"Salary Structure Assignment",
+		filters={"employee": ["in", employees], "docstatus": 1},
+		fields=["employee", "from_date", "base"], limit_page_length=0,
+	):
+		by_emp.setdefault(a.employee, []).append(a)
+
+	# The SLIP's start, not the processing period's: a run for 16-30 Nov must
+	# still price with the assignment the November slip uses (in force on
+	# 1 Nov, or on the joining date when the employee joined that month).
+	month_first, month_last, _days = get_salary_month(start_date)
+	out = {}
+	for emp in employees:
+		row = emp_rows.get(emp) or {}
+		actual_start = month_first
+		doj = row.get("date_of_joining")
+		if doj and month_first < getdate(doj) <= month_last:
+			actual_start = getdate(doj)
+		base = pick_assignment_base(by_emp.get(emp, []), actual_start)
+		out[emp] = base if base > 0 else flt(row.get(field))
+	return out
+
+
+def get_monthly_salary(employee, start_date, settings=None):
+	"""Single-employee form of get_monthly_salaries()."""
+	return get_monthly_salaries([employee], start_date, settings).get(employee, 0.0)
+
+
+OT_DIVISOR_FIELD = "custom_ot_hours_divisor"
+
+
+def has_ot_divisor_field():
+	"""The Employee field arrives with patch v0_4; never fail before it runs."""
+	try:
+		return bool(frappe.get_meta("Employee").has_field(OT_DIVISOR_FIELD))
+	except Exception:
+		return False
+
+
+def employee_ot_divisor(employee=None, settings=None, value=None):
+	"""Normal working hours per day for this employee's overtime rate.
+
+	Employee > OT Hours Divisor when it is set (e.g. 10 for a driver on a
+	10-hour duty), otherwise RAPL Payroll Automation Settings > OT Hours
+	Divisor (8). Pass `value` when the field was already fetched.
+	"""
+	settings = settings or get_automation_settings()
+	if value is None and employee and has_ot_divisor_field():
+		value = frappe.db.get_value("Employee", employee, OT_DIVISOR_FIELD)
+	return flt(value) if flt(value) > 0 else flt(settings.ot_hours_divisor)
 
 
 def get_grade_ot_rule(settings, grade):

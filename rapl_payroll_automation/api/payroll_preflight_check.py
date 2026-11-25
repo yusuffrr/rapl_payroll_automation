@@ -74,11 +74,14 @@ def _check_missing_monthly_salary(start_date, end_date):
 		pluck="employee",
 		distinct=True,
 	)
+	from rapl_payroll_automation.api.payroll_automation_utils import get_monthly_salaries
+
+	salaries = get_monthly_salaries(employees, start_date)
 	issues = []
 	for e in _employee_rows(employees):
-		if not e.custom_monthly_salary:
+		if not salaries.get(e.name):
 			issues.append({"employee": e.name, "employee_name": e.employee_name,
-						   "reason": "Missing custom_monthly_salary"})
+						   "reason": "No salary: Base on the Salary Structure Assignment is 0 or missing"})
 	return issues
 
 

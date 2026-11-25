@@ -218,20 +218,20 @@ function recalculate_late_mark_amount(frm, cdt, cdn, waiver_edit) {
 		waived_units += waived * fraction;
 	}
 	const rate = flt(row.per_day_rate);
-	const priced = round_half_up(gross * rate);
+	const priced = deduction_down(gross * rate);
 	// Pre-waiver amount. A count/rate edit re-prices it (as before waivers
 	// existed); a waiver edit keeps it -- including a hand-typed amount.
 	let base;
 	if (!waiver_edit) base = priced;
-	else if (flt(row.amount_before_waiver) > 0) base = flt(row.amount_before_waiver);
-	else base = flt(row.amount);
+	else if (flt(row.amount_before_waiver) > 0) base = deduction_down(row.amount_before_waiver);
+	else base = deduction_down(row.amount);   // a hand-typed 500.6 is 500, as on the server
 
 	row.waived_marks = waived_marks;
 	if (waived_marks) {
 		row.amount_before_waiver = base;
 		row.amount = base === priced
-			? round_half_up(net * rate)
-			: Math.max(base - round_half_up(waived_units * rate), 0);
+			? deduction_down(net * rate)
+			: deduction_down(base - waived_units * rate);
 		row.waived_amount = base - row.amount;
 	} else {
 		row.amount = base;
@@ -241,10 +241,24 @@ function recalculate_late_mark_amount(frm, cdt, cdn, waiver_edit) {
 	frm.refresh_field("entries");
 }
 
-// Positive amounts only (a deduction is never negative), so half-up is
-// Math.round after nudging away float noise like 340.49999999.
-function round_half_up(x) {
-	return Math.round(flt(x, 6));
+// Half-up to 2 decimals on the SHORTEST decimal form of the number (the
+// digits Python's repr() gives), matching the server's round_half_up.
+function round2_half_up(x) {
+	x = Number(x) || 0;
+	const sign = x < 0 ? -1 : 1;
+	const str = String(Math.abs(x));
+	if (str.includes("e")) return Math.round(x * 100) / 100;
+	const [int_part, frac = ""] = str.split(".");
+	let cents = parseInt(int_part + (frac + "00").slice(0, 2), 10);
+	if ((frac[2] || "0") >= "5") cents += 1;
+	return (sign * cents) / 100;
+}
+
+// Late marks are deductions for absence: to paise first (so 646.9999999 is
+// 647.00), then DOWN to the rupee -- payroll_math.round_down_deduction.
+function deduction_down(x) {
+	const v = round2_half_up(x);
+	return v > 0 ? Math.floor(v) : 0;
 }
 
 const WAIVER_METHOD = "rapl_payroll_automation.rapl_payroll_automation.doctype.rapl_late_mark_processing.rapl_late_mark_processing";

@@ -128,6 +128,7 @@ fixtures = [
 					"Attendance-custom_status_manual",
 					"Attendance-custom_attendance_type",
 					"Employee-custom_ot",
+					"Employee-custom_ot_hours_divisor",
 					"Employee-custom_monthly_salary",
 					"Employee-custom_pf",
 					"Employee-custom_pt",

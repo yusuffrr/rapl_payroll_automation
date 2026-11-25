@@ -675,3 +675,151 @@ class LateMarkWaiverEdges(LateMarkWaiver):
 		ac._apply_overrides(doc, "late_mark", {"E1": {"late_amount": 500}},
 							[{"fraction": 0.25}, {"fraction": 0.5}])
 		self.assertEqual((r.amount_before_waiver, r.amount), (500, 300))
+
+
+class ProcessingRounding(unittest.TestCase):
+	"""validate(): Late Mark rows round DOWN, Overtime rows to nearest."""
+
+	def doc(self, doctype, amount):
+		row = Row(1, employee="E1", amount=amount)
+		return ns(doctype=doctype, start_date="2026-10-01", end_date="2026-10-31", entries=[row])
+
+	def test_late_mark_down_overtime_nearest(self):
+		lm = self.doc("RAPL Late Mark Processing", 646.6)
+		processing_common.validate_processing_doc(lm)
+		self.assertEqual(lm.entries[0].amount, 646)
+		ot = self.doc("RAPL Overtime Processing", 646.6)
+		processing_common.validate_processing_doc(ot)
+		self.assertEqual(ot.entries[0].amount, 647)
+
+
+class SlipSetupWarnings(unittest.TestCase):
+	def run_it(self, method, rows, ps, late_prorated=0):
+		old = getattr(frappe, "get_system_settings", None)
+		frappe.get_system_settings = lambda key: method
+		old_settings, old_gv = ac.get_automation_settings, frappe.db.get_value
+		ac.get_automation_settings = lambda: settings(late_mark_salary_component="Late Mark")
+		frappe.db.get_value = lambda *a, **k: late_prorated
+		self.addCleanup(lambda: setattr(ac, "get_automation_settings", old_settings))
+		self.addCleanup(lambda: setattr(frappe.db, "get_value", old_gv))
+		rows = {t: [WRow(**vars(r)) for r in rs] for t, rs in rows.items()}
+		try:
+			slip = types.SimpleNamespace(
+				get=lambda t: rows.get(t, []),
+			)
+			return ac._slip_setup_warnings(slip, ps)
+		finally:
+			if old is None:
+				del frappe.get_system_settings
+			else:
+				frappe.get_system_settings = old
+
+	def test_clean_setup_has_no_warnings(self):
+		rows = {"earnings": [ns(salary_component="Basic", amount=20730.0)],
+				"deductions": [ns(salary_component="Late Mark", amount=647.0)]}
+		ps = {"payroll_based_on": "Attendance", "consider_unmarked_attendance_as": "Absent"}
+		self.assertEqual(self.run_it("Commercial Rounding", rows, ps), [])
+
+	def test_flags_each_problem(self):
+		rows = {"earnings": [ns(salary_component="Basic", amount=20730.16),
+							 ns(salary_component="HRA", amount=8884.35)],
+				"deductions": []}
+		ps = {"payroll_based_on": "Leave"}
+		w = self.run_it("Banker's Rounding", rows, ps)
+		self.assertEqual(len(w), 4)
+		self.assertIn("Commercial Rounding", w[0])
+		self.assertIn("Salary Component Basic", w[1])
+		self.assertIn("Salary Component HRA", w[2])
+		self.assertIn("Attendance", w[3])
+
+
+class ReviewFixesNov2026(unittest.TestCase):
+	def test_negative_late_mark_still_rejected(self):
+		row = Row(1, employee="E1", amount=-120)
+		doc = ns(doctype="RAPL Late Mark Processing", start_date="2026-10-01",
+				 end_date="2026-10-31", entries=[row])
+		with self.assertRaises(frappe.ValidationError):
+			processing_common.validate_processing_doc(doc)
+
+	def test_fractional_pre_waiver_amount_rounds_down(self):
+		from rapl_payroll_automation.api import payroll_math as pm
+		# hand-typed 500.6, one 0.5 mark at 400/day waived -> 500 - 200 = 300
+		self.assertEqual(pm.waived_row_amount([0, 3], [0, 1], [0.25, 0.5], 400, 500.6), (500, 300))
+
+
+class SlipSetupWarningsLate(SlipSetupWarnings):
+	def test_prorated_late_mark_component_flagged(self):
+		ps = {"payroll_based_on": "Attendance", "consider_unmarked_attendance_as": "Absent"}
+		w = self.run_it("Commercial Rounding", {"earnings": [], "deductions": []}, ps, late_prorated=1)
+		self.assertEqual(len(w), 1)
+		self.assertIn("Depends on Payment Days", w[0])
+
+	def test_statistical_and_tax_lines_ignored(self):
+		rows = {"earnings": [ns(salary_component="Employer PF", amount=1800.5, do_not_include_in_total=1)],
+				"deductions": [ns(salary_component="TDS", amount=10.4, variable_based_on_taxable_salary=1)]}
+		ps = {"payroll_based_on": "Attendance", "consider_unmarked_attendance_as": "Absent"}
+		self.assertEqual(self.run_it("Commercial Rounding", rows, ps), [])
+
+
+class OtDivisorPerEmployee(unittest.TestCase):
+	def test_employee_value_wins_else_settings(self):
+		s = settings(ot_hours_divisor=8)
+		self.assertEqual(pau.employee_ot_divisor(settings=s, value=10), 10)
+		self.assertEqual(pau.employee_ot_divisor(settings=s, value=0), 8)
+		self.assertEqual(pau.employee_ot_divisor(settings=s, value=None), 8)
+
+	def test_driver_rate_nilesh_october(self):
+		from rapl_payroll_automation.api import payroll_math as pm
+		# 22,000 / 27 days (Floor) / 10 hours = 81.4815; 20:53 of overtime
+		r = pm.pay_rates(22000, 31, 4, True, 10)
+		self.assertAlmostEqual(r["hourly"], 81.481481, places=5)
+		self.assertEqual(pm.ot_amount((20 * 60 + 53) * 60, r["hourly"]), 1702)
+
+
+class _AD(dict):
+	__getattr__ = dict.get
+
+
+class MonthlySalaryFromBase(unittest.TestCase):
+	SSA = [
+		{"employee": "E1", "from_date": dt.date(2026, 5, 1), "base": 0},        # old, Monthly-Salary era
+		{"employee": "E1", "from_date": dt.date(2026, 10, 1), "base": 30100},
+		{"employee": "E1", "from_date": dt.date(2026, 11, 15), "base": 33000},  # mid-month increment
+		{"employee": "J1", "from_date": dt.date(2026, 10, 12), "base": 29100},  # joined 12 Oct
+	]
+	EMP = {"E1": dt.date(2025, 1, 1), "J1": dt.date(2026, 10, 12), "X1": dt.date(2025, 1, 1)}
+	FIELD = {"E1": 99999, "J1": 0, "X1": 17000}
+
+	def setUp(self):
+		self._ga = frappe.get_all
+
+		def get_all(doctype, filters=None, fields=None, **kw):
+			names = filters["employee"][1] if doctype == "Salary Structure Assignment" else filters["name"][1]
+			if doctype == "Employee":
+				return [_AD(name=n, date_of_joining=self.EMP[n], custom_monthly_salary=self.FIELD[n])
+						for n in names]
+			return [_AD(a) for a in self.SSA if a["employee"] in names]
+
+		frappe.get_all = get_all
+		self.addCleanup(lambda: setattr(frappe, "get_all", self._ga))
+		self.s = settings(ot_rate_base_fieldname="custom_monthly_salary")
+
+	def m(self, emp, start):
+		return pau.get_monthly_salary(emp, start, self.s)
+
+	def test_month_by_month(self):
+		self.assertEqual(self.m("E1", "2026-09-01"), 99999)   # base 0 -> Employee field
+		self.assertEqual(self.m("E1", "2026-10-01"), 30100)   # October assignment
+		self.assertEqual(self.m("E1", "2026-11-01"), 30100)   # 15 Nov increment: HRMS still uses October's
+		self.assertEqual(self.m("E1", "2026-12-01"), 33000)
+
+	def test_joiner_and_legacy(self):
+		self.assertEqual(self.m("J1", "2026-10-01"), 29100)   # from the joining date
+		self.assertEqual(self.m("X1", "2026-10-01"), 17000)   # no assignment base -> Employee field
+
+
+class MonthlySalaryMidMonthPeriod(MonthlySalaryFromBase):
+	def test_period_not_starting_on_the_first(self):
+		# Run for 16-30 Nov: the November slip uses the 1 Oct assignment
+		self.assertEqual(self.m("E1", "2026-11-16"), 30100)
+		self.assertEqual(self.m("J1", "2026-10-20"), 29100)   # joined 12 Oct, period from 20 Oct

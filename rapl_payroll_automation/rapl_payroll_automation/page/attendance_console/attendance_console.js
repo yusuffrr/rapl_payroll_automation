@@ -494,10 +494,12 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 					&minus; ${__("absent")} ${flt(res.days.absent, 1)} &minus; ${__("half-day shortfall")} ${flt(res.days.half_absent * res.days.half_fraction, 1)}
 					&minus; ${__("no record")} ${flt(res.days.missing, 1)} &minus; ${__("LWP")} ${flt(res.days.lwp, 1)}
 					${res.days.not_yet_earned ? `&minus; ${__("not yet earned")} ${flt(res.days.not_yet_earned, 1)}` : ""}
-					= <b>${flt(res.payment_days, 1)}</b></div>` : ""}
-				${res.native_payment_days !== undefined && Math.abs(flt(res.native_payment_days) - flt(res.payment_days)) > 0.001
-					? `<div class="ea-late ac-pay-note">${__("Note: the real Salary Slip would pay {0} days, not {1}. It follows Payroll Settings (Payroll Based On / Consider Unmarked Attendance As), which count absent or missing days differently from this preview. Check those settings before payroll.", [flt(res.native_payment_days, 1), flt(res.payment_days, 1)])}</div>`
+					= <b>${flt(res.console_payment_days !== undefined ? res.console_payment_days : res.payment_days, 1)}</b></div>` : ""}
+				${!res.month_in_progress && res.console_payment_days !== undefined
+					&& Math.abs(flt(res.native_payment_days) - flt(res.console_payment_days)) > 0.001
+					? `<div class="ea-late ac-pay-note">${__("The Salary Slip pays {0} days, so this figure uses {0}. The Console counts {1}: Payroll Settings (Payroll Based On / Consider Unmarked Attendance As) treat absent or unmarked days differently. Fix those settings if {1} is right.", [flt(res.native_payment_days, 1), flt(res.console_payment_days, 1)])}</div>`
 					: ""}
+				${(res.setup_warnings || []).map((w) => `<div class="ea-late ac-pay-note">${frappe.utils.escape_html(w)}</div>`).join("")}
 				${res.already_submitted ? `<div class="ea-late ac-pay-note">${__("Overtime / Late Mark already submitted for this period - not added again.")}</div>` : ""}
 				<div class="ac-pay-net">
 					<div>
@@ -617,7 +619,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 				<td class="ac-num"><input class="ac-cell ac-day-ot ${att.overtime_manual ? "ac-pinned" : ""}"
 					value="${day_ot_hhmm(att)}" placeholder="0:00"
 					title="${att.overtime_manual ? __("Set by hand - the rules will not recalculate this day") : __("Leave blank for automatic")}"></td>
-				<td class="ac-num">${cut ? `<span class="ea-cut">${Math.round(cut)}</span>` : '<span class="ea-dim">&mdash;</span>'}</td>
+				<td class="ac-num">${cut ? `<span class="ea-cut">${deduction_down(cut)}</span>` : '<span class="ea-dim">&mdash;</span>'}</td>
 			</tr>`;
 	}
 
@@ -754,7 +756,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 				bands.forEach((b, i) => {
 					fraction += flt(b.fraction) * flt(ov(employee, `band_${i + 1}_count`, g.entry.band_counts[b.label] || 0));
 				});
-				o.late_amount = Math.round(fraction * flt(ov(employee, "per_day_rate", g.entry.per_day_rate)));
+				o.late_amount = deduction_down(fraction * flt(ov(employee, "per_day_rate", g.entry.per_day_rate)));
 			}
 		});
 	}
@@ -765,7 +767,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 		//   OT h:mm changed -> ot_hours -> amount = round(hours x rate)
 		//   rate    changed -> amount = round(hours x rate)
 		//   amount  changed -> stands alone (not recomputed until h:mm or rate move)
-		//   band count / per-day rate changed -> cut = round(sum(count x fraction) x per_day)
+		//   band count / per-day rate changed -> cut = down(sum(count x fraction) x per_day)
 		const employee = String($(this).attr("data-employee"));
 		const field = $(this).data("field");
 		const raw = $(this).val();
@@ -817,7 +819,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 			bands.forEach((b, i) => {
 				fraction += flt(b.fraction) * flt(ov(employee, `band_${i + 1}_count`, g.entry.band_counts[b.label] || 0));
 			});
-			o.late_amount = Math.round(fraction * per_day);
+			o.late_amount = deduction_down(fraction * per_day);
 			o._late_auto = true;
 		}
 		state.overrides.set(employee, o);
@@ -1460,4 +1462,11 @@ function round2_half_up(x) {
 	let cents = parseInt(int_part + (frac + "00").slice(0, 2), 10);
 	if ((frac[2] || "0") >= "5") cents += 1;
 	return (sign * cents) / 100;
+}
+
+// Late marks are deductions for absence: to paise first (so 646.9999999 is
+// 647.00), then DOWN to the rupee -- payroll_math.round_down_deduction.
+function deduction_down(x) {
+	const v = round2_half_up(x);
+	return v > 0 ? Math.floor(v) : 0;
 }

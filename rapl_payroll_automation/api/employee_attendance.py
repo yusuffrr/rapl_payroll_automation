@@ -37,9 +37,11 @@ from rapl_payroll_automation.api.attendance_data import (
 	summarise,
 )
 from rapl_payroll_automation.api.ot_engine import is_ot_eligible
-from rapl_payroll_automation.api.payroll_math import ot_amount, pay_rates, round_half_up
+from rapl_payroll_automation.api.payroll_math import late_deduction, ot_amount, pay_rates, round_half_up
 from rapl_payroll_automation.api.payroll_automation_utils import (
+	employee_ot_divisor,
 	get_automation_settings,
+	get_monthly_salary,
 	get_grade_ot_rule,
 	get_salary_month,
 	get_total_working_days,
@@ -98,7 +100,7 @@ def _check_period(start_date, end_date):
 def _pay_context(employee, start_date, end_date, settings):
 	"""Monthly salary -> per-day -> per-hour, mirroring the rate derivation in
 	rapl_overtime_processing so the statement cannot disagree with what is paid."""
-	monthly = flt(frappe.db.get_value("Employee", employee, settings.ot_rate_base_fieldname))
+	monthly = get_monthly_salary(employee, start_date, settings)   # Base for this month
 	grade = frappe.db.get_value("Employee", employee, "grade")
 	rule = get_grade_ot_rule(settings, grade)
 
@@ -108,7 +110,8 @@ def _pay_context(employee, start_date, end_date, settings):
 	exclude = bool(rule)
 	if exclude:
 		sundays = get_employee_weekly_off_dates(employee, month_first, month_last)
-	r = pay_rates(monthly, total_days, len(sundays), exclude, settings.ot_hours_divisor)
+	divisor = employee_ot_divisor(employee, settings)   # Employee's own, else Settings
+	r = pay_rates(monthly, total_days, len(sundays), exclude, divisor)
 
 	# per_day_rate = calendar-day rate (late mark / half day, as Late Mark
 	# Processing pays); ot_per_day_rate = the overtime denominator.
@@ -121,7 +124,7 @@ def _pay_context(employee, start_date, end_date, settings):
 		# asks for a manual edit, so the statement must not promise OT money.
 		"hourly_rate": 0 if rule is None else r["hourly"],
 		"ot_rule_missing": rule is None,
-		"ot_hours_divisor": flt(settings.ot_hours_divisor),
+		"ot_hours_divisor": divisor,
 		"grade": grade,
 	}
 
@@ -181,7 +184,7 @@ def _build_statement(employee, start_date, end_date, show_money, settings):
 
 		band = att.get("late_mark_band")
 		att["late_deduction_amount"] = (
-			round_half_up(flt(bands.get(band, 0)) * flt(pay["per_day_rate"])) if band else 0
+			late_deduction(flt(bands.get(band, 0)), pay["per_day_rate"]) if band else 0
 		)
 
 	# Period totals are recomputed from the period hours, NOT summed from the
@@ -196,10 +199,11 @@ def _build_statement(employee, start_date, end_date, show_money, settings):
 			pay["hourly_rate"],
 		),
 		"overtime_amount_daily_sum": round_half_up(ot_total),
-		"late_deduction_amount": round_half_up(
+		# Same rule as RAPL Late Mark Processing: priced once, rounded DOWN.
+		"late_deduction_amount": late_deduction(
 			sum(flt(bands.get(label, 0)) * count
-				for label, count in summary["band_counts"].items())
-			* flt(pay["per_day_rate"])
+				for label, count in summary["band_counts"].items()),
+			pay["per_day_rate"],
 		),
 		# Only half days whose other half is unpaid cost anything, at the
 		# Payroll Settings fraction -- the way the slip deducts them.

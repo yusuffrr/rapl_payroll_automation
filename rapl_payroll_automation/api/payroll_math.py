@@ -81,6 +81,31 @@ def ot_amount(seconds, hourly):
 	return round_half_up(float(seconds or 0) / 3600 * float(hourly or 0))
 
 
+def round_down_deduction(value):
+	"""A deduction for absence (late marks) in whole rupees, ROUNDED DOWN.
+
+	Code on Wages 2019 s.20(2): a deduction for absence may not take a larger
+	share of wages than the share of time absent. Rounding half-up could take
+	up to 49 paise more than that; rounding down never does. The figure is
+	first taken to paise (removing float artefacts such as 646.9999999999,
+	which must be 647.00, not 646), then any fraction of a rupee is dropped:
+	  647.31 -> 647     1265.05 -> 1265     646.99 -> 646
+	"""
+	from decimal import ROUND_FLOOR
+
+	if not value or float(value) <= 0:
+		return 0
+	paise = Decimal(repr(float(value))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+	return int(paise.quantize(Decimal("1"), rounding=ROUND_FLOOR))
+
+
+def late_deduction(day_units, per_day_rate):
+	"""Late-mark money: sum(count x band fraction) x EXACT per-day rate,
+	rounded down once. The one late-mark rounding rule for every screen and
+	document."""
+	return round_down_deduction(float(day_units or 0) * float(per_day_rate or 0))
+
+
 def esi_employee_contribution(wages, rate="0.0075"):
 	"""ESI employee contribution, rounded UP to the next whole rupee.
 
@@ -277,7 +302,7 @@ def allocate_waiver(counts, fractions, marks, mode, band_index=None, existing=No
 
 
 def late_amounts(counts, waived, fractions, per_day_rate):
-	"""(amount before waiver, amount after waiver), each rounded ONCE.
+	"""(amount before waiver, amount after waiver), each rounded ONCE (down).
 
 	Both are priced from day-units the same way RAPL Late Mark Processing
 	prices a row, so "before" equals the normal amount and the saving is
@@ -288,8 +313,7 @@ def late_amounts(counts, waived, fractions, per_day_rate):
 	waived = clamp_waived(counts, waived)
 	gross = sum(_int0(c) * f for c, f in zip(counts, fractions))
 	net = sum((_int0(c) - w) * f for c, w, f in zip(counts, waived, fractions))
-	rate = float(per_day_rate or 0)
-	return round_half_up(gross * rate), round_half_up(net * rate)
+	return late_deduction(gross, per_day_rate), late_deduction(net, per_day_rate)
 
 
 def waived_row_amount(counts, waived, fractions, per_day_rate, base=None):
@@ -304,11 +328,13 @@ def waived_row_amount(counts, waived, fractions, per_day_rate, base=None):
 	gross, net = late_amounts(counts, waived, fractions, per_day_rate)
 	if base is None:
 		return gross, net
-	base = max(round_half_up(float(base or 0)), 0)
+	# The pre-waiver amount is itself a deduction: a hand-typed 500.6 is 500.
+	base = round_down_deduction(base)
 	if base == gross:
 		return gross, net
 	n = len(counts)
 	fractions = [float(f or 0) for f in list(fractions) + [0] * (n - len(fractions))]
 	units = sum(w * f for w, f in zip(clamp_waived(counts, waived), fractions))
-	value = round_half_up(units * float(per_day_rate or 0))
-	return base, max(base - value, 0)
+	# Exact value off the base, then down to the rupee (never above the base
+	# minus the waived marks' exact value).
+	return base, round_down_deduction(base - units * float(per_day_rate or 0))

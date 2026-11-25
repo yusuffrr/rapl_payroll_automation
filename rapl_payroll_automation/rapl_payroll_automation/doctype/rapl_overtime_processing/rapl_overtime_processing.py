@@ -19,7 +19,9 @@ from frappe.model.naming import append_number_if_name_exists
 from rapl_payroll_automation.api.payroll_automation_utils import (
 	additional_salary_already_exists,
 	create_and_submit_additional_salary,
+	employee_ot_divisor,
 	get_employee_holiday_dates,
+	get_monthly_salary,
 	get_automation_settings,
 	get_grade_ot_rule,
 	get_employee_holiday_rows,
@@ -240,12 +242,13 @@ def _compute_employee_overtime(emp, start_date, end_date, settings, errors):
 	validate entirely. Computing from in_time/out_time on every run keeps
 	payroll correct against current punch data no matter how a record was
 	edited, which is how this doctype always behaved."""
-	grade, monthly_salary = frappe.db.get_value(
-		"Employee", emp, ["grade", settings.ot_rate_base_fieldname]
-	) or (None, None)
+	grade = frappe.db.get_value("Employee", emp, "grade")
+	# Base of the Salary Structure Assignment in force for this month (what
+	# the slip pays from); the Employee field only for anyone not on Base yet.
+	monthly_salary = get_monthly_salary(emp, start_date, settings)
 
 	if not monthly_salary:
-		errors.append(f"{emp}: missing '{settings.ot_rate_base_fieldname}', added with 0 (edit manually)")
+		errors.append(f"{emp}: no salary (Base on Salary Structure Assignment), added with 0 (edit manually)")
 		return None
 
 	rule = get_grade_ot_rule(settings, grade)
@@ -266,7 +269,7 @@ def _compute_employee_overtime(emp, start_date, end_date, settings, errors):
 	rates = pay_rates(
 		monthly_salary, month_days, len(sunday_dates),
 		bool(rule),
-		settings.ot_hours_divisor,
+		employee_ot_divisor(emp, settings),   # Employee's own, else Settings
 	)
 	ot_working_days = rates["ot_days"]
 	if ot_working_days <= 0:

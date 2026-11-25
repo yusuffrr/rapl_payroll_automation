@@ -40,21 +40,28 @@ from rapl_payroll_automation.api.attendance_data import (
 from rapl_payroll_automation.api.ot_engine import is_ot_eligible
 from rapl_payroll_automation.api.payroll_math import (
 	expected_payment_days,
+	late_deduction,
 	month_cutoff,
 	ot_amount,
 	pay_rates,
+	round_down_deduction,
 	round_half_up,
 )
 from rapl_payroll_automation.api.payroll_automation_utils import (
+	OT_DIVISOR_FIELD,
 	additional_salary_already_exists,
+	employee_ot_divisor,
 	get_additional_salary_total,
 	get_automation_settings,
 	get_employee_holiday_dates,
 	get_employee_weekly_off_dates,
 	get_grade_ot_rule,
+	get_monthly_salaries,
+	get_monthly_salary,
 	get_salary_month,
 	get_total_working_days,
 	get_weekly_off_dates,
+	has_ot_divisor_field,
 )
 from erpnext.setup.doctype.employee.employee import get_holiday_list_for_employee
 
@@ -349,15 +356,17 @@ def get_console_data(start_date=None, end_date=None, employees=None, only_flagge
 
 def _prefetch(names, start_date, end_date, cutoff, settings):
 	"""Everything get_console_data needs per employee, in a handful of queries."""
-	out = {"monthly": {}, "ot_eligible": {}, "processed": set(), "advances": {}}
+	out = {"monthly": {}, "ot_eligible": {}, "processed": set(), "advances": {}, "divisor": {}}
 	if not names:
 		return out
-	base = settings.ot_rate_base_fieldname
-	for e in frappe.get_all(
-		"Employee", filters={"name": ["in", names]}, fields=["name", "custom_ot", base]
-	):
-		out["monthly"][e.name] = flt(e.get(base))
+	fields = ["name", "custom_ot"]
+	if has_ot_divisor_field():
+		fields.append(OT_DIVISOR_FIELD)
+	# Base of the Salary Structure Assignment in force for the month.
+	out["monthly"] = get_monthly_salaries(names, start_date, settings)
+	for e in frappe.get_all("Employee", filters={"name": ["in", names]}, fields=fields):
 		out["ot_eligible"][e.name] = bool(e.custom_ot)
+		out["divisor"][e.name] = employee_ot_divisor(settings=settings, value=e.get(OT_DIVISOR_FIELD) or 0)
 
 	components = [c for c in (settings.overtime_salary_component,
 							  settings.late_mark_salary_component) if c]
@@ -449,7 +458,7 @@ def _entry_preview(emp, start_date, end_date, summary, bands, settings, pre=None
 	if pre is not None:
 		monthly = pre["monthly"].get(emp.name, 0)
 	else:
-		monthly = flt(frappe.db.get_value("Employee", emp.name, settings.ot_rate_base_fieldname))
+		monthly = get_monthly_salary(emp.name, start_date, settings)
 	rule = get_grade_ot_rule(settings, emp.grade)
 
 	month_first, month_last, total_days = get_salary_month(start_date)
@@ -457,7 +466,11 @@ def _entry_preview(emp, start_date, end_date, summary, bands, settings, pre=None
 	if rule:
 		sundays = len(get_employee_weekly_off_dates(emp.name, month_first, month_last))
 
-	rates = pay_rates(monthly, total_days, sundays, bool(rule), settings.ot_hours_divisor)
+	divisor = (
+		pre["divisor"].get(emp.name) if pre is not None and emp.name in pre.get("divisor", {})
+		else employee_ot_divisor(emp.name, settings)
+	)
+	rates = pay_rates(monthly, total_days, sundays, bool(rule), divisor)
 	# Processing adds an employee whose grade has no OT rule with 0 hours/rate
 	# and asks for a manual edit. Mirror that, or the Console promises an OT
 	# figure the draft will not contain.
@@ -483,7 +496,7 @@ def _entry_preview(emp, start_date, end_date, summary, bands, settings, pre=None
 		"ot_hours_hhmm": int(seconds),
 		"ot_amount": ot_amount(seconds, hourly),
 		"band_counts": band_counts,
-		"late_amount": round_half_up(late_fraction * rates["late_per_day"]),
+		"late_amount": late_deduction(late_fraction, rates["late_per_day"]),
 		# Any submitted record dated inside the period, not only one dated
 		# exactly end_date -- a processing run for a shorter period dates its
 		# Additional Salary on that period's own end.
@@ -1143,13 +1156,13 @@ def _apply_overrides(doc, kind, overrides, bands):
 			# late-mark deduction when only their OT had been edited.
 			late_amount = values.get("late_amount")
 			if late_amount is not None:
-				row.amount = round_half_up(flt(late_amount))   # whole rupees, like computed amounts
+				row.amount = round_down_deduction(late_amount)   # whole rupees, down, like computed amounts
 			else:
 				fraction = sum(
 					flt(b["fraction"]) * int(getattr(row, f"band_{i}_count", 0) or 0)
 					for i, b in enumerate(bands, start=1)
 				)
-				row.amount = round_half_up(fraction * flt(row.per_day_rate))
+				row.amount = late_deduction(fraction, row.per_day_rate)
 			# On a row with a late-mark waiver, the Console's figure is the
 			# deduction BEFORE the waiver; validate() then takes the waived
 			# marks off it. Without this the save re-derived Amount from the
@@ -1499,7 +1512,8 @@ def _build_net_pay_preview(employee, start_date, end_date, today, settings,
 	ps = frappe.get_cached_value(
 		"Payroll Settings", None,
 		["include_holidays_in_total_working_days", "daily_wages_fraction_for_half_day",
-		 "consider_marked_attendance_on_holidays", "disable_rounded_total"],
+		 "consider_marked_attendance_on_holidays", "disable_rounded_total",
+		 "payroll_based_on", "consider_unmarked_attendance_as"],
 		as_dict=1,
 	) or {}
 	include_holidays = cint(ps.get("include_holidays_in_total_working_days"))
@@ -1565,11 +1579,19 @@ def _build_net_pay_preview(employee, start_date, end_date, today, settings,
 	)
 
 	native_payment_days = flt(slip.payment_days)
-	slip.payment_days = expected_payment_days(
+	console_payment_days = expected_payment_days(
 		base_days, lwp, absent, half_absent, half_fraction,
 		missing, future_days,
 	)
-	slip.absent_days = absent + half_absent * half_fraction + missing
+	if in_progress:
+		# No slip can exist for a running month: price it month-to-date with
+		# the Console's own count.
+		slip.payment_days = console_payment_days
+		slip.absent_days = absent + half_absent * half_fraction + missing
+	# A finished month keeps HRMS's own payment days -- the figure the real
+	# Salary Slip computes with these same settings -- so the preview pays
+	# exactly what the slip will. If the Console's count differs, that is
+	# reported (Payroll Settings decide it), never silently substituted.
 
 	# Inject what the Console is about to create -- unless it is already there.
 	pending = [
@@ -1654,6 +1676,8 @@ def _build_net_pay_preview(employee, start_date, end_date, today, settings,
 		"through_date": str(cutoff),
 		"payment_days": flt(slip.payment_days, 2),
 		"native_payment_days": flt(native_payment_days, 2),
+		"console_payment_days": flt(console_payment_days, 2),
+		"setup_warnings": _slip_setup_warnings(slip, ps),
 		"total_working_days": flt(slip.total_working_days, 2),
 		"days": {
 			"period": base_days, "absent": absent, "half_absent": half_absent,
@@ -1671,6 +1695,62 @@ def _build_net_pay_preview(employee, start_date, end_date, today, settings,
 		"already_submitted": already_submitted,
 		"statutory_applied": statutory_applied,
 	}
+
+
+def _slip_setup_warnings(slip, ps):
+	"""Setup that makes the Salary Slip disagree with RAPL's rounding policy.
+
+	The preview is computed by HRMS itself, so it already shows what the slip
+	would show; these say WHY a figure is not a whole rupee, or why the slip
+	will count days differently from the Console:
+	  - a salary line with paise: its Salary Component lacks "Round to the
+	    Nearest Integer" (HRMS rounds a line only when that box is ticked);
+	  - System Settings rounding method: HRMS rounds every such line with it,
+	    and RAPL's policy is half-up (Commercial);
+	  - Payroll Settings that pay Absent or unmarked days.
+	"""
+	warnings = []
+	method = frappe.get_system_settings("rounding_method") or "Banker's Rounding (legacy)"
+	if method != "Commercial Rounding":
+		warnings.append(
+			f"System Settings > Rounding Method is '{method}'. HRMS rounds salary lines "
+			"with it, so .50 can go down. Set it to Commercial Rounding."
+		)
+	for table in ("earnings", "deductions"):
+		for row in slip.get(table) or []:
+			# Lines that are not paid (statistical / not in totals) and income
+			# tax (HRMS rounds it by its own rules) are not the slip's money.
+			if cint(row.get("do_not_include_in_total")) or cint(
+				row.get("variable_based_on_taxable_salary")
+			):
+				continue
+			amount = flt(row.amount, 2)
+			if amount and abs(amount - round(amount)) > 0.001:
+				warnings.append(
+					f"{row.salary_component} comes to {amount:,.2f}. Tick 'Round to the "
+					f"Nearest Integer' on Salary Component {row.salary_component} so the "
+					"slip pays whole rupees."
+				)
+	late_component = get_automation_settings().get("late_mark_salary_component")
+	if late_component and cint(frappe.db.get_value(
+		"Salary Component", late_component, "depends_on_payment_days", cache=True
+	)):
+		warnings.append(
+			f"Salary Component {late_component} has 'Depends on Payment Days' ticked: the "
+			"slip scales the late-mark deduction by payment days (and may round it up). "
+			"Untick it -- the amount is already final."
+		)
+	if (ps.get("payroll_based_on") or "") != "Attendance":
+		warnings.append(
+			"Payroll Settings > Calculate Payroll Working Days Based On is not "
+			"'Attendance': the slip will not deduct Absent days or half days."
+		)
+	elif (ps.get("consider_unmarked_attendance_as") or "Present") != "Absent":
+		warnings.append(
+			"Payroll Settings > Consider Unmarked Attendance As is not 'Absent': "
+			"the slip will pay days that have no attendance."
+		)
+	return warnings
 
 
 def _lwp_days_after(employee, after, last, holidays=None, include_holidays=True, half_fraction=0.5):

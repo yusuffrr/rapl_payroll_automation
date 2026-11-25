@@ -15,6 +15,8 @@ from rapl_payroll_automation.api.payroll_math import (
 	RATE_DP,
 	allocate_waiver,
 	clamp_waived,
+	late_deduction,
+	round_down_deduction,
 	round_half_up,
 	waived_row_amount,
 )
@@ -22,6 +24,7 @@ from rapl_payroll_automation.api.payroll_automation_utils import (
 	additional_salary_already_exists,
 	create_and_submit_additional_salary,
 	get_automation_settings,
+	get_monthly_salary,
 	get_salary_month,
 	get_total_working_days,
 	time_to_seconds,
@@ -194,12 +197,13 @@ def _compute_employee_late_mark_details(employee, start_date, end_date, working_
 	custom_late_deduction_fraction field is no longer read here at all.
 	"""
 	settings = settings or get_automation_settings()
-	# Same base field the Console and Overtime use (Settings), not a literal.
-	monthly_salary = frappe.db.get_value("Employee", employee, settings.ot_rate_base_fieldname or "custom_monthly_salary")
+	# Same salary the Console and Overtime use: Base of the Salary Structure
+	# Assignment in force for this month (Employee field only as a fallback).
+	monthly_salary = get_monthly_salary(employee, start_date, settings)
 	if not monthly_salary:
 		return (
 			{"band_counts": [0] * MAX_BANDS, "per_day_rate": 0, "amount": 0},
-			f"{employee}: missing monthly salary, added with 0 (edit manually)",
+			f"{employee}: no salary (Base on Salary Structure Assignment), added with 0 (edit manually)",
 		)
 
 	# Round FIRST, then use the rounded rate consistently in the amount
@@ -261,9 +265,9 @@ def _compute_employee_late_mark_details(employee, start_date, end_date, working_
 		{
 			"band_counts": band_counts,
 			"per_day_rate": per_day_rate,
-			# sum(count x fraction) x per-day, rounded once -- the same order as
-			# the Console, so float error cannot tip the rupee differently.
-			"amount": round_half_up(amount * per_day_rate),
+			# sum(count x fraction) x per-day, rounded once and DOWN (Code on
+			# Wages s.20(2)) -- the same rule as the Console and the statement.
+			"amount": late_deduction(amount, per_day_rate),
 		},
 		None,
 	)
@@ -413,7 +417,7 @@ def _plan_waiver(doc, employees, mode, band, marks, combine):
 		new = allocate_waiver(
 			counts, fractions, marks, mode, band_index, existing=current if add else None
 		)
-		amount_now = round_half_up(flt(row.amount))
+		amount_now = round_down_deduction(row.amount)
 		applies = bool(sum(new))
 		if not applies:
 			# Nothing of this kind to waive for this employee (e.g. no marks in

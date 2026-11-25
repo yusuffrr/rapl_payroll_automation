@@ -199,9 +199,10 @@ class Waiver(unittest.TestCase):
 		self.assertEqual(pm.allocate_waiver([2, 2], self.F, -3, "costliest"), [0, 0])
 
 	def test_amounts_rounded_once(self):
-		# 3 x 0.25 x 333.333333 = 249.99999975 -> 250; after waiving 1 -> 166.67 -> 167
+		# 3 x 0.25 x 333.333333 = 249.99999975 -> 250.00 at paise -> 250;
+		# after waiving 1 -> 166.67 -> DOWN to 166
 		before, after = pm.late_amounts([3, 0], [1, 0], self.F, 333.333333)
-		self.assertEqual((before, after), (250, 167))
+		self.assertEqual((before, after), (250, 166))
 
 	def test_clamp(self):
 		self.assertEqual(pm.clamp_waived([2, 1], [5, -1]), [2, 0])
@@ -212,7 +213,7 @@ class WaivedRowAmount(unittest.TestCase):
 	F = [0.25, 0.5]
 
 	def test_normal_row_priced_once(self):
-		self.assertEqual(pm.waived_row_amount([3, 0], [1, 0], self.F, 333.333333, 250), (250, 167))
+		self.assertEqual(pm.waived_row_amount([3, 0], [1, 0], self.F, 333.333333, 250), (250, 166))
 
 	def test_hand_set_zero_never_increases(self):
 		self.assertEqual(pm.waived_row_amount([0, 3], [0, 1], self.F, 400, 0), (0, 0))
@@ -221,3 +222,26 @@ class WaivedRowAmount(unittest.TestCase):
 		# computed would be 600; HR typed 500; waiving one 0.5 mark at 400 takes 200 off
 		self.assertEqual(pm.waived_row_amount([0, 3], [0, 1], self.F, 400, 500), (500, 300))
 		self.assertEqual(pm.waived_row_amount([0, 3], [0, 3], self.F, 400, 500), (500, 0))
+
+
+class LateRoundsDown(unittest.TestCase):
+	"""Late marks are deductions for absence: exact, to paise, then DOWN."""
+
+	def test_rule(self):
+		self.assertEqual(pm.round_down_deduction(647.31), 647)
+		self.assertEqual(pm.round_down_deduction(1265.99), 1265)
+		self.assertEqual(pm.round_down_deduction(646.9999999999), 647)   # float noise is 647.00
+		self.assertEqual(pm.round_down_deduction(0), 0)
+		self.assertEqual(pm.round_down_deduction(-5), 0)
+
+	def test_hr_examples_nov_2026(self):
+		# Employee 03: 30,100 / 31 days; 1 x 1/6 + 2 x 1/4 late marks
+		r03 = pm.pay_rates(30100, 31, 0, False, 8)["late_per_day"]
+		self.assertEqual(pm.late_deduction(1 / 6 + 2 / 4, r03), 647)     # 647.31
+		# Employee 15: 36,200 / 31 days; 2 x 1/6 + 3 x 1/4
+		r15 = pm.pay_rates(36200, 31, 0, False, 8)["late_per_day"]
+		self.assertEqual(pm.late_deduction(2 / 6 + 3 / 4, r15), 1265)    # 1265.05
+
+	def test_hand_amount_waiver_never_exceeds_exact(self):
+		# base 500, one 0.5 mark at 333.33 waived: 500 - 166.665 = 333.335 -> 333
+		self.assertEqual(pm.waived_row_amount([0, 3], [0, 1], [0.25, 0.5], 333.33, 500), (500, 333))

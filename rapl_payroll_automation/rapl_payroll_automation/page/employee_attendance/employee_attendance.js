@@ -303,7 +303,7 @@ frappe.pages["employee-attendance"].on_page_load = function (wrapper) {
 				const count = counts[b.label] || 0;
 				if (!count) return "";
 				const amount = show && s.pay
-					? `<span class="ea-cut">${money(Math.round(b.fraction * count * s.pay.per_day_rate))}</span>`
+					? `<span class="ea-cut">${money(deduction_down(b.fraction * count * s.pay.per_day_rate))}</span>`
 					: "";
 				return `<div><span>${count} &times; ${frappe.utils.escape_html(b.label)} ${__("day")}</span>${amount}</div>`;
 			})
@@ -332,3 +332,23 @@ frappe.pages["employee-attendance"].on_page_load = function (wrapper) {
 			</div>`;
 	}
 };
+
+// Half-up to 2 decimals on the SHORTEST decimal form of the number (the
+// digits Python's repr() gives), matching the server's round_half_up.
+function round2_half_up(x) {
+	x = Number(x) || 0;
+	const sign = x < 0 ? -1 : 1;
+	const str = String(Math.abs(x));
+	if (str.includes("e")) return Math.round(x * 100) / 100;
+	const [int_part, frac = ""] = str.split(".");
+	let cents = parseInt(int_part + (frac + "00").slice(0, 2), 10);
+	if ((frac[2] || "0") >= "5") cents += 1;
+	return (sign * cents) / 100;
+}
+
+// Late marks are deductions for absence: to paise first (so 646.9999999 is
+// 647.00), then DOWN to the rupee -- payroll_math.round_down_deduction.
+function deduction_down(x) {
+	const v = round2_half_up(x);
+	return v > 0 ? Math.floor(v) : 0;
+}

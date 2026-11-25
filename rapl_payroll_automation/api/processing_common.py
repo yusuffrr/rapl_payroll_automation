@@ -36,8 +36,19 @@ def validate_processing_doc(doc):
 		# reach the Additional Salary as 1234.5 (Currency precision 0 only
 		# affects display).
 		if row.meta.has_field("amount") and row.get("amount") is not None:
-			from rapl_payroll_automation.api.payroll_math import round_half_up
-			row.amount = round_half_up(flt(row.amount))
+			from rapl_payroll_automation.api.payroll_math import (
+				round_down_deduction,
+				round_half_up,
+			)
+			# Late marks are deductions for absence: rounded DOWN (Code on
+			# Wages s.20(2)). Overtime is an earning: nearest rupee.
+			# Only positive amounts are rounded: a negative one must still reach
+			# the "cannot be negative" check below, not turn into 0.
+			if getattr(doc, "doctype", None) == "RAPL Late Mark Processing":
+				if flt(row.amount) > 0:
+					row.amount = round_down_deduction(row.amount)
+			else:
+				row.amount = round_half_up(flt(row.amount))
 		for field in ("amount", "ot_hours", "ot_rate", "per_day_rate"):
 			if row.meta.has_field(field) and flt(row.get(field)) < 0:
 				frappe.throw(
