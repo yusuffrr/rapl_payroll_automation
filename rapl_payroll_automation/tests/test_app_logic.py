@@ -823,3 +823,57 @@ class MonthlySalaryMidMonthPeriod(MonthlySalaryFromBase):
 		# Run for 16-30 Nov: the November slip uses the 1 Oct assignment
 		self.assertEqual(self.m("E1", "2026-11-16"), 30100)
 		self.assertEqual(self.m("J1", "2026-10-20"), 29100)   # joined 12 Oct, period from 20 Oct
+
+
+from rapl_payroll_automation.api import salary_sync  # noqa: E402
+
+
+class EmployeeSalaryFieldsSync(unittest.TestCase):
+	def setUp(self):
+		self.saved = {}
+		self.ssa = {}
+		olds = (frappe.get_all, frappe.get_doc, frappe.db.get_value, frappe.db.set_value,
+				salary_sync.get_automation_settings, getattr(frappe, "get_meta", None))
+
+		def restore():
+			(frappe.get_all, frappe.get_doc, frappe.db.get_value, frappe.db.set_value,
+			 salary_sync.get_automation_settings, gm) = olds
+			if gm is not None:
+				frappe.get_meta = gm
+		self.addCleanup(restore)
+
+		frappe.get_all = lambda dt, **kw: [_AD(self.ssa[kw["filters"]["employee"]])] if kw["filters"]["employee"] in self.ssa else []
+		frappe.get_doc = lambda dt, name: types.SimpleNamespace(
+			_evaluate_all_components=lambda: ({}, {"earnings": self.rows[name]}))
+		frappe.db.get_value = lambda *a, **k: {}
+		frappe.db.set_value = lambda dt, name, values, **k: self.saved.setdefault(name, {}).update(values)
+		frappe.get_meta = lambda dt: types.SimpleNamespace(has_field=lambda f: True)
+		salary_sync.get_automation_settings = lambda: settings(basic_salary_component=None, hra_salary_component=None)
+
+	def test_fifty_fifty_and_fixed(self):
+		self.ssa = {"59": {"name": "A59", "base": 35530}, "15": {"name": "A15", "base": 36200}}
+		self.rows = {
+			"A59": [_AD(salary_component="Basic", abbr="B", default_amount=17765),
+					_AD(salary_component="House Rent Allowance", abbr="HRA", default_amount=17765)],
+			"A15": [_AD(salary_component="Basic", abbr="B", default_amount=25500),
+					_AD(salary_component="House Rent Allowance", abbr="HRA", default_amount=10700)],
+		}
+		salary_sync.sync_employee("59"); salary_sync.sync_employee("15")
+		self.assertEqual(self.saved["59"], {"custom_monthly_salary": 35530, "custom_basic": 17765, "custom_hra": 17765})
+		self.assertEqual(self.saved["15"], {"custom_monthly_salary": 36200, "custom_basic": 25500, "custom_hra": 10700})
+
+	def test_zero_base_and_no_assignment_left_alone(self):
+		self.ssa = {"30": {"name": "OLD", "base": 0}}
+		self.rows = {}
+		self.assertFalse(salary_sync.sync_employee("30"))
+		self.assertFalse(salary_sync.sync_employee("99"))
+		self.assertEqual(self.saved, {})
+
+	def test_basic_hra_failure_keeps_monthly(self):
+		self.ssa = {"01": {"name": "A01", "base": 54900}}
+		frappe.get_doc = lambda dt, name: (_ for _ in ()).throw(RuntimeError("hrms changed"))
+		old_log = frappe.log_error
+		frappe.log_error = lambda *a, **k: None
+		self.addCleanup(lambda: setattr(frappe, "log_error", old_log))
+		salary_sync.sync_employee("01")
+		self.assertEqual(self.saved["01"], {"custom_monthly_salary": 54900})

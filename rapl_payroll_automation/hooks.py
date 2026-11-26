@@ -80,6 +80,17 @@ doc_events = {
 		"on_submit": "rapl_payroll_automation.api.employee_advance.update_outstanding_balance_from_additional_salary",
 		"on_cancel": "rapl_payroll_automation.api.employee_advance.update_outstanding_balance_from_additional_salary",
 	},
+	# Employee > Monthly salary / Basic / HRA are read-only copies of the
+	# assignment in force (api/salary_sync.py).
+	"Salary Structure Assignment": {
+		"on_submit": "rapl_payroll_automation.api.salary_sync.on_assignment_change",
+		"on_cancel": "rapl_payroll_automation.api.salary_sync.on_assignment_change",
+	},
+}
+
+scheduler_events = {
+	# A raise dated today reaches Employee > Monthly salary / Basic / HRA.
+	"daily": ["rapl_payroll_automation.api.salary_sync.sync_all"],
 }
 
 # Assets ---------------------------------------------------------------------

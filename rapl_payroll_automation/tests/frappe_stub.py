@@ -143,6 +143,7 @@ def install():
 	utils.add_months = add_months
 	utils.time_diff_in_hours = time_diff_in_hours
 	utils.now = lambda: str(_dt.datetime.now())
+	utils.today = lambda: str(_dt.date.today())
 	utils.escape_html = lambda s: _html.escape(str(s), quote=True)
 	utils.strip_html = lambda s: str(s)
 	utils.get_holiday_dates_between = _not_available

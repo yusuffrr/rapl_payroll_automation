@@ -4,3 +4,4 @@
 rapl_payroll_automation.patches.v0_2.add_manual_override_fields
 rapl_payroll_automation.patches.v0_3.order_cost_fields
 rapl_payroll_automation.patches.v0_4.add_ot_hours_divisor_field
+rapl_payroll_automation.patches.v0_5.salary_fields_read_only
