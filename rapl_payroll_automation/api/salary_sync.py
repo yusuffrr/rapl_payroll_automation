@@ -1,14 +1,20 @@
 # Copyright (c) 2026, RAPL and contributors
-"""Employee > Monthly salary / Basic / HRA, kept in step with the Salary
-Structure Assignment.
+"""Employee > Monthly Gross Salary / Basic / HRA / Salary Structure / CTC,
+kept in step with the Salary Structure Assignment.
 
 Since October 2026 pay is decided by Base on the Salary Structure Assignment.
-These three Employee fields are read-only copies for HR to see (and for the
-app's pre-October fallback): never typed, always filled from here.
+These Employee fields are read-only copies for HR to see (and for the app's
+pre-October fallback): never typed, always filled from here.
 
-  custom_monthly_salary  Base of the assignment in force TODAY
-  custom_basic           that assignment's full-month Basic
-  custom_hra             that assignment's full-month HRA
+  custom_monthly_salary    Base of the assignment in force TODAY (gross,
+                           before PF/PT/ESI; labelled "Monthly Gross Salary")
+  custom_basic             that assignment's full-month Basic
+  custom_hra               that assignment's full-month HRA
+  custom_salary_structure  that assignment's Salary Structure (list filter)
+  ctc                      that assignment's yearly CTC (standard Employee
+                           field). Employee Promotion also writes it (Revised
+                           CTC); the next sync puts the assignment's figure
+                           back -- the assignment is what pays.
 
 Basic and HRA come from HRMS's own evaluation of the assignment's salary
 structure (SalaryStructureAssignment._evaluate_all_components, present in
@@ -25,14 +31,21 @@ from frappe.utils import flt, getdate, today
 
 from rapl_payroll_automation.api.payroll_automation_utils import get_automation_settings
 
-FIELDS = ("custom_monthly_salary", "custom_basic", "custom_hra")
+# The three site Custom Fields made read-only by patch v0_5.
+COPY_FIELDS = ("custom_monthly_salary", "custom_basic", "custom_hra")
+# Everything the sync writes (each only if Employee has the field).
+FIELDS = COPY_FIELDS + ("custom_salary_structure", "ctc")
 
 
 def _assignment_in_force(employee, on_date):
+	fields = ["name", "base", "salary_structure"]
+	# CTC on the assignment is newer HRMS; read it only where the column exists.
+	if frappe.get_meta("Salary Structure Assignment").has_field("ctc"):
+		fields.append("ctc")
 	rows = frappe.get_all(
 		"Salary Structure Assignment",
 		filters={"employee": employee, "docstatus": 1, "from_date": ["<=", on_date]},
-		fields=["name", "base"],
+		fields=fields,
 		order_by="from_date desc, creation desc",
 		limit=1,
 	)
@@ -50,11 +63,15 @@ def _component_amount(rows, names):
 
 
 def salary_values(employee, on_date=None):
-	"""{field: value} for the three Employee fields, or None to leave them."""
+	"""{field: value} for the Employee copy fields, or None to leave them."""
 	ssa = _assignment_in_force(employee, getdate(on_date or today()))
 	if not ssa or flt(ssa.base) <= 0:
 		return None
 	values = {"custom_monthly_salary": flt(ssa.base)}
+	if ssa.get("salary_structure"):
+		values["custom_salary_structure"] = ssa.salary_structure
+	if flt(ssa.get("ctc")) > 0:
+		values["ctc"] = flt(ssa.ctc)
 	try:
 		doc = frappe.get_doc("Salary Structure Assignment", ssa.name)
 		_data, rows_by_type = doc._evaluate_all_components()
@@ -71,6 +88,16 @@ def salary_values(employee, on_date=None):
 	except Exception:
 		# Monthly salary is still right; Basic/HRA stay as they were.
 		frappe.log_error(frappe.get_traceback(), f"RAPL: Basic/HRA not computed for {employee}")
+		return values
+	# An assignment saved before HRMS computed CTC has 0 stored: compute it in
+	# memory (nothing is saved on the assignment). A failure here only skips CTC.
+	if "ctc" not in values and hasattr(doc, "calculate_ctc_and_gross"):
+		try:
+			doc.calculate_ctc_and_gross()
+			if flt(doc.get("ctc")) > 0:
+				values["ctc"] = flt(doc.ctc)
+		except Exception:
+			frappe.log_error(frappe.get_traceback(), f"RAPL: CTC not computed for {employee}")
 	return values
 
 
@@ -82,10 +109,17 @@ def sync_employee(employee, on_date=None):
 	meta = frappe.get_meta("Employee")
 	values = {k: v for k, v in values.items() if meta.has_field(k)}
 	current = frappe.db.get_value("Employee", employee, list(values), as_dict=True) or {}
-	changed = {k: v for k, v in values.items() if flt(current.get(k)) != flt(v)}
+	changed = {k: v for k, v in values.items() if _differs(current.get(k), v)}
 	if changed:
 		frappe.db.set_value("Employee", employee, changed, update_modified=False)
 	return bool(changed)
+
+
+def _differs(old, new):
+	"""Numbers compare as numbers (17765 == 17765.0), text as text."""
+	if isinstance(new, (int, float)):
+		return flt(old) != flt(new)
+	return (old or "") != (new or "")
 
 
 def on_assignment_change(doc, method=None):

@@ -366,7 +366,7 @@ frappe.pages["attendance-console"].on_page_load = function (wrapper) {
 								<span class="ac-field"><label>&#8377;/${__("day")}</label>
 									<input class="ac-cell ac-sum" data-employee="${esc_attr(emp)}" data-field="per_day_rate"
 										value="${per_day || ""}" placeholder="0"
-										title="${__("Monthly salary divided by calendar days in the period")}"></span>
+										title="${__("Monthly gross salary divided by calendar days in the period")}"></span>
 								<span class="ac-spacer"></span>
 								<input class="ac-cell ac-sum ea-cut" data-employee="${esc_attr(emp)}" data-field="late_amount"
 									value="${late_amount || ""}" placeholder="0" title="${__("Total late mark deduction")}">

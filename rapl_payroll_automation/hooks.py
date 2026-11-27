@@ -80,8 +80,12 @@ doc_events = {
 		"on_submit": "rapl_payroll_automation.api.employee_advance.update_outstanding_balance_from_additional_salary",
 		"on_cancel": "rapl_payroll_automation.api.employee_advance.update_outstanding_balance_from_additional_salary",
 	},
-	# Employee > Monthly salary / Basic / HRA are read-only copies of the
-	# assignment in force (api/salary_sync.py).
+	# Payroll Entry named after the month it pays (api/payroll_entry_naming.py).
+	"Payroll Entry": {
+		"autoname": "rapl_payroll_automation.api.payroll_entry_naming.autoname",
+	},
+	# Employee > Monthly Gross Salary / Basic / HRA / Salary Structure / CTC are
+	# read-only copies of the assignment in force (api/salary_sync.py).
 	"Salary Structure Assignment": {
 		"on_submit": "rapl_payroll_automation.api.salary_sync.on_assignment_change",
 		"on_cancel": "rapl_payroll_automation.api.salary_sync.on_assignment_change",
@@ -89,7 +93,7 @@ doc_events = {
 }
 
 scheduler_events = {
-	# A raise dated today reaches Employee > Monthly salary / Basic / HRA.
+	# A raise dated today reaches Employee > Monthly Gross Salary / Basic / HRA / CTC.
 	"daily": ["rapl_payroll_automation.api.salary_sync.sync_all"],
 }
 
@@ -141,6 +145,7 @@ fixtures = [
 					"Employee-custom_ot",
 					"Employee-custom_ot_hours_divisor",
 					"Employee-custom_monthly_salary",
+					"Employee-custom_salary_structure",
 					"Employee-custom_pf",
 					"Employee-custom_pt",
 					"Employee-custom_esi",

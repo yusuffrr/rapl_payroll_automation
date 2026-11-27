@@ -8,13 +8,13 @@ only if it exists.
 
 import frappe
 
-from rapl_payroll_automation.api.salary_sync import FIELDS, sync_all
+from rapl_payroll_automation.api.salary_sync import COPY_FIELDS, sync_all
 
 NOTE = "Read-only: comes from the Salary Structure Assignment in force today. Change pay with a new assignment."
 
 
 def execute():
-	for fieldname in FIELDS:
+	for fieldname in COPY_FIELDS:
 		name = frappe.db.get_value("Custom Field", {"dt": "Employee", "fieldname": fieldname}, "name")
 		if not name:
 			continue

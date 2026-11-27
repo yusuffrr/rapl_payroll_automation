@@ -877,3 +877,82 @@ class EmployeeSalaryFieldsSync(unittest.TestCase):
 		self.addCleanup(lambda: setattr(frappe, "log_error", old_log))
 		salary_sync.sync_employee("01")
 		self.assertEqual(self.saved["01"], {"custom_monthly_salary": 54900})
+
+
+class EmployeeStructureAndCTCSync(EmployeeSalaryFieldsSync):
+	"""Salary Structure and CTC follow the assignment too."""
+
+	def test_structure_and_stored_ctc(self):
+		self.ssa = {"59": {"name": "A59", "base": 35530, "salary_structure": "RAPL 50-50 (Oct 2026)", "ctc": 426360}}
+		self.rows = {"A59": [_AD(salary_component="Basic", abbr="B", default_amount=17765),
+							 _AD(salary_component="House Rent Allowance", abbr="HRA", default_amount=17765)]}
+		salary_sync.sync_employee("59")
+		self.assertEqual(self.saved["59"]["custom_salary_structure"], "RAPL 50-50 (Oct 2026)")
+		self.assertEqual(self.saved["59"]["ctc"], 426360)
+
+	def test_ctc_computed_when_not_stored(self):
+		self.ssa = {"15": {"name": "A15", "base": 36200, "salary_structure": "RAPL Fixed Basic 25500 (Oct 2026)", "ctc": 0}}
+		rows = [_AD(salary_component="Basic", abbr="B", default_amount=25500)]
+
+		class Doc(dict):
+			__getattr__ = dict.get
+
+			def calculate_ctc_and_gross(self):
+				self["ctc"] = 434400
+
+			def _evaluate_all_components(self):
+				return {}, {"earnings": rows}
+		frappe.get_doc = lambda dt, name: Doc()
+		salary_sync.sync_employee("15")
+		self.assertEqual(self.saved["15"]["ctc"], 434400)
+
+	def test_unchanged_text_and_number_not_rewritten(self):
+		self.ssa = {"59": {"name": "A59", "base": 35530, "salary_structure": "S1", "ctc": 426360}}
+		self.rows = {"A59": [_AD(salary_component="Basic", abbr="B", default_amount=17765)]}
+		frappe.db.get_value = lambda *a, **k: {"custom_monthly_salary": 35530.0, "custom_basic": 17765.0,
+											   "custom_salary_structure": "S1", "ctc": 426360.0}
+		self.assertFalse(salary_sync.sync_employee("59"))
+		frappe.db.get_value = lambda *a, **k: {"custom_monthly_salary": 35530.0, "custom_basic": 17765.0,
+											   "custom_salary_structure": "OLD", "ctc": 426360.0}
+		self.assertTrue(salary_sync.sync_employee("59"))
+		self.assertEqual(self.saved["59"], {"custom_salary_structure": "S1"})
+
+
+from rapl_payroll_automation.api import payroll_entry_naming as pen  # noqa: E402
+
+
+class PayrollEntryNaming(unittest.TestCase):
+	def setUp(self):
+		self.taken = set()
+		self.counter = {}
+		old = (pen._next_name, frappe.db.exists)
+		self.addCleanup(lambda: (setattr(pen, "_next_name", old[0]), setattr(frappe.db, "exists", old[1])))
+
+		def nxt(prefix):
+			self.counter[prefix] = self.counter.get(prefix, 0) + 1
+			return f"{prefix}{self.counter[prefix]}"
+		pen._next_name = nxt
+		frappe.db.exists = lambda dt, name: name in self.taken
+
+	def name(self, **kw):
+		doc = _AD(company="RAPL", **kw)
+		pen.autoname(doc)
+		return doc.__dict__.get("name")   # set as an attribute, like a Document
+
+	def test_month_of_start_date_not_creation(self):
+		self.assertEqual(self.name(start_date="2026-10-01", posting_date="2026-10-31"), "PE-10/2026-2027-1")
+		self.assertEqual(self.name(start_date="2026-10-01"), "PE-10/2026-2027-2")
+
+	def test_january_to_march_belong_to_previous_fiscal_year(self):
+		self.assertEqual(self.name(start_date="2027-02-01"), "PE-02/2026-2027-1")
+		self.assertEqual(self.name(start_date="2027-04-01"), "PE-04/2027-2028-1")
+
+	def test_skips_names_already_taken(self):
+		self.taken = {"PE-09/2026-2027-1"}   # e.g. made by a rename, series never moved
+		self.assertEqual(self.name(start_date="2026-09-01"), "PE-09/2026-2027-2")
+
+	def test_amendment_left_to_frappe(self):
+		self.assertIsNone(self.name(start_date="2026-10-01", amended_from="PE-10/2026-2027-1"))
+
+	def test_posting_date_when_no_start_date(self):
+		self.assertEqual(self.name(posting_date="2026-08-31"), "PE-08/2026-2027-1")

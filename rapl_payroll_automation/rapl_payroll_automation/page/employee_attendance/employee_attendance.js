@@ -189,7 +189,7 @@ frappe.pages["employee-attendance"].on_page_load = function (wrapper) {
 
 		const rate_block = show
 			? `<div class="ea-rates">
-					<div><span>${__("Monthly salary")}</span><b>${money(pay.monthly_salary)}</b></div>
+					<div><span>${__("Monthly gross salary")}</span><b>${money(pay.monthly_salary)}</b></div>
 					<div><span>${__("Per day (late mark)")} &middot; ${__("all days")}</span><b>${money(pay.per_day_rate)}</b></div>
 					<div><span>${__("OT per day")} &middot; ${pay.ot_working_days} ${__("days")}</span><b>${money(pay.ot_per_day_rate)}</b></div>
 					<div><span>${__("OT per hour")} &middot; &divide;${pay.ot_hours_divisor || 8}</span><b>${money(pay.hourly_rate)}</b></div>
